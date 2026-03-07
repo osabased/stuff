@@ -343,16 +343,18 @@ end
 
 --[[
     IsInFrontArc — one sqrt, one dot, one compare.
+    Origin is the tool Handle — position and facing direction both come
+    from the sword, matching where hits physically land.
     Uses cached cosAngleCap (cos of CFG.AngleCap in radians).
     No acos, no degrees conversion.
 --]]
-local function IsInFrontArc(root, torso)
-    local dx = torso.Position.X - root.Position.X
-    local dy = torso.Position.Y - root.Position.Y
-    local dz = torso.Position.Z - root.Position.Z
+local function IsInFrontArc(handle, torso)
+    local dx = torso.Position.X - handle.Position.X
+    local dy = torso.Position.Y - handle.Position.Y
+    local dz = torso.Position.Z - handle.Position.Z
     local mag = math.sqrt(dx*dx + dy*dy + dz*dz)
     if mag < 0.1 then return false end
-    local lv = root.CFrame.LookVector
+    local lv = handle.CFrame.LookVector
     return (lv.X*dx + lv.Y*dy + lv.Z*dz) / mag >= cosAngleCap
 end
 
@@ -508,8 +510,8 @@ local COLOR = {
     Uses CFrame.lookAt(mid, mid+dir) — -Z axis aligns with p1→p2,
     Size.Z is the part's long axis.
 
-    Origin: HumanoidRootPart.CFrame — matches IsInFrontArc exactly.
-    The two radius lines span HRP → left/right boundary at CFG.Size studs.
+    Origin: tool Handle CFrame — matches IsInFrontArc exactly.
+    The two radius lines span Handle → left/right boundary at CFG.Size studs.
     The 14 arc segments trace the curved boundary between them.
     Both reach radius (line length) and angle cap (arc sweep) are directly
     visible, making a separate sphere redundant.
@@ -901,7 +903,7 @@ task.spawn(FetchWhitelist)
     Errors after a yield are routed to the task scheduler and appear
     in the output window instead of silently killing the coroutine.
 --]]
-local function DragAndFire(victim, attackerRoot, remote)
+local function DragAndFire(victim, attackerRoot, remote, handle)
     local uid  = victim.UserId
     local char = victim.Character; if not char then return end
     local torso    = TorsoCache[uid] or FindTorso(char)   -- V5-8: cache first
@@ -911,9 +913,9 @@ local function DragAndFire(victim, attackerRoot, remote)
     if humanoid:GetState() == Enum.HumanoidStateType.Dead then return end
     if ActiveDrags[uid] then return end
     if tick()-(LastDrag[uid] or 0) < CFG.DragCooldown then return end
-    if not IsInFrontArc(attackerRoot, torso) then return end
+    if not IsInFrontArc(handle, torso) then return end
 
-    local realDist=(attackerRoot.Position-torso.Position).Magnitude
+    local realDist=(handle.Position-torso.Position).Magnitude
     ActiveDrags[uid]=true; LastDrag[uid]=tick(); Stats.ActiveDrags=Stats.ActiveDrags+1
 
     task.spawn(function()   -- V5-6
@@ -1020,7 +1022,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
 
         targetsInRange = targetsInRange + 1
         if CFG.Enabled and triggerHeld then
-            DragAndFire(player, root, currentRemote)
+            DragAndFire(player, root, currentRemote, handle)
         end
     end
 
@@ -1033,7 +1035,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     else                              col=COLOR.CLEAR
     end
 
-    UpdateArcVis(root.CFrame, col)
+    UpdateArcVis(handle.CFrame, col)
 end)
 
 -- ═══════════════════════════════════════════════════════════════
