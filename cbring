@@ -1,165 +1,272 @@
-if getgenv().GLOBALENABLED == true then return end
+--[[
+    HARD CBRING v2 — No BreakJoints
+    
+    The key insight: BreakJoints was never necessary.
+    
+    The original script used it as a shortcut to guarantee a kill.
+    But it was the most detectable thing in the entire script.
+    
+    The smarter approach: drag the victim into the tool's Handle so the
+    GAME'S OWN damage system registers the hit.  The server fires
+    Handle.Touched legitimately.  The damage module runs legitimately.
+    Humanoid.Health reaches 0 legitimately.  There is no anomalous
+    event anywhere in the kill pipeline — because we never touched it.
+    
+    We are not killing them.  We are moving them in front of the sword
+    and letting the sword kill them.
 
-getgenv().GLOBALENABLED = true
+    What changes from v1:
+      - BreakJoints() call removed entirely
+      - Drag destination is now INSIDE the tool's swing arc, not beside
+        the HumanoidRootPart — so the Handle.Touched fires naturally
+      - Signal suppression window is shorter (lerp only, no post-kill writes)
+      - A "snap-back" is added: after the hit registers, we lerp the victim
+        back toward their original position so the teleport is less visible
+        in the kill-cam / replay
+--]]
 
-getgenv().Settings = {
+if getgenv()._HCBRING2_LOADED then return end
+getgenv()._HCBRING2_LOADED = true
+
+local Players      = game:GetService("Players")
+local RunService   = game:GetService("RunService")
+local UIS          = game:GetService("UserInputService")
+local StarterGui   = game:GetService("StarterGui")
+
+-- ─────────────────────────────────────────────────────────────
+-- CONFIG
+-- ─────────────────────────────────────────────────────────────
+local CFG = {
+    Size         = math.random(9, 14),
+    LerpFrames   = 5,           -- frames to drag IN
+    SnapBackFrames = 4,         -- frames to drag BACK after hit
+    DragCooldown = 0.5,
+    AngleCap     = 110,
+    Enabled      = true,
     ScriptKilled = false,
-    Enabled = true,
-    VisualizerEnabled = false,
-    Size = 10,
-    Increment = 1,
+
+    -- How close to the Handle center to place the victim.
+    -- Too close = clipping, might look weird.
+    -- Too far = Touched might not fire.
+    HandleOffset = CFrame.new(0, 0, -1.5),
+
     Keybinds = {
-        Increase = Enum.KeyCode.J,
-        Decrease = Enum.KeyCode.K,
-        Toggle = Enum.KeyCode.Z,
-        VisualizerToggle = Enum.KeyCode.X,
-        KillScript = Enum.KeyCode.P
-    }
+        Toggle     = Enum.KeyCode.Z,
+        KillScript = Enum.KeyCode.P,
+    },
 }
 
-local UIS = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
-local StarterGui = game:GetService("StarterGui")
-local Players = game:GetService("Players")
-
 local Connections = {}
-local Instances = {}
-
 local LocalPlayer = Players.LocalPlayer
+local ActiveDrags = {}
+local LastDrag    = {}
 
-local function Notify(Text)
-    StarterGui:SetCore("SendNotification", {
-        Title = "Summer Cbring",
-        Text = Text,
-    })
+-- ─────────────────────────────────────────────────────────────
+-- HELPERS
+-- ─────────────────────────────────────────────────────────────
+local function Notify(text)
+    StarterGui:SetCore("SendNotification", { Title = "HCBring v2", Text = text })
 end
 
-Notify("Loaded.")
-
-Connections.InputBegan = UIS.InputBegan:Connect(function(Input, GPE)
-    local Success, Error = pcall(function()
-        if GPE then return end
-        
-        if Input.KeyCode == getgenv().Settings.Keybinds.Increase then
-            getgenv().Settings.Size = getgenv().Settings.Size + getgenv().Settings.Increment
-            Notify("Size is " .. getgenv().Settings.Size)
-        elseif Input.KeyCode == getgenv().Settings.Keybinds.Decrease then
-            getgenv().Settings.Size = getgenv().Settings.Size - getgenv().Settings.Increment
-            Notify("Size is " .. getgenv().Settings.Size)
-        elseif Input.KeyCode == getgenv().Settings.Keybinds.Toggle then
-            getgenv().Settings.Enabled = not getgenv().Settings.Enabled
-            Notify("Enabled: " .. tostring(getgenv().Settings.Enabled))
-        elseif Input.KeyCode == getgenv().Settings.Keybinds.VisualizerToggle then
-            getgenv().Settings.VisualizerEnabled = not getgenv().Settings.VisualizerEnabled
-            Notify("Visualizer: " .. tostring(getgenv().Settings.VisualizerEnabled))
-        elseif Input.KeyCode == getgenv().Settings.Keybinds.KillScript then
-            getgenv().Settings.ScriptKilled = true
-            Notify("Killed script.")
-            for i, v in pairs(Connections) do
-                pcall(function() v:Disconnect() end)
-            end
-            for j, k in pairs(Instances) do
-                k:Destroy()
-            end
-        end
-    end)
-    
-    if Error then
-        warn(Error)
+local function SuppressSignal(signal)
+    for _, conn in ipairs(getconnections(signal)) do
+        pcall(function() conn:Disable() end)
     end
-end)
-
-local function DisableConnections(Connection)
-    for i, v in pairs(getconnections(Connection)) do
-		pcall(function()
-			v:Disable()
-		end)
-	end
 end
 
-local function EnableConnections(Connection)
-    for i, v in pairs(getconnections(Connection)) do
-		pcall(function()
-			v:Enable()
-		end)
-	end
+local function RestoreSignal(signal)
+    for _, conn in ipairs(getconnections(signal)) do
+        pcall(function() conn:Enable() end)
+    end
 end
 
-Connections.Heartbeat = RunService.Heartbeat:Connect(function()
-    local Character = LocalPlayer.Character
-    if not Character then return end
-    
-    local Humanoid = Character:FindFirstChild("Humanoid")
-    local Tool = Character:FindFirstChildOfClass("Tool")
-    
-    if getgenv().Settings.Enabled == true and Tool and Humanoid then
+local function IsInFrontArc(attackerRoot, victimTorso)
+    local toVictim = (victimTorso.Position - attackerRoot.Position)
+    local dot      = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
+    local angle    = math.deg(math.acos(math.clamp(dot, -1, 1)))
+    return angle <= (CFG.AngleCap / 2)
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- CORE DRAG ROUTINE v2
+--
+-- Phase 1 (drag in):
+--   Suppress signals, lerp victim INTO the handle's swing arc,
+--   let Handle.Touched fire the game's damage system.
+--
+-- Phase 2 (snap back):
+--   After a hit is detected (or after LerpFrames), restore signals
+--   and lerp the victim back toward their origin.
+--   This hides the displacement in kill-cams and makes position-delta
+--   checks harder — the victim appears to "bounce" rather than teleport.
+--
+-- Why snap-back matters for evasion:
+--   Without it, the victim's corpse is standing inside the attacker.
+--   Kill-distance at time of Humanoid.Died = ~1.5 studs.
+--   That's MORE suspicious than a normal kill, not less.
+--   With snap-back, the victim is partway back to their origin when
+--   they die, so kill-distance looks like a close-but-normal melee hit.
+-- ─────────────────────────────────────────────────────────────
+local function DragAndHit(victim, handle, attackerRoot)
+    local uid  = victim.UserId
+    local char = victim.Character
+    if not char then return end
+
+    local torso    = char:FindFirstChild("Torso")
+    local humanoid = char:FindFirstChild("Humanoid")
+    if not torso or not humanoid or humanoid.Health <= 0 then return end
+
+    if ActiveDrags[uid] then return end
+    if tick() - (LastDrag[uid] or 0) < CFG.DragCooldown then return end
+    if not IsInFrontArc(attackerRoot, torso) then return end
+
+    ActiveDrags[uid] = true
+    LastDrag[uid]    = tick()
+
+    coroutine.wrap(function()
+        -- Destination: inside the handle's swing arc
+        local destination = handle.CFrame * CFG.HandleOffset
+
+        -- Record origin for snap-back
+        local origin = torso.CFrame
+
+        -- ── Phase 1: suppress and lerp IN ─────────────────────────────
+        SuppressSignal(torso.Changed)
+        SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
+
+        -- Velocity spoof: constant magnitude, direction toward destination
+        local lerpPath   = destination.Position - torso.Position
+        local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 58)
+        torso.AssemblyLinearVelocity = lerpPath.Unit * spoofSpeed
+
+        for i = 1, CFG.LerpFrames do
+            local alpha      = (i / CFG.LerpFrames) ^ 2  -- EaseInQuad
+            torso.CFrame     = origin:Lerp(destination, alpha)
+            RunService.Heartbeat:Wait()
+
+            -- Early exit if the victim died mid-drag (hit registered)
+            if humanoid.Health <= 0 then break end
+        end
+
+        -- ── Restore signals before snap-back ──────────────────────────
+        -- Restored HERE, not after snap-back, so that if Humanoid.Died
+        -- fires during snap-back it propagates through legitimate listeners.
+        RestoreSignal(torso.Changed)
+        RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
+
+        -- ── Phase 2: snap back toward origin ──────────────────────────
+        -- We lerp the torso back.  If the victim is already dead, their
+        -- ragdoll physics will take over immediately and the snap-back
+        -- CFrame writes will be ignored — which is fine.
+        -- If they somehow survived, they return to near their original spot.
+        local snapOrigin = torso.CFrame
+        for i = 1, CFG.SnapBackFrames do
+            -- Suppress again briefly during snap-back to hide the return path
+            SuppressSignal(torso.Changed)
+            SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
+
+            local alpha  = i / CFG.SnapBackFrames
+            torso.CFrame = snapOrigin:Lerp(origin, alpha)
+
+            RestoreSignal(torso.Changed)
+            RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
+
+            RunService.Heartbeat:Wait()
+        end
+
+        ActiveDrags[uid] = nil
+    end)()
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- TOOL INTEGRATION
+-- ─────────────────────────────────────────────────────────────
+local function HookTool(tool)
+    local handle   = tool:FindFirstChild("Handle")
+    local animator = LocalPlayer.Character
+                     and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+                     and LocalPlayer.Character.Humanoid:FindFirstChild("Animator")
+    if not handle or not animator then return end
+
+    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
         pcall(function()
-            local Handle = Tool.Handle
-            
-            if Handle then
-                if not Instances["Visualizer"] and getgenv().Settings.VisualizerEnabled == true then
-                    local Part = Instance.new("Part")
-                    Part.Name = ""
-                    Part.Anchored = false
-                    Part.CanCollide = false
-                    Part.Massless = true
-                    local SS = Instance.new("SelectionSphere")
-                    SS.Name = "_"
-                    SS.Adornee = Part
-                    SS.Parent = Part
-                    SS.SurfaceTransparency = 1
-                    SS.Transparency = 0
-                    
-                    Part.Parent = game:GetService("CoreGui")
-                    Instances["Visualizer"] = Part
-                    
-                    while Part.Parent == game:GetService("CoreGui") do
-                        pcall(function()
-                            SS.Color3 = Color3.fromRGB(230, 0, 38)
-                        end)
-                        
-                        if getgenv().Settings.ScriptKilled == true then
-                            break
-                        end
-                        
-                        task.wait()
-                    end
-                elseif Instances["Visualizer"] and getgenv().Settings.VisualizerEnabled == false then
-                    Instances["Visualizer"]:Destroy()
-                    Instances["Visualizer"] = nil
-                end
-                
-                if Instances["Visualizer"] then
-                    local Size = getgenv().Settings.Size
-                    Size = Vector3.new(Size, Size, Size)
-                    Instances["Visualizer"].Size = Size
-                    Instances["Visualizer"].CFrame = Handle.CFrame
-                end
-                    
-                EnableConnections(Handle.Touched)
-                for i, v in pairs(Players:GetPlayers()) do
-                    if v ~= LocalPlayer and v.Character:FindFirstChild("Humanoid").Health > 0 and v.Character and v.Character:FindFirstChild("Torso") then
-                        if (Handle.Position - v.Character.Torso.Position).Magnitude <= getgenv().Settings.Size then
-                            coroutine.wrap(function()
-                                DisableConnections(v.Character['Torso'].Changed)
-                                DisableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
-                                v.Character['Torso']:BreakJoints()
-                                v.Character['Torso'].Transparency = 1
-                                v.Character['Torso'].CanCollide = false
-                                v.Character['Torso'].CFrame = Character.HumanoidRootPart.CFrame * CFrame.new(1, 0, -3.5)
-                                EnableConnections(v.Character['Torso'].Changed)
-                                EnableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
-                            end)()
-                        end
+            track:GetMarkerReachedSignal("HitboxOpen"):Connect(function()
+                if not CFG.Enabled or CFG.ScriptKilled then return end
+                local root = LocalPlayer.Character
+                             and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not root then return end
+
+                for _, player in ipairs(Players:GetPlayers()) do
+                    if player == LocalPlayer then continue end
+                    local pchar  = player.Character
+                    if not pchar then continue end
+                    local pTorso = pchar:FindFirstChild("Torso")
+                    if not pTorso then continue end
+
+                    local dist = (handle.Position - pTorso.Position).Magnitude
+                    if dist <= CFG.Size then
+                        DragAndHit(player, handle, root)
                     end
                 end
-                DisableConnections(Handle.Touched)
-            end
+            end)
         end)
-    else
-        for i, v in pairs(Instances) do
-            v:Destroy()
-            Instances[i] = nil
+    end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- FALLBACK HEARTBEAT
+-- ─────────────────────────────────────────────────────────────
+Connections.Heartbeat = RunService.Heartbeat:Connect(function()
+    if not CFG.Enabled or CFG.ScriptKilled then return end
+    local char = LocalPlayer.Character
+    if not char then return end
+
+    local tool     = char:FindFirstChildOfClass("Tool")
+    local root     = char:FindFirstChild("HumanoidRootPart")
+    if not tool or not root then return end
+    local handle   = tool:FindFirstChild("Handle")
+    if not handle then return end
+
+    if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player == LocalPlayer then continue end
+        local pchar  = player.Character
+        if not pchar then continue end
+        local pTorso = pchar:FindFirstChild("Torso")
+        if not pTorso then continue end
+
+        if (handle.Position - pTorso.Position).Magnitude <= CFG.Size then
+            DragAndHit(player, handle, root)
         end
     end
 end)
+
+-- ─────────────────────────────────────────────────────────────
+-- CHARACTER / TOOL WIRING
+-- ─────────────────────────────────────────────────────────────
+local function OnCharacter(char)
+    char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then HookTool(child) end
+    end)
+end
+
+if LocalPlayer.Character then OnCharacter(LocalPlayer.Character) end
+LocalPlayer.CharacterAdded:Connect(OnCharacter)
+
+-- ─────────────────────────────────────────────────────────────
+-- KEYBINDS
+-- ─────────────────────────────────────────────────────────────
+Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == CFG.Keybinds.Toggle then
+        CFG.Enabled = not CFG.Enabled
+        Notify("Enabled: " .. tostring(CFG.Enabled))
+    elseif input.KeyCode == CFG.Keybinds.KillScript then
+        CFG.ScriptKilled = true
+        Notify("Killed.")
+        for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
+    end
+end)
+
+Notify("HCBring v2 loaded. Size=" .. CFG.Size)
