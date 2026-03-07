@@ -182,6 +182,7 @@ local STATS_THROTTLE      = 20
 local winDragging   = false
 local winDragStart, winPosStart, shadowPosStart = nil, nil, nil
 local winRef, shadowRef = nil, nil
+local winH          = 720   -- actual rendered height (clamped to viewport at BuildGUI time)
 local wiredChars    = {}
 local activeDrag    = nil   -- shared slider drag dispatcher
 local triggerRowDimRefs = nil  -- { chipStroke, chipLbl, rbLbl, rbStroke }
@@ -589,7 +590,7 @@ local guiVisible   = true
 local refreshStats = nil
 
 local UI = {
-    W=338, H=720, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
+    W=338, CONTENT_H=720, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
     Font=Enum.Font.GothamBold, FontBody=Enum.Font.Gotham, TextSz=13, TitleSz=14,
     BG=Color3.fromRGB(13,13,18), ACCENT=Color3.fromRGB(0,200,115),
     ACCENT2=Color3.fromRGB(255,55,95), WARN=Color3.fromRGB(255,195,0),
@@ -847,9 +848,23 @@ local function BuildGUI()
     ScreenGui=sg
     sg.AncestryChanged:Connect(function() if not sg.Parent then listeningForTrigger=false end end)
 
-    local shadow=MkFrame(sg,UDim2.new(0,UI.W+16,0,UI.H+16),UDim2.new(0,52,0,112),Color3.fromRGB(0,0,0),0)
+    --[[
+        Responsive window height.
+        winH is capped so the panel always fits on-screen with MARGIN_Y pixels
+        of breathing room (24 px top + 24 px bottom).  Content that doesn't fit
+        is accessible through the ScrollingFrame below.
+        Initial position is centered horizontally and vertically, then clamped
+        so no edge can start off-screen.
+    --]]
+    local MARGIN_Y = 48
+    local vp   = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800,600)
+    winH       = math.max(UI.TitleH + 80, math.min(UI.CONTENT_H, vp.Y - MARGIN_Y))
+    local initX = math.clamp(math.floor((vp.X - UI.W) / 2), 0, math.max(0, vp.X - UI.W))
+    local initY = math.clamp(math.floor((vp.Y - winH)  / 2), 0, math.max(0, vp.Y - winH))
+
+    local shadow=MkFrame(sg,UDim2.new(0,UI.W+16,0,winH+16),UDim2.new(0,initX-8,0,initY-8),Color3.fromRGB(0,0,0),0)
     shadow.BackgroundTransparency=0.58; MkCorner(shadow,12)
-    local win=MkFrame(sg,UDim2.new(0,UI.W,0,UI.H),UDim2.new(0,60,0,120),UI.BG,1)
+    local win=MkFrame(sg,UDim2.new(0,UI.W,0,winH),UDim2.new(0,initX,0,initY),UI.BG,1)
     MkCorner(win,8); MkStroke(win,UI.BORDER,1)
     winRef=win; shadowRef=shadow
 
@@ -870,7 +885,26 @@ local function BuildGUI()
         end
     end)
 
-    local content=MkFrame(win,UDim2.new(1,0,1,-UI.TitleH),UDim2.new(0,0,0,UI.TitleH),UI.BG,2)
+    --[[
+        ScrollingFrame fills the space below the titlebar.
+        CanvasSize.Y is set at the end of BuildGUI once all rows have been
+        placed and the final `y` cursor value is known.
+        ScrollBarThickness=4 keeps it subtle; ElasticBehavior=Never prevents
+        over-scroll bounce on mobile.
+    --]]
+    local content = Instance.new("ScrollingFrame")
+    content.Size                 = UDim2.new(1,0,1,-UI.TitleH)
+    content.Position             = UDim2.new(0,0,0,UI.TitleH)
+    content.BackgroundColor3     = UI.BG
+    content.BorderSizePixel      = 0
+    content.ZIndex               = 2
+    content.ScrollBarThickness   = 4
+    content.ScrollBarImageColor3 = UI.MUTED
+    content.ScrollingDirection   = Enum.ScrollingDirection.Y
+    content.ElasticBehavior      = Enum.ElasticBehavior.Never
+    content.CanvasSize           = UDim2.new(0,0,0,0)   -- updated at end of BuildGUI
+    content.ClipsDescendants     = true
+    content.Parent               = win
     local y=4
 
     -- ── REACH & TIMING ───────────────────────────────────────
@@ -1035,6 +1069,9 @@ local function BuildGUI()
     -- ── STATS ────────────────────────────────────────────────
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+4
     refreshStats=MkStatsStrip(content,y)
+
+    -- Seal the canvas: 28 px for the stats strip + 10 px bottom padding.
+    content.CanvasSize = UDim2.new(0,0,0,y+38)
 end
 
 -- Module-level UIS listeners (V4-9: registered once, stored in Connections)
@@ -1047,9 +1084,13 @@ end)
 Connections.InputChanged = UIS.InputChanged:Connect(function(i)
     if i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
     if winDragging and winRef and winDragStart then
-        local d=i.Position-winDragStart
-        winRef.Position    = UDim2.new(winPosStart.X.Scale,    winPosStart.X.Offset+d.X,    winPosStart.Y.Scale,    winPosStart.Y.Offset+d.Y)
-        shadowRef.Position = UDim2.new(shadowPosStart.X.Scale, shadowPosStart.X.Offset+d.X-8, shadowPosStart.Y.Scale, shadowPosStart.Y.Offset+d.Y-8)
+        local d  = i.Position - winDragStart
+        local vp = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800,600)
+        -- Clamp so no edge of the window leaves the viewport
+        local nx = math.clamp(winPosStart.X.Offset + d.X, 0, math.max(0, vp.X - UI.W))
+        local ny = math.clamp(winPosStart.Y.Offset + d.Y, 0, math.max(0, vp.Y - winH))
+        winRef.Position    = UDim2.new(winPosStart.X.Scale,    nx,    winPosStart.Y.Scale,    ny)
+        shadowRef.Position = UDim2.new(shadowPosStart.X.Scale, nx-8,  shadowPosStart.Y.Scale, ny-8)
     end
     if activeDrag then
         local ad=activeDrag; local r=ad.track.AbsoluteSize.X
@@ -1312,6 +1353,10 @@ Notify(string.format("NoCBring v8  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
  HumanoidCache    [userId]=Humanoid, mirrors TorsoCache pattern
  WireCharacter    Replaces WireCharacterTorso; wires both caches
  Teams service    Added to service block for dropdown population
+ Responsive GUI   winH clamped to viewport − 48 px; content area is a
+                  ScrollingFrame so all rows are reachable on any screen;
+                  window drag clamped to viewport edges;
+                  initial position centered on screen
 
  KEYBINDS
    Z  toggle drag   X  toggle arc visualizer   C  show/hide panel   P  kill
