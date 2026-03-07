@@ -1,7 +1,23 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  NO-BREAKJOINTS CBRING v6 — FULL AUDIT + OPTIMAL TEAM/WHITELIST            ║
+║  NO-BREAKJOINTS CBRING v7 — ALWAYS-ON MODE + ARC-ONLY VISUALIZER          ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+
+ New in v7:
+   AlwaysOn  — toggle in the INPUTS section.  When on, drag fires every
+               Heartbeat without any button held.  IsTriggerActive()
+               short-circuits to `true` before any UIS poll — zero cost
+               on the normal code path.  The Trigger chip and REBIND
+               button are dimmed in the UI to signal they are bypassed.
+               Switching back to AlwaysOn=false restores normal trigger
+               behaviour and un-dims the row.
+
+   Sphere removed — the SelectionSphere visualizer (Section 1, v6) has
+               been deleted.  The arc cone already encodes both the reach
+               radius (line length) and the angle cap (sweep), making the
+               sphere purely redundant.  Removes: VisPart, VisSphere,
+               BuildSphereVis, DestroySphereVis, UpdateSphereVis,
+               lastSphereSize, lastSphereColor, and ~50 call-sites.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  BUGS INHERITED FROM v5 — FIXED IN v6
@@ -90,8 +106,8 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
-if getgenv()._NOCBRING_V6_LOADED then return end
-getgenv()._NOCBRING_V6_LOADED = true
+if getgenv()._NOCBRING_V7_LOADED then return end
+getgenv()._NOCBRING_V7_LOADED = true
 
 -- ─────────────────────────────────────────────────────────────
 -- SERVICES
@@ -114,6 +130,7 @@ getgenv().NCBCFG = getgenv().NCBCFG or {
     RemoteName   = "DamageRemote",
     IgnoreTeam   = true,
     WhitelistURL = "",
+    AlwaysOn          = false,   -- fire every Heartbeat; no trigger hold needed
     Enabled           = true,
     VisualizerEnabled = true,
     ScriptKilled      = false,
@@ -178,9 +195,7 @@ local function RebuildArcAngles()
     arcAngleDirty = false
 end
 
--- Visualizer dirty flags
-local lastSphereSize  = -1
-local lastSphereColor = nil
+-- Visualizer dirty flag
 local lastArcColor    = nil
 
 -- V5-7: WL range tracking via monotonic frame counter (no table allocs)
@@ -209,6 +224,7 @@ local winDragStart, winPosStart, shadowPosStart = nil, nil, nil
 local winRef, shadowRef = nil, nil
 local wiredChars = {}
 local activeDrag = nil  -- shared slider drag dispatcher
+local triggerRowDimRefs = nil  -- { chipStroke, chipLbl, rbLbl, rbStroke } — set by BuildGUI
 
 -- ─────────────────────────────────────────────────────────────
 -- V5-8: TORSO CACHE — single table lookup instead of FindFirstChild ×3
@@ -352,6 +368,8 @@ end
 -- TRIGGER HOTSWAP
 -- ─────────────────────────────────────────────────────────────
 local function IsTriggerActive()
+    -- AlwaysOn bypasses all UIS polling — short-circuit before any branch
+    if CFG.AlwaysOn then return true end
     local ti = CFG.TriggerInput
     -- V5: pcall guard — malformed TriggerInput won't crash the Heartbeat
     if ti.Kind == "Mouse" then
@@ -464,52 +482,23 @@ local function FetchWhitelist()
 end
 
 -- ═══════════════════════════════════════════════════════════════
---  SECTION 1 — SPHERE REACH VISUALIZER
+--  SECTION 1 — ARC CONE VISUALIZER
 -- ═══════════════════════════════════════════════════════════════
-local VisPart   = nil
-local VisSphere = nil
-
+--[[
+    State colors — shared by all visualizer geometry:
+      DISABLED  gray   CFG.Enabled = false
+      CLEAR     green  enabled, no targets in range
+      TARGET    yellow hostile target(s) in range
+      FIRING    red    drag coroutine active
+      WHITELIST blue   whitelisted player in range, no hostile
+--]]
 local COLOR = {
     DISABLED  = Color3.fromRGB(110, 110, 125),
     CLEAR     = Color3.fromRGB(0,   210, 110),
     TARGET    = Color3.fromRGB(255, 195, 0  ),
     FIRING    = Color3.fromRGB(255, 30,  55 ),
-    WHITELIST = Color3.fromRGB(0,   180, 255),  -- blue: WL player in range
+    WHITELIST = Color3.fromRGB(0,   180, 255),
 }
-
-local function BuildSphereVis()
-    if VisPart then VisPart:Destroy() end
-    local p = Instance.new("Part")
-    p.Name="_NCBSp"; p.Anchored=false; p.CanCollide=false
-    p.Massless=true; p.Transparency=1; p.Size=Vector3.new(1,1,1)
-    p.Parent = game:GetService("CoreGui")
-    local s = Instance.new("SelectionSphere")
-    s.Adornee=p; s.SurfaceTransparency=0.85; s.Transparency=0.3
-    s.Color3=COLOR.CLEAR; s.SurfaceColor3=COLOR.CLEAR; s.Parent=p
-    VisPart=p; VisSphere=s
-    lastSphereSize=-1; lastSphereColor=nil
-end
-
-local function DestroySphereVis()
-    if VisPart then VisPart:Destroy(); VisPart=nil; VisSphere=nil end
-    lastSphereSize=-1; lastSphereColor=nil
-end
-
-local function UpdateSphereVis(handle, col)
-    if not CFG.VisualizerEnabled then DestroySphereVis(); return end
-    if not VisPart or not VisPart.Parent then BuildSphereVis() end
-    local s = CFG.Size
-    if s ~= lastSphereSize then
-        local d = s*2; VisPart.Size = Vector3.new(d,d,d); lastSphereSize = s
-    end
-    VisPart.CFrame = handle.CFrame
-    if col ~= lastSphereColor and VisSphere then
-        VisSphere.Color3=col; VisSphere.SurfaceColor3=col; lastSphereColor=col
-    end
-end
-
--- ═══════════════════════════════════════════════════════════════
---  SECTION 1b — ARC CONE VISUALIZER
 -- ═══════════════════════════════════════════════════════════════
 --[[
     V5-3: arcPtX/Y/Z are pre-allocated at module level.
@@ -518,6 +507,12 @@ end
     SetBeam signature: (part, x1,y1,z1, x2,y2,z2, thick)
     Uses CFrame.lookAt(mid, mid+dir) — -Z axis aligns with p1→p2,
     Size.Z is the part's long axis.
+
+    Origin: HumanoidRootPart.CFrame — matches IsInFrontArc exactly.
+    The two radius lines span HRP → left/right boundary at CFG.Size studs.
+    The 14 arc segments trace the curved boundary between them.
+    Both reach radius (line length) and angle cap (arc sweep) are directly
+    visible, making a separate sphere redundant.
 --]]
 
 local ArcPool = {}
@@ -597,7 +592,7 @@ local guiVisible   = true
 local refreshStats = nil
 
 local UI = {
-    W=338, H=516, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
+    W=338, H=550, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
     Font=Enum.Font.GothamBold, FontBody=Enum.Font.Gotham, TextSz=13, TitleSz=14,
     BG=Color3.fromRGB(13,13,18), ACCENT=Color3.fromRGB(0,200,115),
     ACCENT2=Color3.fromRGB(255,55,95), WARN=Color3.fromRGB(255,195,0),
@@ -735,7 +730,7 @@ local function BuildGUI()
     sliders.Size=MkSlider(content,y,"Size",5,30,CFG.Size,
         function(v) return string.format("%.0f st",v) end,
         function(v)
-            CFG.Size=v; sizeSq=v*v; lastSphereSize=-1
+            CFG.Size=v; sizeSq=v*v
             -- V4-10: size change does NOT set arcAngleDirty (ArcAngles has no size data)
         end)
     y=y+UI.RowH
@@ -774,10 +769,38 @@ local function BuildGUI()
     local rbBG=MkFrame(content,UDim2.new(0,68,0,24),UDim2.new(0,166,0,y+5),Color3.fromRGB(22,22,34),3); MkCorner(rbBG,5)
     local rbStroke=MkStroke(rbBG,UI.BORDER,1)
     local _rbLbl=MkLabel(rbBG,"REBIND",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,11,UI.MUTED,4,Enum.TextXAlignment.Center)
-    rbBG.MouseEnter:Connect(function() if not listeningForTrigger then _rbLbl.TextColor3=UI.TEXT;rbStroke.Color=UI.MUTED end end)
-    rbBG.MouseLeave:Connect(function() if not listeningForTrigger then _rbLbl.TextColor3=UI.MUTED;rbStroke.Color=UI.BORDER end end)
-    rbBG.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then _rbLbl.TextColor3=UI.WARN;rbStroke.Color=UI.WARN;chipStroke.Color=UI.WARN;StartRebind() end end)
+    rbBG.MouseEnter:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.TEXT;rbStroke.Color=UI.MUTED end end)
+    rbBG.MouseLeave:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.MUTED;rbStroke.Color=UI.BORDER end end)
+    rbBG.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.WARN;rbStroke.Color=UI.WARN;chipStroke.Color=UI.WARN;StartRebind() end end)
+    -- Store refs for AlwaysOn dimming and rebind visual restore
+    triggerRowDimRefs = { chipStroke=chipStroke, chipLbl=triggerBindLabel, rbLbl=_rbLbl, rbStroke=rbStroke }
     getgenv()._NCBRebindUI={rbLbl=_rbLbl,rbStroke=rbStroke,chipStroke=chipStroke}
+    -- Apply initial dim state if AlwaysOn was already true when GUI built
+    if CFG.AlwaysOn then
+        chipStroke.Color = UI.MUTED; triggerBindLabel.TextColor3 = UI.MUTED
+        _rbLbl.TextColor3 = UI.MUTED; rbStroke.Color = UI.BORDER
+    end
+    y=y+UI.RowH
+
+    -- Always On toggle  (placed immediately after Trigger row, still in INPUTS)
+    --[[
+        When on: IsTriggerActive() short-circuits to true — no button hold needed.
+        The trigger chip and REBIND are dimmed to show they are bypassed.
+        Switching off restores normal trigger-hold behavior and un-dims the row.
+    --]]
+    toggles.AlwaysOn=MkToggle(content,UI.Pad,y,"Always On",CFG.AlwaysOn,function(v)
+        CFG.AlwaysOn=v
+        if triggerRowDimRefs then
+            local tr=triggerRowDimRefs
+            if v then
+                tr.chipStroke.Color=UI.MUTED; tr.chipLbl.TextColor3=UI.MUTED
+                tr.rbLbl.TextColor3=UI.MUTED; tr.rbStroke.Color=UI.BORDER
+            else
+                tr.chipStroke.Color=UI.ACCENT; tr.chipLbl.TextColor3=UI.ACCENT
+                tr.rbLbl.TextColor3=UI.MUTED;  tr.rbStroke.Color=UI.BORDER
+            end
+        end
+    end)
     y=y+UI.RowH
 
     -- ── FILTERS ──────────────────────────────────────────────
@@ -829,7 +852,7 @@ local function BuildGUI()
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
     toggles.Enabled=MkToggle(content,UI.Pad,y,"Enabled",CFG.Enabled,function(v) CFG.Enabled=v end)
     toggles.Visualizer=MkToggle(content,UI.W/2,y,"Visualizer",CFG.VisualizerEnabled,function(v)
-        CFG.VisualizerEnabled=v; if not v then DestroySphereVis(); DestroyArcVis() end
+        CFG.VisualizerEnabled=v; if not v then DestroyArcVis() end
     end)
     y=y+30
 
@@ -952,9 +975,9 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     local char=LocalPlayer.Character; if not char then return end
     local tool=char:FindFirstChildOfClass("Tool")
     local root=char:FindFirstChild("HumanoidRootPart")
-    if not tool or not root then currentRemote=nil; DestroySphereVis(); DestroyArcVis(); return end
+    if not tool or not root then currentRemote=nil; DestroyArcVis(); return end
     local handle=tool:FindFirstChild("Handle")
-    if not handle then DestroySphereVis(); DestroyArcVis(); return end
+    if not handle then DestroyArcVis(); return end
     if not currentRemote then currentRemote=FindRemote(tool) end
 
     local triggerHeld    = IsTriggerActive()
@@ -1010,7 +1033,6 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     else                              col=COLOR.CLEAR
     end
 
-    UpdateSphereVis(handle, col)
     UpdateArcVis(root.CFrame, col)
 end)
 
@@ -1049,13 +1071,13 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
     elseif input.KeyCode==CFG.Keybinds.ToggleVis then
         CFG.VisualizerEnabled=not CFG.VisualizerEnabled
         if toggles.Visualizer then toggles.Visualizer.SetState(CFG.VisualizerEnabled) end
-        if not CFG.VisualizerEnabled then DestroySphereVis(); DestroyArcVis() end
+        if not CFG.VisualizerEnabled then DestroyArcVis() end
         Notify("Visualizer: "..tostring(CFG.VisualizerEnabled))
     elseif input.KeyCode==CFG.Keybinds.ToggleUI then
         guiVisible=not guiVisible
         if ScreenGui then for _,o in ipairs(ScreenGui:GetChildren()) do o.Visible=guiVisible end end
     elseif input.KeyCode==CFG.Keybinds.Kill then
-        CFG.ScriptKilled=true; DestroySphereVis(); DestroyArcVis()
+        CFG.ScriptKilled=true; DestroyArcVis()
         if ScreenGui then ScreenGui:Destroy() end
         for _,c in pairs(Connections) do pcall(c.Disconnect,c) end
         Notify("Script killed.")
@@ -1085,39 +1107,24 @@ end)
 
 RebuildArcAngles()
 
-Notify(string.format("NoCBring v6  Size=%d  Trigger=%s  WL=%s  [C] UI",
-    CFG.Size, CFG.TriggerInput.Name, CFG.WhitelistURL~="" and "set" or "off"))
+Notify(string.format("NoCBring v7  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
+    CFG.Size, CFG.TriggerInput.Name, tostring(CFG.AlwaysOn), CFG.WhitelistURL~="" and "set" or "off"))
 
 --[[
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- v5 → v6 FIX INDEX
+ v6 → v7 CHANGES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- V5-1  RestoreSignal not guaranteed    suppressed flag + cleanup()
- V5-2  player.Team per-frame           PlayerTeamCache + per-player signal
- V5-3  ptX/Y/Z table alloc/frame       Pre-allocated arcPtX/Y/Z flat arrays
- V5-4  lp.Unit zero-vector UB          Magnitude guard before .Unit call
- V5-5  Duplicate Team signal in GUI    GUI handler reads cachedLocalTeam only
- V5-6  coroutine.wrap post-yield err   task.spawn
- V5-7  2 table allocs/frame (WL)       wlFrameId monotonic counter
- V5-8  GetTorso FindFirstChild×3/frame TorsoCache + WireCharacterTorso
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- TEAM AWARENESS
-   Ignore Team toggle (FILTERS section of panel)
-   Live team chip shows your current team name
-   Two nil-team players are NOT treated as teammates (FFA-safe)
-   PlayerTeamCache[uid] updated by signal — zero property reads/frame
-
- WHITELIST
-   Paste a raw GitHub URL into "WL URL" and click REFRESH
-   Format: one UserId per line, # starts a comment
-   3-attempt exponential back-off (1s → 2s → 4s)
-   Concurrent fetch guard: REFRESH is a no-op if already fetching
-   WhitelistHits stat = number of distinct range-entry events
-   Blue sphere/arc state = WL player in range, no hostile in range
-   Atomic Whitelist table swap on successful fetch
+ AlwaysOn  IsTriggerActive short-circuits; trigger row dimmed in UI
+ Sphere    Removed entirely (arc encodes both radius and angle)
 
  KEYBINDS
-   Z  toggle drag   X  toggle visualizers   C  show/hide panel   P  kill
+   Z  toggle drag   X  toggle arc visualizer   C  show/hide panel   P  kill
    REBIND: panel → REBIND → press any key or mouse button   Esc = cancel
+   (REBIND blocked when Always On is active)
+
+ ALWAYS ON
+   INPUTS section → Always On toggle
+   When on: drag fires every Heartbeat — no button hold required
+   When off: trigger-hold behavior resumes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
