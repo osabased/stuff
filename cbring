@@ -1,33 +1,106 @@
 --[[
-    HARD CBRING v2 — No BreakJoints
-    
-    The key insight: BreakJoints was never necessary.
-    
-    The original script used it as a shortcut to guarantee a kill.
-    But it was the most detectable thing in the entire script.
-    
-    The smarter approach: drag the victim into the tool's Handle so the
-    GAME'S OWN damage system registers the hit.  The server fires
-    Handle.Touched legitimately.  The damage module runs legitimately.
-    Humanoid.Health reaches 0 legitimately.  There is no anomalous
-    event anywhere in the kill pipeline — because we never touched it.
-    
-    We are not killing them.  We are moving them in front of the sword
-    and letting the sword kill them.
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          NO-BREAKJOINTS CBRING — FULL MODEL WITH ARCHITECTURAL NOTES        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-    What changes from v1:
-      - BreakJoints() call removed entirely
-      - Drag destination is now INSIDE the tool's swing arc, not beside
-        the HumanoidRootPart — so the Handle.Touched fires naturally
-      - Signal suppression window is shorter (lerp only, no post-kill writes)
-      - A "snap-back" is added: after the hit registers, we lerp the victim
-        back toward their original position so the teleport is less visible
-        in the kill-cam / replay
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ UNDERSTANDING THE ROBLOX CLIENT-SERVER RELATIONSHIP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ Roblox uses a CLIENT-AUTHORITATIVE physics model with a twist:
+
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  NETWORK OWNERSHIP — who controls what                          │
+ │                                                                 │
+ │  Each BasePart has a "network owner": the peer (client or       │
+ │  server) whose physics simulation is treated as canonical for   │
+ │  that part.                                                     │
+ │                                                                 │
+ │  By default:                                                    │
+ │    • Player A's character parts  → owned by Player A's client   │
+ │    • Player B's character parts  → owned by Player B's client   │
+ │    • Unanchored workspace parts  → owned by nearest player      │
+ │    • Anchored / server parts     → owned by server              │
+ │                                                                 │
+ │  CRITICAL: Player A's client CANNOT write physics state         │
+ │  (CFrame, Velocity, AssemblyLinearVelocity) to Player B's       │
+ │  character parts in a way the SERVER or Player B sees.          │
+ │  The write happens LOCALLY on Player A's machine only.          │
+ └─────────────────────────────────────────────────────────────────┘
+
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  INSTANCE REPLICATION — who can add/remove Instances            │
+ │                                                                 │
+ │  Instance tree changes (ChildAdded, ChildRemoved) are ONLY      │
+ │  replicated SERVER → CLIENT, never CLIENT → SERVER.             │
+ │                                                                 │
+ │  This means BreakJoints() called on the CHEATER'S client:       │
+ │    1. Removes Motor6D instances LOCALLY on the cheater's screen │
+ │    2. The server NEVER sees those Motor6Ds removed              │
+ │    3. The victim NEVER sees those Motor6Ds removed              │
+ │    4. The victim stays alive on every machine except the cheater│
+ └─────────────────────────────────────────────────────────────────┘
+
+ ┌─────────────────────────────────────────────────────────────────┐
+ │  THE REAL KILL MECHANISM                                        │
+ │                                                                 │
+ │  cbring was never about BreakJoints killing the victim.         │
+ │  BreakJoints was a SIDE EFFECT / visual glitch that appeared    │
+ │  to work in earlier Roblox versions or in games where the       │
+ │  damage pipeline runs on a LocalScript.                         │
+ │                                                                 │
+ │  The ACTUAL kill chain is:                                      │
+ │                                                                 │
+ │  [Cheater's Client]                                             │
+ │       │                                                         │
+ │       ▼                                                         │
+ │  Victim's Torso dragged LOCALLY (physics write stays local)     │
+ │       │                                                         │
+ │       ▼                                                         │
+ │  Handle.Touched fires on the CHEATER'S physics simulation       │
+ │  (because locally the torso is now overlapping the handle)      │
+ │       │                                                         │
+ │       ▼                                                         │
+ │  Tool LocalScript fires:  DamageRemote:FireServer(victim)       │
+ │       │                                                         │
+ │       ▼                                                         │
+ │  [Server receives RemoteEvent]                                  │
+ │       │                                                         │
+ │       ▼                                                         │
+ │  Server applies damage to victim.Humanoid.Health                │
+ │  → victim dies on server → replicates to all clients            │
+ │                                                                 │
+ │  The drag is a CLIENT-SIDE ILLUSION.                            │
+ │  The server sees: a hit RemoteEvent.  Nothing else.             │
+ │  Victim's position on the server = their REAL position.         │
+ └─────────────────────────────────────────────────────────────────┘
+
+ WHY REMOVE BREAKJOINTS?
+ ─────────────────────────────────────────────────────────────────
+ BreakJoints() is noise. It does nothing server-side, but it:
+   • Creates a Motor6D ChildRemoved event locally (detectable if the
+     anti-cheat runs on the cheater's client — e.g. a sandboxed AC)
+   • Can cause visual anomalies for the cheater that expose the script
+   • Adds an unnecessary executor API call that some detection hooks
+     can intercept
+
+ Without BreakJoints:
+   • Layer 4 (joint audit) of the previous anti-cheat is completely blind
+   • The exploit becomes a pure RemoteEvent attack
+   • The server can only detect it via hit validation logic
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
-if getgenv()._HCBRING2_LOADED then return end
-getgenv()._HCBRING2_LOADED = true
+-- ─────────────────────────────────────────────────────────────
+-- GUARD
+-- ─────────────────────────────────────────────────────────────
+if getgenv()._NOCBRING_LOADED then return end
+getgenv()._NOCBRING_LOADED = true
 
+-- ─────────────────────────────────────────────────────────────
+-- SERVICES
+-- ─────────────────────────────────────────────────────────────
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
 local UIS          = game:GetService("UserInputService")
@@ -37,18 +110,56 @@ local StarterGui   = game:GetService("StarterGui")
 -- CONFIG
 -- ─────────────────────────────────────────────────────────────
 local CFG = {
+    --[[
+        Size is the LOCAL hitbox radius we manufacture on the cheater's
+        client.  The server never sees this radius — it only receives the
+        resulting RemoteEvent.  Randomized per-session to prevent the
+        statistical kill-distance fingerprinting that a larger fixed
+        size would create.
+    --]]
     Size         = math.random(9, 14),
-    LerpFrames   = 5,           -- frames to drag IN
-    SnapBackFrames = 4,         -- frames to drag BACK after hit
-    DragCooldown = 0.5,
-    AngleCap     = 110,
+
+    --[[
+        LerpFrames: how many Heartbeat frames the local drag takes.
+        6 frames ≈ 0.10 s at 60 Hz.
+        Shorter = kill faster but more physically anomalous.
+        Longer  = smoother but gives server more time to move victim.
+        We want the drag to complete BEFORE the server's next physics
+        snapshot is sent back to us.  At 60 Hz physics, one server
+        heartbeat ≈ 0.016 s.  6 frames = 6 server snapshots pass.
+        This is intentional — by the time the RemoteEvent reaches the
+        server, the server's snapshot of the victim has NOT moved.
+        The server rejects nothing because it doesn't see the drag.
+    --]]
+    LerpFrames   = 6,
+
+    --[[
+        DragCooldown: minimum seconds between successive RemoteEvent fires
+        to the server.  The anti-cheat's rate-limiter will watch for
+        bursts of damage events.  We space them apart to stay under
+        the burst threshold.
+        Tuned to be slightly above a fast legitimate attack rate.
+    --]]
+    DragCooldown = 0.40,
+
+    --[[
+        AngleCap: only drag victims within this cone in front of the
+        attacker (degrees, full width).  Keeps kill-angle distribution
+        realistic so the server's behavioral model sees a normal player.
+        Legitimate melee kills almost always happen in the forward arc.
+    --]]
+    AngleCap     = 100,
+
+    --[[
+        RemoteName: the name of the RemoteEvent (or RemoteFunction) that
+        the tool uses to communicate hits to the server.  The exploit
+        must fire this as if the tool's LocalScript fired it normally.
+        In most games this is found by reading the tool's LocalScript.
+    --]]
+    RemoteName   = "DamageRemote",  -- change per-game
+
     Enabled      = true,
     ScriptKilled = false,
-
-    -- How close to the Handle center to place the victim.
-    -- Too close = clipping, might look weird.
-    -- Too far = Touched might not fire.
-    HandleOffset = CFrame.new(0, 0, -1.5),
 
     Keybinds = {
         Toggle     = Enum.KeyCode.Z,
@@ -56,16 +167,19 @@ local CFG = {
     },
 }
 
+-- ─────────────────────────────────────────────────────────────
+-- STATE
+-- ─────────────────────────────────────────────────────────────
 local Connections = {}
 local LocalPlayer = Players.LocalPlayer
-local ActiveDrags = {}
-local LastDrag    = {}
+local ActiveDrags = {}   -- { [userId] = true }
+local LastDrag    = {}   -- { [userId] = number (tick) }
 
 -- ─────────────────────────────────────────────────────────────
 -- HELPERS
 -- ─────────────────────────────────────────────────────────────
 local function Notify(text)
-    StarterGui:SetCore("SendNotification", { Title = "HCBring v2", Text = text })
+    StarterGui:SetCore("SendNotification", { Title = "NoCBring", Text = text })
 end
 
 local function SuppressSignal(signal)
@@ -80,34 +194,77 @@ local function RestoreSignal(signal)
     end
 end
 
+--[[
+    IsInFrontArc: returns true if the victim's torso falls within the
+    cheater's forward arc (CFG.AngleCap degrees wide).
+
+    Why bother?  Because the kill-angle statistical model on the server
+    looks at the distribution of angles between the attacker's facing
+    direction and where the victim was at time of kill.  If we kill
+    people at 180° (directly behind us), that's a massive red flag.
+    Restricting to a plausible forward arc keeps the distribution normal.
+
+    The server computes this angle using SERVER-SIDE positions.
+    Our local drag does NOT change the server's view of the victim's
+    position.  So the angle the server measures is:
+        attacker real pos → victim real pos
+    This is why we ALSO restrict by real-position angle before dragging —
+    we only drag victims who are already in a geometrically plausible
+    position from the server's perspective.
+--]]
 local function IsInFrontArc(attackerRoot, victimTorso)
     local toVictim = (victimTorso.Position - attackerRoot.Position)
-    local dot      = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
-    local angle    = math.deg(math.acos(math.clamp(dot, -1, 1)))
+    if toVictim.Magnitude < 0.1 then return false end
+    local dot   = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
+    local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
     return angle <= (CFG.AngleCap / 2)
 end
 
 -- ─────────────────────────────────────────────────────────────
--- CORE DRAG ROUTINE v2
+-- REMOTE RESOLVER
 --
--- Phase 1 (drag in):
---   Suppress signals, lerp victim INTO the handle's swing arc,
---   let Handle.Touched fire the game's damage system.
---
--- Phase 2 (snap back):
---   After a hit is detected (or after LerpFrames), restore signals
---   and lerp the victim back toward their origin.
---   This hides the displacement in kill-cams and makes position-delta
---   checks harder — the victim appears to "bounce" rather than teleport.
---
--- Why snap-back matters for evasion:
---   Without it, the victim's corpse is standing inside the attacker.
---   Kill-distance at time of Humanoid.Died = ~1.5 studs.
---   That's MORE suspicious than a normal kill, not less.
---   With snap-back, the victim is partway back to their origin when
---   they die, so kill-distance looks like a close-but-normal melee hit.
+-- Finds the DamageRemote in the tool.  Most games put this inside
+-- the Tool instance itself, or inside ReplicatedStorage.
+-- The exploit searches both locations.
 -- ─────────────────────────────────────────────────────────────
-local function DragAndHit(victim, handle, attackerRoot)
+local function FindRemote(tool)
+    -- Check inside the tool first
+    local r = tool:FindFirstChild(CFG.RemoteName, true)
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+        return r
+    end
+    -- Check ReplicatedStorage
+    r = game:GetService("ReplicatedStorage"):FindFirstChild(CFG.RemoteName, true)
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+        return r
+    end
+    return nil
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- CORE DRAG ROUTINE
+--
+-- This is a CLIENT-LOCAL operation.  Nothing written here reaches
+-- the server or any other player's client.  The ONLY thing that
+-- reaches the server is the RemoteEvent fire at the end.
+--
+-- Timeline on the cheater's client:
+--   Frame 0  : Suppress Changed/CFrame signals on victim's Torso
+--              (locally — because the game's own scripts may react
+--               to CFrame changes and cancel the drag)
+--              Assign spoofed velocity to match lerp direction.
+--   Frames 1–N: EaseInQuad lerp toward destination.
+--              Signals stay suppressed.
+--   Final frame: Restore signals.  Fire the damage RemoteEvent.
+--              We fire AFTER restore so the local Touched handler
+--              (if any) doesn't double-fire.
+--
+-- After RestoreSignal, the torso slowly drifts back to its real
+-- server position via normal replication.  The cheater's client
+-- sees the victim snap back.  This is acceptable — the kill has
+-- already been registered.
+-- ─────────────────────────────────────────────────────────────
+local function DragAndFire(victim, attackerRoot, remote)
     local uid  = victim.UserId
     local char = victim.Character
     if not char then return end
@@ -116,62 +273,85 @@ local function DragAndHit(victim, handle, attackerRoot)
     local humanoid = char:FindFirstChild("Humanoid")
     if not torso or not humanoid or humanoid.Health <= 0 then return end
 
+    -- Cooldown: prevent rapid-fire RemoteEvents that the AC rate-limiter
+    -- would catch immediately.
     if ActiveDrags[uid] then return end
     if tick() - (LastDrag[uid] or 0) < CFG.DragCooldown then return end
+
+    --[[
+        Critical pre-flight check:
+        We validate the angle using REAL positions (server's view).
+        If the victim is already behind us in real space, firing the
+        RemoteEvent would produce an anomalous kill angle on the server.
+        We skip the drag in that case — the AC's angle model never sees
+        an anomalous sample.
+    --]]
     if not IsInFrontArc(attackerRoot, torso) then return end
 
     ActiveDrags[uid] = true
     LastDrag[uid]    = tick()
 
     coroutine.wrap(function()
-        -- Destination: inside the handle's swing arc
-        local destination = handle.CFrame * CFG.HandleOffset
+        -- Destination: just inside our hit radius, slightly to the left
+        -- and in front of the attacker.  This produces a kill distance of
+        -- roughly 3–4 studs from the attacker's root when measured SERVER-
+        -- SIDE — because the server sees the victim at their REAL position,
+        -- which is not where we dragged them locally.
+        --
+        -- Wait — if the victim is, say, 30 studs away in real space,
+        -- and the server sees them at 30 studs, won't the AC's distance
+        -- check catch us?
+        --
+        -- YES.  This is the fundamental tension.  See CFG.Size:
+        -- We only drag victims who are within CFG.Size studs in LOCAL space,
+        -- which initially equals their REAL position (before any drag).
+        -- The first scan runs before the drag, so a victim 30 studs away
+        -- is never dragged — they were too far to begin with.
+        -- We're expanding the LOCAL effective range by only ~3–5 studs
+        -- beyond what the tool's real hitbox would allow.
+        local destination = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
 
-        -- Record origin for snap-back
-        local origin = torso.CFrame
-
-        -- ── Phase 1: suppress and lerp IN ─────────────────────────────
+        -- ── Suppress signals on victim's Torso (local only) ───────────
         SuppressSignal(torso.Changed)
         SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        -- Velocity spoof: constant magnitude, direction toward destination
+        -- ── Spoof velocity ─────────────────────────────────────────────
         local lerpPath   = destination.Position - torso.Position
-        local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 58)
+        local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 55)
         torso.AssemblyLinearVelocity = lerpPath.Unit * spoofSpeed
 
+        -- ── Lerp (client-local only) ───────────────────────────────────
+        local origin = torso.CFrame
         for i = 1, CFG.LerpFrames do
-            local alpha      = (i / CFG.LerpFrames) ^ 2  -- EaseInQuad
-            torso.CFrame     = origin:Lerp(destination, alpha)
+            local alpha      = i / CFG.LerpFrames
+            local easedAlpha = alpha * alpha   -- EaseInQuad
+            torso.CFrame     = origin:Lerp(destination, easedAlpha)
             RunService.Heartbeat:Wait()
-
-            -- Early exit if the victim died mid-drag (hit registered)
-            if humanoid.Health <= 0 then break end
         end
 
-        -- ── Restore signals before snap-back ──────────────────────────
-        -- Restored HERE, not after snap-back, so that if Humanoid.Died
-        -- fires during snap-back it propagates through legitimate listeners.
+        -- ── Restore signals ────────────────────────────────────────────
         RestoreSignal(torso.Changed)
         RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        -- ── Phase 2: snap back toward origin ──────────────────────────
-        -- We lerp the torso back.  If the victim is already dead, their
-        -- ragdoll physics will take over immediately and the snap-back
-        -- CFrame writes will be ignored — which is fine.
-        -- If they somehow survived, they return to near their original spot.
-        local snapOrigin = torso.CFrame
-        for i = 1, CFG.SnapBackFrames do
-            -- Suppress again briefly during snap-back to hide the return path
-            SuppressSignal(torso.Changed)
-            SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
+        --[[
+            Fire the RemoteEvent.
+            This is the ONLY action the server ever sees.
+            The drag existed only on our screen.
 
-            local alpha  = i / CFG.SnapBackFrames
-            torso.CFrame = snapOrigin:Lerp(origin, alpha)
+            The RemoteEvent signature depends on the game.
+            Common patterns:
+                remote:FireServer(victim)                 -- target only
+                remote:FireServer(victim, damage)         -- target + damage
+                remote:FireServer(victim, tool)           -- target + tool ref
 
-            RestoreSignal(torso.Changed)
-            RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
-
-            RunService.Heartbeat:Wait()
+            We pass `victim` as the first argument (the player object,
+            not the character) because most games resolve the character
+            from the player reference server-side.
+        --]]
+        if remote then
+            pcall(function()
+                remote:FireServer(victim)
+            end)
         end
 
         ActiveDrags[uid] = nil
@@ -179,75 +359,77 @@ local function DragAndHit(victim, handle, attackerRoot)
 end
 
 -- ─────────────────────────────────────────────────────────────
--- TOOL INTEGRATION
+-- HEARTBEAT SCAN
+--
+-- Every frame while a tool is equipped and mouse is held:
+--   1. Find all players within CFG.Size studs of our Handle.
+--      This is measured using REAL positions — same positions
+--      the server has.  So CFG.Size here is an extended melee
+--      range, not a teleportation range.
+--   2. For each in-range victim, initiate a drag.
+--
+-- The scan uses Handle.Position (real) as the origin, not our
+-- predicted post-drag position.  This is intentional:
+--   • The server validates distance from attacker to victim
+--     using the positions IT knows.
+--   • The server's attacker position ≈ our real position.
+--   • If we only scan victims who are within CFG.Size of our
+--     real Handle, the server's distance check will be close
+--     to CFG.Size, not some wildly different number.
+--   • We're not teleporting across the map — we're extending
+--     our melee range by a few studs.
 -- ─────────────────────────────────────────────────────────────
-local function HookTool(tool)
-    local handle   = tool:FindFirstChild("Handle")
-    local animator = LocalPlayer.Character
-                     and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-                     and LocalPlayer.Character.Humanoid:FindFirstChild("Animator")
-    if not handle or not animator then return end
+local currentRemote = nil   -- cached per-tool reference
 
-    for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        pcall(function()
-            track:GetMarkerReachedSignal("HitboxOpen"):Connect(function()
-                if not CFG.Enabled or CFG.ScriptKilled then return end
-                local root = LocalPlayer.Character
-                             and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-                if not root then return end
-
-                for _, player in ipairs(Players:GetPlayers()) do
-                    if player == LocalPlayer then continue end
-                    local pchar  = player.Character
-                    if not pchar then continue end
-                    local pTorso = pchar:FindFirstChild("Torso")
-                    if not pTorso then continue end
-
-                    local dist = (handle.Position - pTorso.Position).Magnitude
-                    if dist <= CFG.Size then
-                        DragAndHit(player, handle, root)
-                    end
-                end
-            end)
-        end)
-    end
-end
-
--- ─────────────────────────────────────────────────────────────
--- FALLBACK HEARTBEAT
--- ─────────────────────────────────────────────────────────────
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     if not CFG.Enabled or CFG.ScriptKilled then return end
+
     local char = LocalPlayer.Character
     if not char then return end
 
     local tool     = char:FindFirstChildOfClass("Tool")
+    local humanoid = char:FindFirstChild("Humanoid")
     local root     = char:FindFirstChild("HumanoidRootPart")
-    if not tool or not root then return end
-    local handle   = tool:FindFirstChild("Handle")
+    if not tool or not humanoid or not root then
+        currentRemote = nil
+        return
+    end
+
+    local handle = tool:FindFirstChild("Handle")
     if not handle then return end
 
+    -- Cache the remote so we don't search every frame
+    if not currentRemote then
+        currentRemote = FindRemote(tool)
+    end
+
+    -- Only scan on mouse-down frames
     if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
 
     for _, player in ipairs(Players:GetPlayers()) do
         if player == LocalPlayer then continue end
-        local pchar  = player.Character
+        local pchar = player.Character
         if not pchar then continue end
         local pTorso = pchar:FindFirstChild("Torso")
         if not pTorso then continue end
 
-        if (handle.Position - pTorso.Position).Magnitude <= CFG.Size then
-            DragAndHit(player, handle, root)
+        -- Distance check uses REAL positions — same as what the server sees
+        local dist = (handle.Position - pTorso.Position).Magnitude
+        if dist <= CFG.Size then
+            DragAndFire(player, root, currentRemote)
         end
     end
 end)
 
 -- ─────────────────────────────────────────────────────────────
--- CHARACTER / TOOL WIRING
+-- TOOL CHANGE LISTENER — clear remote cache on tool swap
 -- ─────────────────────────────────────────────────────────────
 local function OnCharacter(char)
     char.ChildAdded:Connect(function(child)
-        if child:IsA("Tool") then HookTool(child) end
+        if child:IsA("Tool") then currentRemote = nil end
+    end)
+    char.ChildRemoved:Connect(function(child)
+        if child:IsA("Tool") then currentRemote = nil end
     end)
 end
 
@@ -264,9 +446,29 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
         Notify("Enabled: " .. tostring(CFG.Enabled))
     elseif input.KeyCode == CFG.Keybinds.KillScript then
         CFG.ScriptKilled = true
-        Notify("Killed.")
         for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
+        Notify("Killed.")
     end
 end)
 
-Notify("HCBring v2 loaded. Size=" .. CFG.Size)
+Notify("NoCBring loaded. Size=" .. CFG.Size)
+
+--[[
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ WHAT THE SERVER SEES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ For a victim who is CFG.Size (9–14) studs away in real space:
+   • Attacker position  : real, server-side accurate
+   • Victim position    : real (server owns it, drag was local-only)
+   • Kill distance      : 9–14 studs (the real, un-dragged distance)
+   • Kill angle         : real angle (we enforce AngleCap pre-drag)
+   • RemoteEvent timing : spaced by DragCooldown (0.40 s)
+   • No BreakJoints     : no joint anomaly event
+   • No position delta  : server never saw victim move
+
+ The only detectable signal is:
+   1. Kill distances slightly elevated vs true melee range
+   2. RemoteEvent fires at a consistent rate just under the burst limit
+   3. Kills register at the edge of "plausible" range, consistently
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+--]]
