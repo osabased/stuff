@@ -137,29 +137,22 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
                 end
                     
                 EnableConnections(Handle.Touched)
-		for i, v in pairs(Players:GetPlayers()) do
-   		 if v ~= LocalPlayer and v.Character and v.Character:FindFirstChild("Torso") and v.Character:FindFirstChild("Humanoid").Health > 0 then
-       			 if (Handle.Position - v.Character.Torso.Position).Magnitude <= settings().Settings.Size then
-           			 coroutine.wrap(function()
-               			 DisableConnections(v.Character['Torso'].Changed)
-                		DisableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
-
-                		-- Replacement for :BreakJoints()
-                		for _, joint in ipairs(v.Character['Torso']:GetChildren()) do
-                 		   if joint:IsA("JointInstance") then
-                        joint:Destroy()
+                for i, v in pairs(Players:GetPlayers()) do
+                    if v ~= LocalPlayer and v.Character:FindFirstChild("Humanoid").Health > 0 and v.Character and v.Character:FindFirstChild("Torso") then
+                        if (Handle.Position - v.Character.Torso.Position).Magnitude <= getgenv().Settings.Size then
+                            coroutine.wrap(function()
+                                DisableConnections(v.Character['Torso'].Changed)
+                                DisableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
+                                v.Character['Torso']:BreakJoints()
+                                v.Character['Torso'].Transparency = 1
+                                v.Character['Torso'].CanCollide = false
+                                v.Character['Torso'].CFrame = Character.HumanoidRootPart.CFrame * CFrame.new(1, 0, -3.5)
+                                EnableConnections(v.Character['Torso'].Changed)
+                                EnableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
+                            end)()
+                        end
                     end
                 end
-
-                v.Character['Torso'].Transparency = 1
-                v.Character['Torso'].CanCollide = false
-                v.Character['Torso'].CFrame = Character.HumanoidRootPart.CFrame * CFrame.new(1, 0, -3.5)
-                EnableConnections(v.Character['Torso'].Changed)
-                EnableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
-            end)()
-        end
-    end
-end
                 DisableConnections(Handle.Touched)
             end
         end)
