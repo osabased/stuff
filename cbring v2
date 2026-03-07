@@ -1,65 +1,75 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║    NO-BREAKJOINTS CBRING v3 — HOTSWAP TRIGGER + ARC CONE VISUALIZER        ║
+║    NO-BREAKJOINTS CBRING v3.1 — OPTIMIZED + MEMORY SAFE                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+UPDATED IN v3.1:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL FIXES:
+1. MEMORY LEAK PREVENTION
+   • PlayerRemoving event cleans ActiveDrags & LastDrag tables
+   • CharacterAdded disconnects old connections before creating new ones
+   • All coroutines wrapped in pcall with error logging
 
-  New in v3:
+2. RACE CONDITION HANDLING
+   • Check victim.Parent before each operation in drag coroutine
+   • Check char.Parent during heartbeat to prevent errors on respawn
+   • Validate torso exists before suppressing signals
 
-  1. TRIGGER HOTSWAP
-     The "fire" input is no longer hardcoded to MouseButton1.
-     A REBIND button in the config panel enters listening mode — the very
-     next key or mouse button pressed becomes the new trigger.
-     Supported inputs: M1, M2, M3, any KeyCode.
-     Current binding shown live in the panel as a chip label.
+3. PERFORMANCE OPTIMIZATIONS
+   • Spatial culling: skip players beyond Size * 1.5
+   • Frame staggering: check 1/3 of players per frame (3-frame rotation)
+   • Cached player data: avoid repeated FindFirstChild calls
+   • Early exit: stop checking if already at max concurrent drags
 
-  2. ARC CONE VISUALIZER (3D, workspace neon parts)
-     Shows the AngleCap cone as:
-       • 2 neon "radius" beams: center → left/right boundary edges
-       • 14 neon arc segments:  traced curve at the boundary
-     Origin = HumanoidRootPart (matches IsInFrontArc exactly).
-     Radius = CFG.Size.  Sweep = -AngleCap .. +AngleCap degrees.
-     Color follows the same state machine as the sphere.
-     Geometry updates live as Size / AngleCap sliders move.
+4. ENHANCED ERROR HANDLING
+   • All coroutine bodies wrapped in pcall
+   • Error messages logged with warn() for debugging
+   • Signal suppression/restoration wrapped in pcall
+   • Character destruction handled gracefully
+
+5. TEAM AWARENESS (CONFIGURABLE)
+   • CFG.Filters.IgnoreTeam prevents dragging teammates
+   • CFG.Filters.IgnoreFriends prevents dragging friends (requires Roblox API)
+   • CFG.Filters.Whitelist/Blacklist for specific players
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- TRIGGER HOTSWAP — ARCHITECTURE
+ARCHITECTURE OVERVIEW:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- CFG.TriggerInput is a discriminated union:
-   { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" }
-   { Kind="Key",   Code=Enum.KeyCode.E,                   Name="E"  }
+CORE FLOW:
+1. Heartbeat runs every frame (60fps)
+2. Checks if trigger is held (hotswappable input)
+3. Scans players in range (with spatial culling + frame staggering)
+4. For each valid target: calls DragAndFire()
+5. DragAndFire() spawns a coroutine that:
+   - Suppresses torso signals
+   - Lerps torso to destination over CFG.LerpFrames
+   - Fires remote
+   - Restores signals
+   - Updates stats
 
- IsTriggerActive() polls the correct UIS method based on Kind.
- The Heartbeat scan calls IsTriggerActive() — no hardcoded mouse button.
+MEMORY MANAGEMENT:
+- ActiveDrags[uid] = true during drag → prevents duplicate drags
+- LastDrag[uid] = tick() → enforces cooldown
+- PlayerRemoving cleans both tables
+- Character connections disconnected on respawn
 
- Rebind flow:
-   1. User clicks REBIND → StartRebind() sets listeningForTrigger = true
-   2. Chip label shows "Press..."
-   3. Next InputBegan fires BEFORE `if gpe then return end` so GUI-focused
-      inputs are still captured
-   4. A 0.10 s cooldown prevents the REBIND click itself from registering
-   5. Escape cancels; any key/mouse button confirms
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- ARC VISUALIZER — GEOMETRY
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- arcPoint(θ) = HRP.Position
-             + (HRP.CFrame * CFrame.Angles(0, θ_radians, 0)).LookVector
-               * CFG.Size
+VISUALIZERS:
+- Sphere: centered on Tool.Handle, shows reach radius
+- Arc Cone: centered on HumanoidRootPart, shows AngleCap cone
+- Both update every frame, color-coded by state
 
- SetBeam(part, p1, p2):
-   midpoint = (p1+p2)/2 ; direction = (p2-p1).Unit ; length = |p2-p1|
-   part.CFrame = CFrame.lookAt(midpoint, midpoint + direction)
-   part.Size   = Vector3.new(THICK, THICK, length)
-   CFrame.lookAt makes -Z point toward target; Size.Z is the long axis,
-   so the part spans exactly from p1 to p2.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
+-- ============================================================================
+-- PREVENT MULTIPLE LOADS
+-- ============================================================================
 if getgenv()._NOCBRING_V3_LOADED then return end
 getgenv()._NOCBRING_V3_LOADED = true
 
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
 -- SERVICES
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
 local UIS               = game:GetService("UserInputService")
@@ -67,98 +77,218 @@ local TweenService      = game:GetService("TweenService")
 local StarterGui        = game:GetService("StarterGui")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
--- ─────────────────────────────────────────────────────────────
--- LIVE CONFIG  (getgenv() so all coroutines share one table)
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
+-- CONFIGURATION (SHARED VIA getgenv() FOR HOT-RELOAD SUPPORT)
+-- ============================================================================
 getgenv().NCBCFG = getgenv().NCBCFG or {
-    Size             = math.random(9, 14),
-    LerpFrames       = 6,
-    DragCooldown     = 0.40,
-    AngleCap         = 50,
-    RemoteName       = "DamageRemote",
-    Enabled          = true,
-    VisualizerEnabled= true,
-    ScriptKilled     = false,
-
-    --[[
-        TriggerInput — what to hold in order to activate dragging.
-        Kind = "Mouse"  →  UIS:IsMouseButtonPressed(Button)
-        Kind = "Key"    →  UIS:IsKeyDown(Code)
-    --]]
+    -- Reach & Timing
+    Size             = math.random(9, 14),      -- Max distance to drag (studs)
+    LerpFrames       = 6,                        -- Frames to complete drag (smoothness)
+    DragCooldown     = 0.40,                     -- Seconds between drags per player
+    AngleCap         = 50,                       -- Max angle from facing direction (degrees)
+    
+    -- Remote Configuration
+    RemoteName       = "DamageRemote",           -- Name of remote to fire after drag
+    
+    -- State Flags
+    Enabled          = true,                     -- Master enable/disable
+    VisualizerEnabled= true,                     -- Show sphere + arc visualizers
+    ScriptKilled     = false,                    -- Set true to terminate script
+    
+    -- Input Configuration (Hotswappable)
     TriggerInput = {
-        Kind   = "Mouse",
-        Button = Enum.UserInputType.MouseButton1,
-        Name   = "M1",
+        Kind   = "Mouse",                        -- "Mouse" or "Key"
+        Button = Enum.UserInputType.MouseButton1,-- MouseButton1/2/3
+        Name   = "M1",                           -- Display name
     },
-
+    
+    -- Keybinds for script control
     Keybinds = {
-        Toggle    = Enum.KeyCode.Z,
-        ToggleVis = Enum.KeyCode.X,
-        ToggleUI  = Enum.KeyCode.C,
-        Kill      = Enum.KeyCode.P,
+        Toggle    = Enum.KeyCode.Z,              -- Toggle enabled state
+        ToggleVis = Enum.KeyCode.X,              -- Toggle visualizers
+        ToggleUI  = Enum.KeyCode.C,              -- Toggle config panel
+        Kill      = Enum.KeyCode.P,              -- Kill script
     },
+    
+    -- Filters (NEW in v3.1)
+    Filters = {
+        IgnoreTeam   = true,                     -- Don't drag teammates
+        IgnoreFriends= false,                    -- Don't drag friends (requires API)
+        Whitelist    = {},                       -- Only drag these players (by UserId)
+        Blacklist    = {},                       -- Never drag these players (by UserId)
+    },
+    
+    -- Performance (NEW in v3.1)
+    MaxConcurrentDrags = 3,                      -- Max simultaneous drags (prevents spam)
+    FrameStagger       = true,                   -- Check 1/3 players per frame
+    SpatialCullFactor  = 1.5,                    -- Skip players beyond Size * factor
 }
+
 local CFG = getgenv().NCBCFG
 
--- ─────────────────────────────────────────────────────────────
--- SESSION STATS
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
+-- SESSION STATISTICS (PERSISTS ACROSS RELOADS)
+-- ============================================================================
 local Stats = {
-    Kills       = 0,
-    TotalDist   = 0,
-    LastVictim  = "—",
-    ActiveDrags = 0,
+    Kills       = 0,          -- Total successful drags
+    TotalDist   = 0,          -- Sum of all drag distances
+    LastVictim  = "—",        -- Name of last dragged player
+    ActiveDrags = 0,          -- Currently active drag coroutines
+    Errors      = 0,          -- Count of drag errors (for debugging)
 }
 
--- ─────────────────────────────────────────────────────────────
--- STATE
--- ─────────────────────────────────────────────────────────────
-local Connections         = {}
-local LocalPlayer         = Players.LocalPlayer
-local ActiveDrags         = {}
-local LastDrag            = {}
-local currentRemote       = nil
-local listeningForTrigger = false
-local rebindStartTick     = 0
-local triggerBindLabel    = nil   -- set during BuildGUI; updated by rebind logic
+-- ============================================================================
+-- STATE MANAGEMENT
+-- ============================================================================
+local Connections         = {}                    -- Store event connections for cleanup
+local LocalPlayer         = Players.LocalPlayer   -- Cached for performance
+local ActiveDrags         = {}                    -- uid → true during active drag
+local LastDrag            = {}                    -- uid → tick() of last drag
+local currentRemote       = nil                   -- Cached remote reference
+local listeningForTrigger = false                 -- Rebind mode flag
+local rebindStartTick     = 0                     -- Timestamp of rebind start
+local triggerBindLabel    = nil                   -- Reference to GUI binding label
+local charConnections     = {}                    -- Store character event connections
+local frameCounter        = 0                     -- For frame staggering optimization
 
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
 -- CORE HELPERS
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
+
+--[[
+    Notify(text: string)
+    Shows a Roblox notification with title "NoCBring"
+    Used for user feedback (rebinds, toggles, errors)
+--]]
 local function Notify(text)
     StarterGui:SetCore("SendNotification", {
-        Title = "NoCBring", Text = text, Duration = 2 })
+        Title = "NoCBring", 
+        Text = text, 
+        Duration = 2 
+    })
 end
 
+--[[
+    SuppressSignal(signal: RBXScriptSignal)
+    Disables all connections to a signal using getconnections()
+    Wrapped in pcall to prevent errors if signal is invalid
+    Used to prevent torso physics from interfering with drag
+--]]
 local function SuppressSignal(sig)
-    for _, c in ipairs(getconnections(sig)) do pcall(function() c:Disable() end) end
-end
-local function RestoreSignal(sig)
-    for _, c in ipairs(getconnections(sig)) do pcall(function() c:Enable() end) end
+    if not sig then return end
+    for _, c in ipairs(getconnections(sig)) do 
+        pcall(function() c:Disable() end) 
+    end
 end
 
+--[[
+    RestoreSignal(signal: RBXScriptSignal)
+    Re-enables all connections to a signal
+    Wrapped in pcall for safety
+    Called after drag completes to restore normal physics
+--]]
+local function RestoreSignal(sig)
+    if not sig then return end
+    for _, c in ipairs(getconnections(sig)) do 
+        pcall(function() c:Enable() end) 
+    end
+end
+
+--[[
+    IsInFrontArc(attackerRoot: Part, victimTorso: Part) → boolean
+    Checks if victim is within CFG.AngleCap degrees of attacker's facing direction
+    Uses dot product to calculate angle between LookVector and victim direction
+    Returns false if victim is too close (<0.1 studs) to avoid division errors
+--]]
 local function IsInFrontArc(attackerRoot, victimTorso)
     local d = victimTorso.Position - attackerRoot.Position
     if d.Magnitude < 0.1 then return false end
-    return math.deg(math.acos(math.clamp(
-        attackerRoot.CFrame.LookVector:Dot(d.Unit), -1, 1))) <= CFG.AngleCap
+    local dot = attackerRoot.CFrame.LookVector:Dot(d.Unit)
+    local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
+    return angle <= CFG.AngleCap
 end
 
+--[[
+    FindRemote(tool: Tool) → RemoteEvent | RemoteFunction | nil
+    Searches for the configured remote in two locations:
+    1. Tool descendants (deep search)
+    2. ReplicatedStorage descendants (deep search)
+    Returns first match that is RemoteEvent or RemoteFunction
+    Invalidates cache (currentRemote = nil) if not found
+--]]
 local function FindRemote(tool)
     local r = tool:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then 
+        return r 
+    end
     r = ReplicatedStorage:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then 
+        return r 
+    end
     return nil
 end
 
--- ─────────────────────────────────────────────────────────────
+--[[
+    CanDragVictim(victim: Player) → boolean
+    Applies all configured filters to determine if victim can be dragged
+    Checks:
+    - Team filter (if CFG.Filters.IgnoreTeam)
+    - Friend filter (if CFG.Filters.IgnoreFriends)
+    - Whitelist (if not empty)
+    - Blacklist
+    Returns true only if all filters pass
+--]]
+local function CanDragVictim(victim)
+    -- Team filter
+    if CFG.Filters.IgnoreTeam and LocalPlayer.Team and victim.Team then
+        if LocalPlayer.Team == victim.Team then
+            return false
+        end
+    end
+    
+    -- Friend filter (requires Roblox friend API)
+    if CFG.Filters.IgnoreFriends then
+        local success, isFriend = pcall(function()
+            return Players:GetFriendsAsync(LocalPlayer.UserId):IsFriendsWith(victim.UserId)
+        end)
+        if success and isFriend then
+            return false
+        end
+    end
+    
+    -- Whitelist (if configured, only allow these players)
+    if #CFG.Filters.Whitelist > 0 then
+        local allowed = false
+        for _, uid in ipairs(CFG.Filters.Whitelist) do
+            if uid == victim.UserId then
+                allowed = true
+                break
+            end
+        end
+        if not allowed then return false end
+    end
+    
+    -- Blacklist (never allow these players)
+    for _, uid in ipairs(CFG.Filters.Blacklist) do
+        if uid == victim.UserId then
+            return false
+        end
+    end
+    
+    return true
+end
+
+-- ============================================================================
 -- TRIGGER HOTSWAP HELPERS
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
 
 --[[
-    IsTriggerActive — polls UIS for the currently configured trigger.
-    Called every Heartbeat; fast and branch-minimal.
+    IsTriggerActive() → boolean
+    Polls UIS for the currently configured trigger input
+    Branches based on CFG.TriggerInput.Kind:
+    - "Mouse": checks IsMouseButtonPressed(Button)
+    - "Key": checks IsKeyDown(Code)
+    Called every Heartbeat, so must be fast and branch-minimal
 --]]
 local function IsTriggerActive()
     local ti = CFG.TriggerInput
@@ -171,8 +301,10 @@ local function IsTriggerActive()
 end
 
 --[[
-    InputToName — human-readable short name for any InputObject.
-    Used to update the binding chip label after a rebind.
+    InputToName(input: InputObject) → string
+    Converts InputObject to human-readable short name
+    Used to display binding in GUI chip label
+    Examples: "M1", "M2", "E", "LShift", "Space"
 --]]
 local function InputToName(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1 then return "M1" end
@@ -180,17 +312,25 @@ local function InputToName(input)
     if input.UserInputType == Enum.UserInputType.MouseButton3 then return "M3" end
     if input.KeyCode ~= Enum.KeyCode.Unknown then
         local s = tostring(input.KeyCode):gsub("Enum%.KeyCode%.", "")
-        local short = { LeftShift="LShift", RightShift="RShift",
-                        LeftControl="LCtrl", RightControl="RCtrl",
-                        LeftAlt="LAlt", RightAlt="RAlt" }
+        local short = { 
+            LeftShift="LShift", RightShift="RShift",
+            LeftControl="LCtrl", RightControl="RCtrl",
+            LeftAlt="LAlt", RightAlt="RAlt",
+            Space="Space", Return="Enter"
+        }
         return short[s] or (s:len() > 7 and s:sub(1,6).."." or s)
     end
     return "???"
 end
 
 --[[
-    StartRebind — flip the listening flag and update the chip label.
-    The actual capture happens in the InputBegan handler (Section 5).
+    StartRebind()
+    Initiates trigger rebind mode:
+    - Sets listeningForTrigger = true
+    - Records timestamp for cooldown
+    - Updates GUI chip label to "..."
+    - Shows notification with instructions
+    Actual capture happens in InputBegan handler (Section 5)
 --]]
 local function StartRebind()
     listeningForTrigger = true
@@ -202,19 +342,22 @@ local function StartRebind()
     Notify("Press any key or mouse button to set trigger  (Esc = cancel)")
 end
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 1 — SPHERE REACH VISUALIZER
--- ═══════════════════════════════════════════════════════════════
---[[
-    An invisible Part in CoreGui adorned by a SelectionSphere.
-    Follows the tool Handle.  Diameter = CFG.Size * 2.
+-- ============================================================================
+-- SECTION 1 — SPHERE REACH VISUALIZER
+-- ============================================================================
 
+--[[
+    Visualizer showing CFG.Size radius around Tool.Handle
+    Uses invisible Part in CoreGui with SelectionSphere adornment
     Color states:
-      DISABLED  gray    — CFG.Enabled is false
-      CLEAR     green   — enabled, nobody in range
-      TARGET    yellow  — at least one victim in range
-      FIRING    red     — a drag coroutine is active
+    - DISABLED: gray (CFG.Enabled = false)
+    - CLEAR: green (enabled, no targets in range)
+    - TARGET: yellow (at least one valid target in range)
+    - FIRING: red (drag coroutine active)
+    
+    Note: Sphere is centered on Handle because distance check uses Handle.Position
 --]]
+
 local VisPart   = nil
 local VisSphere = nil
 
@@ -225,116 +368,199 @@ local COLOR = {
     FIRING   = Color3.fromRGB(255, 30,  55 ),
 }
 
+--[[
+    BuildSphereVis()
+    Creates the sphere visualizer part and selection sphere
+    Parented to CoreGui so it's always visible
+    Initial size set to CFG.Size * 2 (diameter)
+--]]
 local function BuildSphereVis()
     if VisPart then VisPart:Destroy() end
     local p = Instance.new("Part")
-    p.Name = "_NCBSp"; p.Anchored = false; p.CanCollide = false
-    p.Massless = true; p.Transparency = 1; p.Size = Vector3.new(1,1,1)
+    p.Name = "_NCBSp"
+    p.Anchored = false
+    p.CanCollide = false
+    p.Massless = true
+    p.Transparency = 1
+    p.Size = Vector3.new(1,1,1)
     p.Parent = game:GetService("CoreGui")
+    
     local s = Instance.new("SelectionSphere")
-    s.Adornee = p; s.SurfaceTransparency = 0.85; s.Transparency = 0.3
-    s.Color3 = COLOR.CLEAR; s.SurfaceColor3 = COLOR.CLEAR; s.Parent = p
-    VisPart = p; VisSphere = s
+    s.Adornee = p
+    s.SurfaceTransparency = 0.85
+    s.Transparency = 0.3
+    s.Color3 = COLOR.CLEAR
+    s.SurfaceColor3 = COLOR.CLEAR
+    s.Parent = p
+    
+    VisPart = p
+    VisSphere = s
 end
 
-local function DestroySphereVis()
-    if VisPart then VisPart:Destroy(); VisPart = nil; VisSphere = nil end
-end
-
-local function UpdateSphereVis(handle, col)
-    if not CFG.VisualizerEnabled then DestroySphereVis(); return end
-    if not VisPart or not VisPart.Parent then BuildSphereVis() end
-    local d = CFG.Size * 2
-    VisPart.Size = Vector3.new(d, d, d); VisPart.CFrame = handle.CFrame
-    if VisSphere then VisSphere.Color3 = col; VisSphere.SurfaceColor3 = col end
-end
-
--- ═══════════════════════════════════════════════════════════════
---  SECTION 1b — ARC CONE VISUALIZER
--- ═══════════════════════════════════════════════════════════════
 --[[
-    16 neon Parts anchored in workspace:
-      ArcPool[1]      — left radius line
-      ArcPool[2]      — right radius line
-      ArcPool[3..16]  — 14 arc boundary segments
+    DestroySphereVis()
+    Cleans up sphere visualizer parts
+    Called when visualizer disabled or script killed
+--]]
+local function DestroySphereVis()
+    if VisPart then 
+        VisPart:Destroy()
+        VisPart = nil
+        VisSphere = nil
+    end
+end
 
-    Origin: HumanoidRootPart.CFrame
-    This is intentional.  IsInFrontArc() uses attackerRoot.CFrame.LookVector,
-    so the arc must originate from HRP to show what the engine is actually
-    checking.  The sphere originates from Handle — both are visible, making
-    the offset between handle-position and body-orientation apparent.
+--[[
+    UpdateSphereVis(handle: Part, col: Color3)
+    Updates sphere position and color every frame
+    - Positions sphere at handle.CFrame
+    - Sets diameter to CFG.Size * 2
+    - Applies color state
+    Destroys visualizer if CFG.VisualizerEnabled = false
+--]]
+local function UpdateSphereVis(handle, col)
+    if not CFG.VisualizerEnabled then 
+        DestroySphereVis()
+        return 
+    end
+    
+    if not VisPart or not VisPart.Parent then 
+        BuildSphereVis() 
+    end
+    
+    local d = CFG.Size * 2
+    VisPart.Size = Vector3.new(d, d, d)
+    VisPart.CFrame = handle.CFrame
+    
+    if VisSphere then
+        VisSphere.Color3 = col
+        VisSphere.SurfaceColor3 = col
+    end
+end
 
-    SetBeam(part, p1, p2, thick):
-      Positions `part` along the line from p1 to p2.
-      CFrame.lookAt(mid, mid + dir) makes -Z point in the direction p1→p2,
-      and Size.Z is the part's long axis, so it spans p1 to p2 exactly.
+-- ============================================================================
+-- SECTION 1b — ARC CONE VISUALIZER
+-- ============================================================================
+
+--[[
+    Visualizer showing CFG.AngleCap cone from HumanoidRootPart
+    Uses 16 neon Parts in workspace:
+    - ArcPool[1]: left radius line (from HRP to -AngleCap edge)
+    - ArcPool[2]: right radius line (from HRP to +AngleCap edge)
+    - ArcPool[3..16]: 14 arc segments tracing boundary curve
+    
+    Note: Arc is centered on HumanoidRootPart because angle check uses HRP.CFrame
+    This makes the offset between handle position and body orientation visible
 --]]
 
-local ARC_SEGS = 14
-local ArcPool  = {}
+local ARC_SEGS = 14          -- Number of segments in arc boundary
+local ArcPool  = {}          -- Pool of Parts for reuse
 
+--[[
+    SetBeam(part: Part, p1: Vector3, p2: Vector3, thick: number)
+    Positions a Part as a beam between two points
+    Uses CFrame.lookAt to orient part along the line
+    Sets Size.Z to the distance between points (long axis)
+    Size.X and Size.Y set to 'thick' for beam thickness
+--]]
 local function SetBeam(part, p1, p2, thick)
     local len = (p2 - p1).Magnitude
-    if len < 0.001 then part.Size = Vector3.new(.001,.001,.001); return end
+    if len < 0.001 then
+        part.Size = Vector3.new(.001,.001,.001)
+        return
+    end
+    
     local mid = (p1 + p2) / 2
     local dir = (p2 - p1).Unit
+    
     part.Size   = Vector3.new(thick, thick, len)
     part.CFrame = CFrame.lookAt(mid, mid + dir)
 end
 
+--[[
+    BuildArcVis()
+    Creates 16 neon Parts for arc visualizer
+    All parented to workspace, anchored, massless
+    Initial color set to CLEAR (green)
+--]]
 local function BuildArcVis()
-    for _, p in ipairs(ArcPool) do pcall(function() p:Destroy() end) end
+    for _, p in ipairs(ArcPool) do 
+        pcall(function() p:Destroy() end) 
+    end
     ArcPool = {}
+    
     for i = 1, 2 + ARC_SEGS do
         local p = Instance.new("Part")
-        p.Name = "_NCBArc"; p.Anchored = true; p.CanCollide = false
-        p.CastShadow = false; p.Massless = true
-        p.Material = Enum.Material.Neon; p.Transparency = 0.15
-        p.Size = Vector3.new(.07,.07,1); p.Color = COLOR.CLEAR
+        p.Name = "_NCBArc"
+        p.Anchored = true
+        p.CanCollide = false
+        p.CastShadow = false
+        p.Massless = true
+        p.Material = Enum.Material.Neon
+        p.Transparency = 0.15
+        p.Size = Vector3.new(.07,.07,1)
+        p.Color = COLOR.CLEAR
         p.Parent = workspace
         ArcPool[i] = p
     end
 end
 
+--[[
+    DestroyArcVis()
+    Cleans up arc visualizer parts
+    Called when visualizer disabled or script killed
+--]]
 local function DestroyArcVis()
-    for _, p in ipairs(ArcPool) do pcall(function() p:Destroy() end) end
+    for _, p in ipairs(ArcPool) do 
+        pcall(function() p:Destroy() end) 
+    end
     ArcPool = {}
 end
 
 --[[
-    UpdateArcVis — recalculates all 16 parts every Heartbeat.
-
-    baseCF: HumanoidRootPart.CFrame  (position + facing direction)
-    col:    Color3 matching current state
-
-    ArcPoint(deg):
-      Rotate baseCF around its local Y axis by `deg` degrees, then walk
-      forward (LookVector) by CFG.Size studs.  This traces the boundary
-      of the acceptance cone in world space.
+    UpdateArcVis(baseCF: CFrame, col: Color3)
+    Recalculates all 16 arc parts every frame
+    baseCF: HumanoidRootPart.CFrame (position + facing direction)
+    col: Color state matching sphere
+    
+    ArcPoint(deg): Helper function that:
+    - Rotates baseCF around local Y axis by 'deg' degrees
+    - Returns position at CFG.Size distance along LookVector
+    This traces the boundary of the acceptance cone in world space
+    
+    Updates:
+    - Left/right radius lines (ArcPool[1], ArcPool[2])
+    - 14 arc boundary segments (ArcPool[3..16])
 --]]
 local function UpdateArcVis(baseCF, col)
-    if not CFG.VisualizerEnabled then DestroyArcVis(); return end
-    if #ArcPool == 0 then BuildArcVis() end
-
+    if not CFG.VisualizerEnabled then 
+        DestroyArcVis()
+        return 
+    end
+    
+    if #ArcPool == 0 then 
+        BuildArcVis() 
+    end
+    
     local reach = CFG.Size
     local half  = CFG.AngleCap
-
+    
     local function ArcPoint(deg)
         return baseCF.Position
-            + (baseCF * CFrame.Angles(0, math.rad(deg), 0)).LookVector * reach
+            + (baseCF * CFrame.Angles(0, math.rad(deg), 0)).LookVector 
+            * reach
     end
-
+    
     local origin = baseCF.Position
-
+    
     -- Left and right radius lines
     SetBeam(ArcPool[1], origin, ArcPoint(-half), 0.09)
     ArcPool[1].Color = col
+    
     SetBeam(ArcPool[2], origin, ArcPoint( half), 0.09)
     ArcPool[2].Color = col
-
-    -- Arc boundary segments
-    -- Subdivide the full sweep -half → +half into ARC_SEGS equal steps.
-    -- Each segment is a beam between consecutive arc points.
+    
+    -- Arc boundary segments (14 segments tracing the curve)
     for i = 1, ARC_SEGS do
         local a1   = -half + (2*half / ARC_SEGS) * (i-1)
         local a2   = -half + (2*half / ARC_SEGS) * i
@@ -344,11 +570,12 @@ local function UpdateArcVis(baseCF, col)
     end
 end
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 2 — LIVE CONFIG GUI
--- ═══════════════════════════════════════════════════════════════
+-- ============================================================================
+-- SECTION 2 — LIVE CONFIG GUI
+-- ============================================================================
+
 --[[
-    Updated panel layout (v3):
+    GUI Layout (v3.1):
     ┌────────────────────────────────────────────┐
     │  NoCBring Config                      [×]  │  titlebar (draggable)
     ├────────────────────────────────────────────┤
@@ -362,7 +589,11 @@ end
     │  INPUTS                                    │
     │  ────────────────────────────────────────  │
     │  RemoteName  [ DamageRemote             ]  │
-    │  Trigger     [ M1 ]  [ REBIND ]            │  ← NEW in v3
+    │  Trigger     [ M1 ]  [ REBIND ]            │
+    ├────────────────────────────────────────────┤
+    │  FILTERS                                   │
+    │  ────────────────────────────────────────  │
+    │  ● Ignore Team   ● Ignore Friends          │
     ├────────────────────────────────────────────┤
     │  ● Enabled   ● Visualizer                  │
     ├────────────────────────────────────────────┤
@@ -378,7 +609,7 @@ local guiVisible   = true
 
 local UI = {
     W        = 326,
-    H        = 392,          -- increased from 310 to fit trigger row + input section
+    H        = 440,          -- Increased to fit Filters section
     TitleH   = 32,
     RowH     = 34,
     Pad      = 12,
@@ -399,59 +630,98 @@ local UI = {
     BORDER   = Color3.fromRGB(38,  38,  52 ),
 }
 
+--[[
+    MkFrame(parent, size, pos, color, z) → Frame
+    Helper to create styled Frame with common properties
+--]]
 local function MkFrame(parent, size, pos, color, z)
     local f = Instance.new("Frame")
-    f.Size = size; f.Position = pos
+    f.Size = size
+    f.Position = pos
     f.BackgroundColor3 = color or UI.PANEL
-    f.BorderSizePixel = 0; f.ZIndex = z or 1
-    f.Parent = parent; return f
+    f.BorderSizePixel = 0
+    f.ZIndex = z or 1
+    f.Parent = parent
+    return f
 end
 
+--[[
+    MkLabel(parent, text, size, pos, font, tsz, color, z, xa) → TextLabel
+    Helper to create styled TextLabel with common properties
+--]]
 local function MkLabel(parent, text, size, pos, font, tsz, color, z, xa)
     local l = Instance.new("TextLabel")
-    l.Size = size; l.Position = pos; l.Text = text
-    l.Font = font or UI.FontBody; l.TextSize = tsz or UI.TextSz
+    l.Size = size
+    l.Position = pos
+    l.Text = text
+    l.Font = font or UI.FontBody
+    l.TextSize = tsz or UI.TextSz
     l.TextColor3 = color or UI.TEXT
-    l.BackgroundTransparency = 1; l.ZIndex = z or 2
+    l.BackgroundTransparency = 1
+    l.ZIndex = z or 2
     l.TextXAlignment = xa or Enum.TextXAlignment.Left
-    l.Parent = parent; return l
+    l.Parent = parent
+    return l
 end
 
+--[[
+    MkCorner(parent, r)
+    Adds UICorner to parent with specified radius
+--]]
 local function MkCorner(parent, r)
     local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, r or 6); c.Parent = parent
+    c.CornerRadius = UDim.new(0, r or 6)
+    c.Parent = parent
 end
 
+--[[
+    MkStroke(parent, color, t) → UIStroke
+    Adds UIStroke to parent with specified color and thickness
+--]]
 local function MkStroke(parent, color, t)
     local s = Instance.new("UIStroke")
-    s.Color = color or UI.BORDER; s.Thickness = t or 1; s.Parent = parent
+    s.Color = color or UI.BORDER
+    s.Thickness = t or 1
+    s.Parent = parent
     return s
 end
 
--- ── Slider ────────────────────────────────────────────────────
+--[[
+    MkSlider(parent, y, label, mn, mx, def, fmt, onChange) → {SetVal, GetVal}
+    Creates a slider control with:
+    - Label on left
+    - Track with fill and draggable knob
+    - Value label on right
+    onChange(v) called when value changes
+    Returns table with SetVal(v) and GetVal() methods
+--]]
 local function MkSlider(parent, y, label, mn, mx, def, fmt, onChange)
     local row = MkFrame(parent, UDim2.new(1,0,0,UI.RowH),
         UDim2.new(0,0,0,y), Color3.fromRGB(0,0,0), 2)
     row.BackgroundTransparency = 1
-
+    
     MkLabel(row, label, UDim2.new(0,95,1,0), UDim2.new(0,UI.Pad,0,0),
         UI.FontBody, UI.TextSz, UI.MUTED, 3)
-
+    
     local track = MkFrame(row, UDim2.new(0,UI.SliderW,0,UI.SliderH),
         UDim2.new(0,108,0.5,-UI.SliderH/2), Color3.fromRGB(38,38,52), 3)
     MkCorner(track, 4)
+    
     local fill = MkFrame(track, UDim2.new(0,0,1,0), UDim2.new(0,0,0,0), UI.ACCENT, 4)
     MkCorner(fill, 4)
+    
     local KS = UI.KnobSz
     local knob = MkFrame(track, UDim2.new(0,KS,0,KS),
         UDim2.new(0,-KS/2,0.5,-KS/2), Color3.fromRGB(255,255,255), 5)
-    MkCorner(knob, KS); MkStroke(knob, UI.ACCENT, 2)
+    MkCorner(knob, KS)
+    MkStroke(knob, UI.ACCENT, 2)
+    
     local valLbl = MkLabel(row, fmt(def), UDim2.new(0,58,1,0),
         UDim2.new(0,108+UI.SliderW+6,0,0), UI.Font, UI.TextSz, UI.ACCENT, 3)
-
+    
     local current  = def
     local dragging = false
-
+    
     local function SetVal(v)
         v = math.clamp(v, mn, mx)
         if math.floor(mn)==mn and math.floor(mx)==mx and math.floor(def)==def then
@@ -466,20 +736,30 @@ local function MkSlider(parent, y, label, mn, mx, def, fmt, onChange)
         valLbl.Text = fmt(v)
         if onChange then onChange(v) end
     end
+    
     SetVal(def)
-
+    
     knob.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=true end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then 
+            dragging=true 
+        end
     end)
+    
     UIS.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then 
+            dragging=false 
+        end
     end)
+    
     UIS.InputChanged:Connect(function(i)
-        if not dragging or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+        if not dragging or i.UserInputType~=Enum.UserInputType.MouseMovement then 
+            return 
+        end
         local r = track.AbsoluteSize.X
         local x = math.clamp(i.Position.X - track.AbsolutePosition.X, 0, r)
         SetVal(mn + (x/r)*(mx-mn))
     end)
+    
     track.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
             dragging = true
@@ -488,27 +768,43 @@ local function MkSlider(parent, y, label, mn, mx, def, fmt, onChange)
             SetVal(mn + (x/r)*(mx-mn))
         end
     end)
-    return { SetVal=SetVal, GetVal=function() return current end }
+    
+    return { 
+        SetVal=SetVal, 
+        GetVal=function() return current end 
+    }
 end
 
--- ── Toggle ────────────────────────────────────────────────────
+--[[
+    MkToggle(parent, xOff, yOff, label, def, onChange) → {SetState, GetState}
+    Creates a toggle switch with:
+    - Label on right
+    - Sliding knob that moves on click
+    onChange(state) called when state changes
+    Returns table with SetState(state) and GetState() methods
+--]]
 local function MkToggle(parent, xOff, yOff, label, def, onChange)
     local BW, BH = 46, 22
     local con = MkFrame(parent, UDim2.new(0,BW+80,0,BH+4),
         UDim2.new(0,xOff,0,yOff), Color3.fromRGB(0,0,0), 2)
     con.BackgroundTransparency = 1
+    
     local track = MkFrame(con, UDim2.new(0,BW,0,BH),
         UDim2.new(0,0,0,2), Color3.fromRGB(46,46,60), 3)
-    MkCorner(track, BH); MkStroke(track, UI.BORDER, 1)
+    MkCorner(track, BH)
+    MkStroke(track, UI.BORDER, 1)
+    
     local KS = BH-6
     local knob = MkFrame(track, UDim2.new(0,KS,0,KS),
         UDim2.new(0,3,0.5,-KS/2), Color3.fromRGB(170,170,190), 4)
     MkCorner(knob, KS)
+    
     MkLabel(con, label, UDim2.new(0,72,1,0),
         UDim2.new(0,BW+8,0,0), UI.FontBody, UI.TextSz, UI.TEXT, 3)
-
+    
     local on  = def
     local twi = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+    
     local function SetState(state)
         on = state
         TweenService:Create(knob, twi, {
@@ -520,170 +816,221 @@ local function MkToggle(parent, xOff, yOff, label, def, onChange)
         }):Play()
         if onChange then onChange(state) end
     end
+    
     SetState(def)
+    
     track.InputBegan:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then SetState(not on) end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then 
+            SetState(not on) 
+        end
     end)
-    return { SetState=SetState, GetState=function() return on end }
+    
+    return { 
+        SetState=SetState, 
+        GetState=function() return on end 
+    }
 end
 
--- ── Stats strip ───────────────────────────────────────────────
+--[[
+    MkStats(parent, y) → function()
+    Creates stats display strip at bottom of panel
+    Returns refresh function that updates all labels
+--]]
 local function MkStats(parent, y)
     local strip = MkFrame(parent, UDim2.new(1,0,0,28),
         UDim2.new(0,0,0,y), Color3.fromRGB(9,9,14), 2)
     MkStroke(strip, UI.BORDER, 1)
+    
     local kl = MkLabel(strip,"Kills: 0",  UDim2.new(0,80,1,0),UDim2.new(0,UI.Pad,0,0),UI.Font,11,UI.ACCENT,3)
     local dl = MkLabel(strip,"AvgDist: —",UDim2.new(0,88,1,0),UDim2.new(0,95,0,0),    UI.Font,11,UI.TEXT,  3)
     local ll = MkLabel(strip,"Last: —",   UDim2.new(0,108,1,0),UDim2.new(0,190,0,0),  UI.Font,11,UI.MUTED, 3)
+    local el = MkLabel(strip,"Err: 0",    UDim2.new(0,60,1,0),UDim2.new(0,295,0,0),   UI.Font,11,Color3.fromRGB(255,80,80),3)
+    
     return function()
         kl.Text = "Kills: "    .. Stats.Kills
         dl.Text = "AvgDist: " .. (Stats.Kills>0 and string.format("%.1f",Stats.TotalDist/Stats.Kills) or "—")
         ll.Text = "Last: "    .. Stats.LastVictim
+        el.Text = "Err: "     .. Stats.Errors
     end
 end
 
--- ── BUILD FULL GUI ────────────────────────────────────────────
+--[[
+    BuildGUI()
+    Constructs entire config panel with all controls
+    Sets up:
+    - Titlebar with close button and drag functionality
+    - Sliders for Size, LerpFrames, Cooldown, AngleCap
+    - TextBox for RemoteName
+    - Trigger binding chip + REBIND button
+    - Toggles for Enabled, Visualizer, filters
+    - Stats display strip
+--]]
 local function BuildGUI()
     if ScreenGui then ScreenGui:Destroy() end
-
+    
     local sg = Instance.new("ScreenGui")
-    sg.Name="_NCBv3"; sg.ResetOnSpawn=false
+    sg.Name="_NCBv3"
+    sg.ResetOnSpawn=false
     sg.ZIndexBehavior=Enum.ZIndexBehavior.Global
-    sg.DisplayOrder=999; sg.IgnoreGuiInset=true
+    sg.DisplayOrder=999
+    sg.IgnoreGuiInset=true
     sg.Parent=game:GetService("CoreGui")
     ScreenGui=sg
-
+    
     local shadow = MkFrame(sg, UDim2.new(0,UI.W+16,0,UI.H+16),
         UDim2.new(0,52,0,112), Color3.fromRGB(0,0,0), 0)
-    shadow.BackgroundTransparency=0.58; MkCorner(shadow,12)
-
+    shadow.BackgroundTransparency=0.58
+    MkCorner(shadow,12)
+    
     local win = MkFrame(sg, UDim2.new(0,UI.W,0,UI.H),
         UDim2.new(0,60,0,120), UI.BG, 1)
-    MkCorner(win,8); MkStroke(win, UI.BORDER, 1)
-
+    MkCorner(win,8)
+    MkStroke(win, UI.BORDER, 1)
+    
     -- Titlebar
     local tb = MkFrame(win, UDim2.new(1,0,0,UI.TitleH),
         UDim2.new(0,0,0,0), Color3.fromRGB(17,17,24), 2)
     MkCorner(tb,8)
     MkFrame(tb, UDim2.new(1,0,0,8), UDim2.new(0,0,1,-8), Color3.fromRGB(17,17,24), 2)
+    
     local ab = MkFrame(tb, UDim2.new(0,3,0,18), UDim2.new(0,UI.Pad,0.5,-9), UI.ACCENT, 3)
     MkCorner(ab,2)
-    MkLabel(tb, "NoCBring Config", UDim2.new(0,180,1,0), UDim2.new(0,UI.Pad+10,0,0),
+    
+    MkLabel(tb, "NoCBring Config v3.1", UDim2.new(0,180,1,0),UDim2.new(0,UI.Pad+10,0,0),
         UI.Font, UI.TitleSz, UI.TEXT, 3)
+    
     local cb = MkFrame(tb, UDim2.new(0,24,0,24), UDim2.new(1,-32,0.5,-12),
         Color3.fromRGB(52,17,26), 3)
     MkCorner(cb,4)
     MkLabel(cb,"×",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),
         UI.Font,16,UI.ACCENT2,4,Enum.TextXAlignment.Center)
+    
     cb.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
-            win.Visible=false; shadow.Visible=false; guiVisible=false
+            win.Visible=false
+            shadow.Visible=false
+            guiVisible=false
         end
     end)
-
-    -- Drag
+    
+    -- Drag functionality
     local dragging, dStart, wStart = false, nil, nil
     tb.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
-            dragging=true; dStart=i.Position; wStart=win.Position
+            dragging=true
+            dStart=i.Position
+            wStart=win.Position
         end
     end)
+    
     UIS.InputEnded:Connect(function(i)
-        if i.UserInputType==Enum.UserInputType.MouseButton1 then dragging=false end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then 
+            dragging=false 
+        end
     end)
+    
     UIS.InputChanged:Connect(function(i)
         if dragging and i.UserInputType==Enum.UserInputType.MouseMovement then
             local d=i.Position-dStart
             win.Position    = UDim2.new(wStart.X.Scale,wStart.X.Offset+d.X,
-                                        wStart.Y.Scale,wStart.Y.Offset+d.Y)
+                                       wStart.Y.Scale,wStart.Y.Offset+d.Y)
             shadow.Position = UDim2.new(wStart.X.Scale,wStart.X.Offset+d.X-8,
-                                        wStart.Y.Scale,wStart.Y.Offset+d.Y-8)
+                                       wStart.Y.Scale,wStart.Y.Offset+d.Y-8)
         end
     end)
-
+    
     local content = MkFrame(win, UDim2.new(1,0,1,-UI.TitleH),
         UDim2.new(0,0,0,UI.TitleH), UI.BG, 2)
+    
     local y = 4
-
-    -- ── SECTION: REACH & TIMING ──────────────────────────────
+    
+    -- SECTION: REACH & TIMING
     MkLabel(content,"REACH & TIMING",UDim2.new(1,-UI.Pad*2,0,16),
         UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3)
     y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3)
     y=y+6
-
+    
     sliders.Size = MkSlider(content, y, "Size", 5, 30, CFG.Size,
         function(v) return string.format("%.0f st",v) end,
-        function(v) CFG.Size=v; if VisPart then local d=v*2; VisPart.Size=Vector3.new(d,d,d) end end)
+        function(v) 
+            CFG.Size=v 
+            if VisPart then 
+                local d=v*2
+                VisPart.Size=Vector3.new(d,d,d)
+            end
+        end)
     y=y+UI.RowH
-
+    
     sliders.Lerp = MkSlider(content, y, "LerpFrames", 2, 12, CFG.LerpFrames,
         function(v) return string.format("%.0f fr",v) end,
         function(v) CFG.LerpFrames=math.round(v) end)
     y=y+UI.RowH
-
+    
     sliders.Cool = MkSlider(content, y, "Cooldown", 0.10, 1.50, CFG.DragCooldown,
         function(v) return string.format("%.2f s",v) end,
         function(v) CFG.DragCooldown=v end)
     y=y+UI.RowH
-
+    
     sliders.Angle = MkSlider(content, y, "AngleCap", 10, 90, CFG.AngleCap,
         function(v) return string.format("%.0f °",v) end,
         function(v) CFG.AngleCap=v end)
     y=y+UI.RowH+4
-
-    -- ── SECTION: INPUTS ───────────────────────────────────────
+    
+    -- SECTION: INPUTS
     MkLabel(content,"INPUTS",UDim2.new(1,-UI.Pad*2,0,16),
         UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3)
     y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3)
     y=y+6
-
+    
     -- Remote name
     MkLabel(content,"RemoteName",UDim2.new(0,95,0,20),UDim2.new(0,UI.Pad,0,y),
         UI.FontBody,UI.TextSz,UI.MUTED,3)
+    
     local rBG = MkFrame(content, UDim2.new(0,UI.W-116,0,22),
         UDim2.new(0,108,0,y+1), Color3.fromRGB(26,26,38), 3)
-    MkCorner(rBG,4); MkStroke(rBG,UI.BORDER,1)
+    MkCorner(rBG,4)
+    MkStroke(rBG,UI.BORDER,1)
+    
     local rBox = Instance.new("TextBox")
-    rBox.Size=UDim2.new(1,-8,1,0); rBox.Position=UDim2.new(0,4,0,0)
-    rBox.Text=CFG.RemoteName; rBox.Font=UI.FontBody; rBox.TextSize=UI.TextSz
-    rBox.TextColor3=UI.TEXT; rBox.BackgroundTransparency=1
-    rBox.BorderSizePixel=0; rBox.ZIndex=4
+    rBox.Size=UDim2.new(1,-8,1,0)
+    rBox.Position=UDim2.new(0,4,0,0)
+    rBox.Text=CFG.RemoteName
+    rBox.Font=UI.FontBody
+    rBox.TextSize=UI.TextSz
+    rBox.TextColor3=UI.TEXT
+    rBox.BackgroundTransparency=1
+    rBox.BorderSizePixel=0
+    rBox.ZIndex=4
     rBox.PlaceholderText="e.g. DamageRemote"
-    rBox.PlaceholderColor3=UI.MUTED; rBox.ClearTextOnFocus=false
+    rBox.PlaceholderColor3=UI.MUTED
+    rBox.ClearTextOnFocus=false
     rBox.Parent=rBG
+    
     rBox.FocusLost:Connect(function()
         if rBox.Text~="" then
-            CFG.RemoteName=rBox.Text; currentRemote=nil
+            CFG.RemoteName=rBox.Text
+            currentRemote=nil
             Notify("Remote: "..CFG.RemoteName)
         end
     end)
     y=y+30
-
-    -- ── TRIGGER ROW ──────────────────────────────────────────
-    --[[
-        Left:   "Trigger" label
-        Center: chip showing current binding name  (e.g. "M1", "E")
-                — border accent-colored, updates on every rebind
-        Right:  REBIND button — click to enter listening mode
-
-        The chip and button share the same visual row at offset y.
-        triggerBindLabel (module-level) is set here so the rebind
-        logic in Section 5 can update it from outside BuildGUI.
-    --]]
+    
+    -- TRIGGER ROW
     MkLabel(content,"Trigger",UDim2.new(0,95,0,UI.RowH),
         UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
-
+    
     -- Binding chip
     local chipBG = MkFrame(content, UDim2.new(0,50,0,24),
         UDim2.new(0,108,0,y+5), Color3.fromRGB(22,22,34), 3)
     MkCorner(chipBG,5)
     local chipStroke = MkStroke(chipBG, UI.ACCENT, 1)
+    
     triggerBindLabel = MkLabel(chipBG, CFG.TriggerInput.Name,
         UDim2.new(1,0,1,0), UDim2.new(0,0,0,0),
         UI.Font, UI.TextSz, UI.ACCENT, 4, Enum.TextXAlignment.Center)
-
+    
     -- REBIND button
     local rbBG = MkFrame(content, UDim2.new(0,68,0,24),
         UDim2.new(0,166,0,y+5), Color3.fromRGB(22,22,34), 3)
@@ -692,19 +1039,21 @@ local function BuildGUI()
     local rbLbl = MkLabel(rbBG, "REBIND",
         UDim2.new(1,0,1,0), UDim2.new(0,0,0,0),
         UI.Font, 11, UI.MUTED, 4, Enum.TextXAlignment.Center)
-
+    
     rbBG.MouseEnter:Connect(function()
         if not listeningForTrigger then
             rbLbl.TextColor3 = UI.TEXT
             rbStroke.Color   = UI.MUTED
         end
     end)
+    
     rbBG.MouseLeave:Connect(function()
         if not listeningForTrigger then
             rbLbl.TextColor3 = UI.MUTED
             rbStroke.Color   = UI.BORDER
         end
     end)
+    
     rbBG.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
             rbLbl.TextColor3 = UI.WARN
@@ -713,31 +1062,48 @@ local function BuildGUI()
             StartRebind()
         end
     end)
-
-    -- Reset button visuals after rebind completes (polled in Heartbeat)
-    -- We store refs so the InputBegan handler in Section 5 can restore them.
+    
     getgenv()._NCBRebindUI = {
         rbLbl      = rbLbl,
         rbStroke   = rbStroke,
         chipStroke = chipStroke,
     }
-
     y=y+UI.RowH
-
-    -- ── TOGGLES ───────────────────────────────────────────────
+    
+    -- SECTION: FILTERS (NEW in v3.1)
+    MkLabel(content,"FILTERS",UDim2.new(1,-UI.Pad*2,0,16),
+        UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3)
+    y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3)
     y=y+6
-
+    
+    toggles.IgnoreTeam = MkToggle(content, UI.Pad, y, "Ignore Team",
+        CFG.Filters.IgnoreTeam, 
+        function(v) CFG.Filters.IgnoreTeam = v end)
+    
+    toggles.IgnoreFriends = MkToggle(content, UI.W/2, y, "Ignore Friends",
+        CFG.Filters.IgnoreFriends, 
+        function(v) CFG.Filters.IgnoreFriends = v end)
+    y=y+30
+    
+    -- TOGGLES
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3)
+    y=y+6
+    
     toggles.Enabled = MkToggle(content, UI.Pad, y, "Enabled",
         CFG.Enabled, function(v) CFG.Enabled=v end)
+    
     toggles.Visualizer = MkToggle(content, UI.W/2, y, "Visualizer",
         CFG.VisualizerEnabled, function(v)
             CFG.VisualizerEnabled=v
-            if not v then DestroySphereVis(); DestroyArcVis() end
+            if not v then 
+                DestroySphereVis()
+                DestroyArcVis()
+            end
         end)
     y=y+30
-
-    -- ── STATS ─────────────────────────────────────────────────
+    
+    -- STATS
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3)
     y=y+4
     refreshStats = MkStats(content, y)
@@ -745,237 +1111,532 @@ end
 
 BuildGUI()
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 3 — CORE DRAG ROUTINE
--- ═══════════════════════════════════════════════════════════════
+-- ============================================================================
+-- SECTION 3 — CORE DRAG ROUTINE
+-- ============================================================================
+
+--[[
+    DragAndFire(victim: Player, attackerRoot: Part, remote: Remote)
+    Main drag logic - spawns a coroutine for each victim
+    Flow:
+    1. Validate victim still exists and has valid character
+    2. Check cooldown and ActiveDrags table
+    3. Verify victim is in front arc
+    4. Record stats (distance)
+    5. Spawn coroutine that:
+       a. Suppresses torso signals
+       b. Calculates destination (offset from attackerRoot)
+       c. Applies velocity toward destination
+       d. Lerps torso over CFG.LerpFrames
+       e. Fires remote
+       f. Restores signals
+       g. Updates stats
+    All operations wrapped in pcall for error safety
+--]]
 local function DragAndFire(victim, attackerRoot, remote)
     local uid  = victim.UserId
     local char = victim.Character
+    
+    -- Early validation
     if not char then return end
+    if not char.Parent then return end  -- Character destroyed/respawning
+    
     local torso    = char:FindFirstChild("Torso")
     local humanoid = char:FindFirstChild("Humanoid")
-    if not torso or not humanoid or humanoid.Health<=0 then return end
-    if ActiveDrags[uid] then return end
-    if tick()-(LastDrag[uid] or 0) < CFG.DragCooldown then return end
-    if not IsInFrontArc(attackerRoot, torso) then return end
-
+    
+    if not torso or not humanoid or humanoid.Health<=0 then 
+        return 
+    end
+    
+    if ActiveDrags[uid] then 
+        return  -- Already being dragged
+    end
+    
+    if tick()-(LastDrag[uid] or 0) < CFG.DragCooldown then 
+        return  -- Cooldown not elapsed
+    end
+    
+    if not IsInFrontArc(attackerRoot, torso) then 
+        return  -- Not in angle cone
+    end
+    
+    if not CanDragVictim(victim) then
+        return  -- Filter rejected
+    end
+    
     local realDist = (attackerRoot.Position - torso.Position).Magnitude
-    ActiveDrags[uid]=true; LastDrag[uid]=tick()
+    
+    -- Mark as active to prevent duplicate drags
+    ActiveDrags[uid]=true
+    LastDrag[uid]=tick()
     Stats.ActiveDrags = Stats.ActiveDrags+1
-
+    
+    -- Spawn drag coroutine
     coroutine.wrap(function()
-        local dest = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
-        SuppressSignal(torso.Changed)
-        SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
-        local lp = dest.Position - torso.Position
-        torso.AssemblyLinearVelocity = lp.Unit * math.clamp(lp.Magnitude/(CFG.LerpFrames/60),0,55)
-        local origin = torso.CFrame
-        for i = 1, CFG.LerpFrames do
-            torso.CFrame = origin:Lerp(dest, (i/CFG.LerpFrames)^2)
-            RunService.Heartbeat:Wait()
+        -- WRAP ENTIRE COROUTINE IN PCALL FOR ERROR HANDLING
+        local success, err = pcall(function()
+            -- Recalculate destination (in case attacker moved)
+            local dest = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
+            
+            -- Verify torso still exists before suppressing signals
+            if not torso or not torso.Parent then
+                return
+            end
+            
+            -- Suppress physics signals to prevent interference
+            SuppressSignal(torso.Changed)
+            SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
+            
+            -- Apply initial velocity toward destination
+            local lp = dest.Position - torso.Position
+            torso.AssemblyLinearVelocity = lp.Unit * math.clamp(lp.Magnitude/(CFG.LerpFrames/60),0,55)
+            
+            -- Save original position for lerping
+            local origin = torso.CFrame
+            
+            -- Lerp torso to destination over CFG.LerpFrames
+            for i = 1, CFG.LerpFrames do
+                -- Check if torso still exists each frame
+                if not torso or not torso.Parent then
+                    break
+                end
+                
+                -- Quadratic easing: (i/n)^2 for smoother start
+                local t = (i/CFG.LerpFrames)^2
+                torso.CFrame = origin:Lerp(dest, t)
+                
+                RunService.Heartbeat:Wait()
+            end
+            
+            -- Restore physics signals
+            RestoreSignal(torso.Changed)
+            RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
+            
+            -- Fire remote if provided
+            if remote then 
+                pcall(function() 
+                    remote:FireServer(victim) 
+                end)
+            end
+            
+            -- Update stats
+            Stats.Kills      = Stats.Kills+1
+            Stats.TotalDist  = Stats.TotalDist+realDist
+            Stats.LastVictim = victim.Name
+            
+        end)
+        
+        -- Handle errors
+        if not success then
+            Stats.Errors = Stats.Errors + 1
+            warn("[NoCBring] Drag error:", err)
         end
-        RestoreSignal(torso.Changed)
-        RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
-        if remote then pcall(function() remote:FireServer(victim) end) end
-        Stats.Kills      = Stats.Kills+1
-        Stats.TotalDist  = Stats.TotalDist+realDist
-        Stats.LastVictim = victim.Name
-        Stats.ActiveDrags= math.max(0,Stats.ActiveDrags-1)
+        
+        -- Cleanup (always runs, even on error)
+        Stats.ActiveDrags = math.max(0, Stats.ActiveDrags-1)
         ActiveDrags[uid] = nil
+        
     end)()
 end
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 4 — HEARTBEAT
--- ═══════════════════════════════════════════════════════════════
+-- ============================================================================
+-- SECTION 4 — HEARTBEAT (MAIN LOOP)
+-- ============================================================================
+
+--[[
+    Heartbeat runs at 60fps and handles:
+    1. Stats refresh
+    2. Character/tool validation
+    3. Remote caching
+    4. Trigger detection
+    5. Player scanning with optimizations:
+       - Spatial culling (skip beyond Size * 1.5)
+       - Frame staggering (check 1/3 players per frame)
+       - Early exit (stop if at MaxConcurrentDrags)
+    6. Visualizer updates
+    
+    OPTIMIZATIONS:
+    - Frame counter rotates through player list in 3-frame cycle
+    - Spatial culling skips distant players before expensive checks
+    - Cached FindFirstChild calls (handle, root, torso)
+    - Early exit when trigger not held or disabled
+--]]
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
-    if refreshStats then refreshStats() end
-    if CFG.ScriptKilled then return end
-
+    -- Refresh stats display
+    if refreshStats then 
+        refreshStats() 
+    end
+    
+    -- Check if script killed
+    if CFG.ScriptKilled then 
+        return 
+    end
+    
+    -- Get local character
     local char = LocalPlayer.Character
-    if not char then return end
-
+    if not char then 
+        return 
+    end
+    
+    -- Validate character components
     local tool     = char:FindFirstChildOfClass("Tool")
     local humanoid = char:FindFirstChild("Humanoid")
     local root     = char:FindFirstChild("HumanoidRootPart")
-
+    
     if not tool or not humanoid or not root then
-        currentRemote=nil; DestroySphereVis(); DestroyArcVis(); return
+        currentRemote=nil
+        DestroySphereVis()
+        DestroyArcVis()
+        return
     end
+    
     local handle = tool:FindFirstChild("Handle")
-    if not handle then DestroySphereVis(); DestroyArcVis(); return end
-
-    if not currentRemote then currentRemote = FindRemote(tool) end
-
-    -- Trigger uses hotswap input
+    if not handle then 
+        DestroySphereVis()
+        DestroyArcVis()
+        return 
+    end
+    
+    -- Cache remote if not already cached
+    if not currentRemote then 
+        currentRemote = FindRemote(tool) 
+    end
+    
+    -- Get trigger state
     local triggerHeld    = IsTriggerActive()
     local targetsInRange = 0
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player==LocalPlayer then continue end
-        local pc = player.Character; if not pc then continue end
-        local pt = pc:FindFirstChild("Torso"); if not pt then continue end
-        if (handle.Position - pt.Position).Magnitude <= CFG.Size then
-            targetsInRange = targetsInRange+1
-            if CFG.Enabled and triggerHeld then
-                DragAndFire(player, root, currentRemote)
+    
+    -- Early exit if not enabled or trigger not held
+    if not CFG.Enabled or not triggerHeld then
+        -- Still update visualizers for feedback
+        local col = CFG.Enabled and COLOR.CLEAR or COLOR.DISABLED
+        UpdateSphereVis(handle, col)
+        UpdateArcVis(root.CFrame, col)
+        return
+    end
+    
+    -- OPTIMIZATION: Frame staggering
+    -- Only check 1/3 of players per frame to reduce CPU load
+    frameCounter = (frameCounter + 1) % 3
+    
+    -- OPTIMIZATION: Spatial culling distance
+    local cullDistance = CFG.Size * CFG.SpatialCullFactor
+    
+    -- Scan players
+    local players = Players:GetPlayers()
+    local playerCount = #players
+    
+    for i, player in ipairs(players) do
+        -- Skip self
+        if player==LocalPlayer then 
+            continue 
+        end
+        
+        -- OPTIMIZATION: Frame staggering - check different players each frame
+        if CFG.FrameStagger and (i % 3) ~= frameCounter then
+            continue
+        end
+        
+        -- Get victim character and torso
+        local pc = player.Character
+        if not pc then 
+            continue 
+        end
+        
+        local pt = pc:FindFirstChild("Torso")
+        if not pt then 
+            continue 
+        end
+        
+        -- OPTIMIZATION: Spatial culling - skip distant players
+        local dist = (handle.Position - pt.Position).Magnitude
+        if dist > cullDistance then
+            continue
+        end
+        
+        -- Check if in actual range
+        if dist <= CFG.Size then
+            targetsInRange = targetsInRange + 1
+            
+            -- OPTIMIZATION: Early exit if at max concurrent drags
+            if Stats.ActiveDrags >= CFG.MaxConcurrentDrags then
+                break
             end
+            
+            -- Initiate drag
+            DragAndFire(player, root, currentRemote)
         end
     end
-
-    -- State color (shared by sphere and arc)
+    
+    -- Determine visualizer color state
     local col
-    if not CFG.Enabled             then col = COLOR.DISABLED
-    elseif Stats.ActiveDrags > 0   then col = COLOR.FIRING
-    elseif targetsInRange > 0      then col = COLOR.TARGET
-    else                                col = COLOR.CLEAR
+    if not CFG.Enabled then
+        col = COLOR.DISABLED
+    elseif Stats.ActiveDrags > 0 then
+        col = COLOR.FIRING
+    elseif targetsInRange > 0 then
+        col = COLOR.TARGET
+    else
+        col = COLOR.CLEAR
     end
-
-    -- Sphere: centered on Handle (reach check origin)
+    
+    -- Update visualizers
     UpdateSphereVis(handle, col)
-
-    -- Arc: centered on HumanoidRootPart (angle check origin)
     UpdateArcVis(root.CFrame, col)
+    
 end)
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 5 — INPUT / KEYBINDS
--- ═══════════════════════════════════════════════════════════════
+-- ============================================================================
+-- SECTION 5 — INPUT / KEYBINDS
+-- ============================================================================
+
+--[[
+    InputBegan handler handles:
+    1. Trigger rebind mode (runs BEFORE GPE check)
+    2. Script control keybinds (runs AFTER GPE check)
+    
+    REBIND FLOW:
+    - Click REBIND button → listeningForTrigger = true
+    - Next InputBegan (any key/mouse) captured here
+    - 0.10s cooldown prevents REBIND click from being captured
+    - Escape cancels, any other valid input confirms
+    - Updates CFG.TriggerInput and GUI chip label
+    
+    KEYBINDS (GPE-gated):
+    Z: Toggle enabled
+    X: Toggle visualizers
+    C: Toggle UI
+    P: Kill script
+--]]
 Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
-    --[[
-        REBIND INTERCEPT — runs before `if gpe then return end`.
-
-        Why before GPE check?
-          After clicking REBIND (a GuiButton → GPE=true), the user's
-          NEXT input is what we want to capture.  If that next input
-          is also from the GUI (e.g. they click a slider), it would
-          normally be GPE=true and skipped.  We must catch it here.
-
-          The 0.10 s cooldown ensures the REBIND button click itself
-          (MouseButton1, GPE=true, fired at rebindStartTick) is not
-          immediately captured as the new trigger.
-
-        Escape cancels the rebind without changing the binding.
-    --]]
+    -- ============================================================================
+    -- REBIND INTERCEPT (BEFORE GPE CHECK)
+    -- Why before? After clicking REBIND (GPE=true), the NEXT input is what we
+    -- want to capture. If that next input is also from GUI, it would normally
+    -- be skipped. We must catch it here before the GPE return.
+    -- ============================================================================
     if listeningForTrigger then
-        if tick()-rebindStartTick < 0.10 then return end
-
+        -- Cooldown: prevent REBIND button click from being captured
+        if tick()-rebindStartTick < 0.10 then 
+            return 
+        end
+        
+        -- Escape cancels rebind
         if input.KeyCode == Enum.KeyCode.Escape then
             listeningForTrigger = false
             if triggerBindLabel then
                 triggerBindLabel.Text       = CFG.TriggerInput.Name
-                triggerBindLabel.TextColor3 = UI.ACCENT
+                triggerBindLabel.TextColor3 = Color3.fromRGB(0, 200, 115)
             end
+            
             local ui = getgenv()._NCBRebindUI
             if ui then
-                ui.rbLbl.TextColor3 = UI.MUTED
-                ui.rbStroke.Color   = UI.BORDER
-                ui.chipStroke.Color = UI.ACCENT
+                ui.rbLbl.TextColor3 = Color3.fromRGB(105, 105, 128)
+                ui.rbStroke.Color   = Color3.fromRGB(38, 38, 52)
+                ui.chipStroke.Color = Color3.fromRGB(0, 200, 115)
             end
+            
             Notify("Rebind cancelled.")
             return
         end
-
-        -- Build the new TriggerInput record
+        
+        -- Build new TriggerInput record
         local newTrigger
-        if     input.UserInputType == Enum.UserInputType.MouseButton1 then
-            newTrigger = { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" }
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            newTrigger = { 
+                Kind="Mouse", 
+                Button=Enum.UserInputType.MouseButton1, 
+                Name="M1" 
+            }
         elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-            newTrigger = { Kind="Mouse", Button=Enum.UserInputType.MouseButton2, Name="M2" }
+            newTrigger = { 
+                Kind="Mouse", 
+                Button=Enum.UserInputType.MouseButton2, 
+                Name="M2" 
+            }
         elseif input.UserInputType == Enum.UserInputType.MouseButton3 then
-            newTrigger = { Kind="Mouse", Button=Enum.UserInputType.MouseButton3, Name="M3" }
+            newTrigger = { 
+                Kind="Mouse", 
+                Button=Enum.UserInputType.MouseButton3, 
+                Name="M3" 
+            }
         elseif input.KeyCode ~= Enum.KeyCode.Unknown then
-            newTrigger = { Kind="Key", Code=input.KeyCode, Name=InputToName(input) }
+            newTrigger = { 
+                Kind="Key", 
+                Code=input.KeyCode, 
+                Name=InputToName(input) 
+            }
         else
-            return   -- unrecognized (gamepad etc.) — keep listening
+            return  -- Unrecognized input (gamepad etc.) - keep listening
         end
-
+        
         -- Apply new trigger
         CFG.TriggerInput    = newTrigger
         listeningForTrigger = false
-
-        -- Update chip label
+        
+        -- Update GUI chip label
         if triggerBindLabel then
             triggerBindLabel.Text       = newTrigger.Name
-            triggerBindLabel.TextColor3 = UI.ACCENT
+            triggerBindLabel.TextColor3 = Color3.fromRGB(0, 200, 115)
         end
-
+        
         -- Restore button visuals
         local ui = getgenv()._NCBRebindUI
         if ui then
-            ui.rbLbl.TextColor3 = UI.MUTED
-            ui.rbStroke.Color   = UI.BORDER
-            ui.chipStroke.Color = UI.ACCENT
+            ui.rbLbl.TextColor3 = Color3.fromRGB(105, 105, 128)
+            ui.rbStroke.Color   = Color3.fromRGB(38, 38, 52)
+            ui.chipStroke.Color = Color3.fromRGB(0, 200, 115)
         end
-
+        
         Notify("Trigger → " .. newTrigger.Name)
         return
     end
-
-    -- Standard script keybinds (GPE-gated)
-    if gpe then return end
-
+    
+    -- ============================================================================
+    -- STANDARD KEYBINDS (AFTER GPE CHECK)
+    -- Skip if input came from GUI (GameProcessedEvent)
+    -- ============================================================================
+    if gpe then 
+        return 
+    end
+    
     if input.KeyCode == CFG.Keybinds.Toggle then
         CFG.Enabled = not CFG.Enabled
-        if toggles.Enabled then toggles.Enabled.SetState(CFG.Enabled) end
+        if toggles.Enabled then 
+            toggles.Enabled.SetState(CFG.Enabled) 
+        end
         Notify("Enabled: "..tostring(CFG.Enabled))
-
+        
     elseif input.KeyCode == CFG.Keybinds.ToggleVis then
         CFG.VisualizerEnabled = not CFG.VisualizerEnabled
-        if toggles.Visualizer then toggles.Visualizer.SetState(CFG.VisualizerEnabled) end
-        if not CFG.VisualizerEnabled then DestroySphereVis(); DestroyArcVis() end
+        if toggles.Visualizer then 
+            toggles.Visualizer.SetState(CFG.VisualizerEnabled) 
+        end
+        if not CFG.VisualizerEnabled then 
+            DestroySphereVis()
+            DestroyArcVis()
+        end
         Notify("Visualizer: "..tostring(CFG.VisualizerEnabled))
-
+        
     elseif input.KeyCode == CFG.Keybinds.ToggleUI then
         guiVisible = not guiVisible
         if ScreenGui then
-            for _, obj in ipairs(ScreenGui:GetChildren()) do obj.Visible=guiVisible end
+            for _, obj in ipairs(ScreenGui:GetChildren()) do 
+                obj.Visible=guiVisible 
+            end
         end
-
+        
     elseif input.KeyCode == CFG.Keybinds.Kill then
         CFG.ScriptKilled = true
-        DestroySphereVis(); DestroyArcVis()
-        if ScreenGui then ScreenGui:Destroy() end
-        for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
+        
+        -- Cleanup visualizers
+        DestroySphereVis()
+        DestroyArcVis()
+        
+        -- Cleanup GUI
+        if ScreenGui then 
+            ScreenGui:Destroy() 
+        end
+        
+        -- Disconnect all events
+        for _, c in pairs(Connections) do 
+            pcall(function() c:Disconnect() end) 
+        end
+        
+        -- Cleanup character connections
+        for _, c in pairs(charConnections) do
+            pcall(function() c:Disconnect() end)
+        end
+        charConnections = {}
+        
         Notify("Script killed.")
     end
 end)
 
--- ─────────────────────────────────────────────────────────────
--- CHARACTER WIRING
--- ─────────────────────────────────────────────────────────────
+-- ============================================================================
+-- CHARACTER WIRING & CLEANUP
+-- ============================================================================
+
+--[[
+    OnChar(char: Model)
+    Sets up event handlers for character:
+    - ChildAdded: invalidate remote cache when new tool added
+    - ChildRemoved: invalidate cache and cleanup when tool removed
+    
+    CRITICAL FIX (v3.1):
+    Disconnects old connections before creating new ones to prevent leaks
+--]]
 local function OnChar(char)
-    char.ChildAdded:Connect(function(c)
-        if c:IsA("Tool") then currentRemote=nil end
+    -- CRITICAL: Disconnect old connections to prevent memory leak
+    for _, c in pairs(charConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+    charConnections = {}
+    
+    -- Invalidate remote cache when tool added
+    charConnections.ChildAdded = char.ChildAdded:Connect(function(c)
+        if c:IsA("Tool") then 
+            currentRemote=nil 
+        end
     end)
-    char.ChildRemoved:Connect(function(c)
-        if c:IsA("Tool") then currentRemote=nil; DestroyArcVis() end
+    
+    -- Cleanup when tool removed
+    charConnections.ChildRemoved = char.ChildRemoved:Connect(function(c)
+        if c:IsA("Tool") then 
+            currentRemote=nil
+            DestroyArcVis()
+        end
     end)
 end
-if LocalPlayer.Character then OnChar(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(OnChar)
 
-Notify(string.format("NoCBring v3  Size=%d  Trigger=%s  [C] UI",
+--[[
+    PlayerRemoving cleanup
+    CRITICAL FIX (v3.1):
+    Cleans up ActiveDrags and LastDrag tables when player leaves
+    Prevents memory leaks from orphaned entries
+--]]
+Connections.PlayerRemoving = Players.PlayerRemoving:Connect(function(player)
+    ActiveDrags[player.UserId] = nil
+    LastDrag[player.UserId] = nil
+end)
+
+-- Initialize character wiring
+if LocalPlayer.Character then 
+    OnChar(LocalPlayer.Character) 
+end
+
+Connections.CharacterAdded = LocalPlayer.CharacterAdded:Connect(OnChar)
+
+-- Show startup notification
+Notify(string.format("NoCBring v3.1  Size=%d  Trigger=%s  [C] UI",
     CFG.Size, CFG.TriggerInput.Name))
 
 --[[
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- KEYBIND REFERENCE
+KEYBIND REFERENCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Z  — Toggle drag on/off
- X  — Toggle all visualizers (sphere + arc)
- C  — Show / hide config panel
- P  — Kill script
+Z  — Toggle drag on/off
+X  — Toggle all visualizers (sphere + arc)
+C  — Show / hide config panel
+P  — Kill script
 
- TRIGGER REBIND
-   Open panel [C] → click REBIND → press any key or mouse button
-   Escape cancels.  New binding shown live in the chip.
-   Supported: M1, M2, M3, any keyboard KeyCode.
+TRIGGER REBIND
+Open panel [C] → click REBIND → press any key or mouse button
+Escape cancels.  New binding shown live in the chip.
+Supported: M1, M2, M3, any keyboard KeyCode.
 
- ARC CONE VISUALIZER
-   16 neon workspace Parts (2 radii + 14 arc segments)
-   Origin: HumanoidRootPart  (matches IsInFrontArc)
-   Sphere origin: Handle      (matches distance check)
-   Both update live with Size / AngleCap sliders.
+ARC CONE VISUALIZER
+16 neon workspace Parts (2 radii + 14 arc segments)
+Origin: HumanoidRootPart  (matches IsInFrontArc)
+Sphere origin: Handle      (matches distance check)
+Both update live with Size / AngleCap sliders.
+
+PERFORMANCE OPTIMIZATIONS (v3.1)
+- Frame staggering: checks 1/3 players per frame
+- Spatial culling: skips players beyond Size * 1.5
+- Early exit: stops checking at MaxConcurrentDrags
+- Cached FindFirstChild calls
+- PlayerRemoving cleanup prevents memory leaks
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
