@@ -1,269 +1,775 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          NO-BREAKJOINTS CBRING — FULL MODEL WITH ARCHITECTURAL NOTES        ║
+║         NO-BREAKJOINTS CBRING — VISUAL INDICATOR + LIVE CONFIG UI           ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- UNDERSTANDING THE ROBLOX CLIENT-SERVER RELATIONSHIP
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Two additions over the base model:
 
- Roblox uses a CLIENT-AUTHORITATIVE physics model with a twist:
+  1. VISUAL INDICATOR
+     A SelectionSphere anchored to the tool Handle showing the current
+     reach radius.  Color shifts:
+       Gray   → script disabled
+       Green  → enabled, no targets in range
+       Yellow → one or more targets within range (pre-drag)
+       Red    → drag actively executing this frame
 
- ┌─────────────────────────────────────────────────────────────────┐
- │  NETWORK OWNERSHIP — who controls what                          │
- │                                                                 │
- │  Each BasePart has a "network owner": the peer (client or       │
- │  server) whose physics simulation is treated as canonical for   │
- │  that part.                                                     │
- │                                                                 │
- │  By default:                                                    │
- │    • Player A's character parts  → owned by Player A's client   │
- │    • Player B's character parts  → owned by Player B's client   │
- │    • Unanchored workspace parts  → owned by nearest player      │
- │    • Anchored / server parts     → owned by server              │
- │                                                                 │
- │  CRITICAL: Player A's client CANNOT write physics state         │
- │  (CFrame, Velocity, AssemblyLinearVelocity) to Player B's       │
- │  character parts in a way the SERVER or Player B sees.          │
- │  The write happens LOCALLY on Player A's machine only.          │
- └─────────────────────────────────────────────────────────────────┘
+  2. LIVE CONFIG PANEL
+     A draggable ScreenGui with real-time sliders and toggles for every
+     CFG value.  Changes apply immediately — no reload required.
+     Includes a live stats strip showing session kills, avg distance,
+     and last victim.
 
- ┌─────────────────────────────────────────────────────────────────┐
- │  INSTANCE REPLICATION — who can add/remove Instances            │
- │                                                                 │
- │  Instance tree changes (ChildAdded, ChildRemoved) are ONLY      │
- │  replicated SERVER → CLIENT, never CLIENT → SERVER.             │
- │                                                                 │
- │  This means BreakJoints() called on the CHEATER'S client:       │
- │    1. Removes Motor6D instances LOCALLY on the cheater's screen │
- │    2. The server NEVER sees those Motor6Ds removed              │
- │    3. The victim NEVER sees those Motor6Ds removed              │
- │    4. The victim stays alive on every machine except the cheater│
- └─────────────────────────────────────────────────────────────────┘
-
- ┌─────────────────────────────────────────────────────────────────┐
- │  THE REAL KILL MECHANISM                                        │
- │                                                                 │
- │  cbring was never about BreakJoints killing the victim.         │
- │  BreakJoints was a SIDE EFFECT / visual glitch that appeared    │
- │  to work in earlier Roblox versions or in games where the       │
- │  damage pipeline runs on a LocalScript.                         │
- │                                                                 │
- │  The ACTUAL kill chain is:                                      │
- │                                                                 │
- │  [Cheater's Client]                                             │
- │       │                                                         │
- │       ▼                                                         │
- │  Victim's Torso dragged LOCALLY (physics write stays local)     │
- │       │                                                         │
- │       ▼                                                         │
- │  Handle.Touched fires on the CHEATER'S physics simulation       │
- │  (because locally the torso is now overlapping the handle)      │
- │       │                                                         │
- │       ▼                                                         │
- │  Tool LocalScript fires:  DamageRemote:FireServer(victim)       │
- │       │                                                         │
- │       ▼                                                         │
- │  [Server receives RemoteEvent]                                  │
- │       │                                                         │
- │       ▼                                                         │
- │  Server applies damage to victim.Humanoid.Health                │
- │  → victim dies on server → replicates to all clients            │
- │                                                                 │
- │  The drag is a CLIENT-SIDE ILLUSION.                            │
- │  The server sees: a hit RemoteEvent.  Nothing else.             │
- │  Victim's position on the server = their REAL position.         │
- └─────────────────────────────────────────────────────────────────┘
-
- WHY REMOVE BREAKJOINTS?
- ─────────────────────────────────────────────────────────────────
- BreakJoints() is noise. It does nothing server-side, but it:
-   • Creates a Motor6D ChildRemoved event locally (detectable if the
-     anti-cheat runs on the cheater's client — e.g. a sandboxed AC)
-   • Can cause visual anomalies for the cheater that expose the script
-   • Adds an unnecessary executor API call that some detection hooks
-     can intercept
-
- Without BreakJoints:
-   • Layer 4 (joint audit) of the previous anti-cheat is completely blind
-   • The exploit becomes a pure RemoteEvent attack
-   • The server can only detect it via hit validation logic
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  Architecture note:
+     All UI and visualizer code is client-local.  Nothing here changes
+     what the server sees.  The config panel modifies CFG values in
+     getgenv() so they persist across coroutines and can be read by the
+     heartbeat loop on the same frame.
 --]]
 
 -- ─────────────────────────────────────────────────────────────
 -- GUARD
 -- ─────────────────────────────────────────────────────────────
-if getgenv()._NOCBRING_LOADED then return end
-getgenv()._NOCBRING_LOADED = true
+if getgenv()._NOCBRING_V2_LOADED then return end
+getgenv()._NOCBRING_V2_LOADED = true
 
 -- ─────────────────────────────────────────────────────────────
 -- SERVICES
 -- ─────────────────────────────────────────────────────────────
-local Players      = game:GetService("Players")
-local RunService   = game:GetService("RunService")
-local UIS          = game:GetService("UserInputService")
-local StarterGui   = game:GetService("StarterGui")
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local UIS               = game:GetService("UserInputService")
+local TweenService      = game:GetService("TweenService")
+local StarterGui        = game:GetService("StarterGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- ─────────────────────────────────────────────────────────────
--- CONFIG
+-- LIVE CONFIG (stored in getgenv() so every coroutine reads
+-- the same table after a UI slider changes it)
 -- ─────────────────────────────────────────────────────────────
-local CFG = {
-    --[[
-        Size is the LOCAL hitbox radius we manufacture on the cheater's
-        client.  The server never sees this radius — it only receives the
-        resulting RemoteEvent.  Randomized per-session to prevent the
-        statistical kill-distance fingerprinting that a larger fixed
-        size would create.
-    --]]
+getgenv().NCBCFG = getgenv().NCBCFG or {
+    -- Core reach — how far (studs) from Handle to scan for victims
     Size         = math.random(9, 14),
-
-    --[[
-        LerpFrames: how many Heartbeat frames the local drag takes.
-        6 frames ≈ 0.10 s at 60 Hz.
-        Shorter = kill faster but more physically anomalous.
-        Longer  = smoother but gives server more time to move victim.
-        We want the drag to complete BEFORE the server's next physics
-        snapshot is sent back to us.  At 60 Hz physics, one server
-        heartbeat ≈ 0.016 s.  6 frames = 6 server snapshots pass.
-        This is intentional — by the time the RemoteEvent reaches the
-        server, the server's snapshot of the victim has NOT moved.
-        The server rejects nothing because it doesn't see the drag.
-    --]]
+    -- Lerp duration in frames (6 ≈ 0.10 s at 60 Hz)
     LerpFrames   = 6,
-
-    --[[
-        DragCooldown: minimum seconds between successive RemoteEvent fires
-        to the server.  The anti-cheat's rate-limiter will watch for
-        bursts of damage events.  We space them apart to stay under
-        the burst threshold.
-        Tuned to be slightly above a fast legitimate attack rate.
-    --]]
+    -- Minimum seconds between RemoteEvent fires per victim
     DragCooldown = 0.40,
-
-    --[[
-        AngleCap: only drag victims within this cone in front of the
-        attacker (degrees, full width).  Keeps kill-angle distribution
-        realistic so the server's behavioral model sees a normal player.
-        Legitimate melee kills almost always happen in the forward arc.
-    --]]
-    AngleCap     = 100,
-
-    --[[
-        RemoteName: the name of the RemoteEvent (or RemoteFunction) that
-        the tool uses to communicate hits to the server.  The exploit
-        must fire this as if the tool's LocalScript fired it normally.
-        In most games this is found by reading the tool's LocalScript.
-    --]]
-    RemoteName   = "DamageRemote",  -- change per-game
-
+    -- Max angle (degrees) each side of forward vector to accept victims
+    AngleCap     = 50,
+    -- Name of the tool's damage RemoteEvent (game-specific)
+    RemoteName   = "DamageRemote",
+    -- Toggle flags
     Enabled      = true,
+    VisualizerEnabled = true,
     ScriptKilled = false,
-
+    -- Keybinds
     Keybinds = {
-        Toggle     = Enum.KeyCode.Z,
-        KillScript = Enum.KeyCode.P,
+        Toggle       = Enum.KeyCode.Z,
+        ToggleVis    = Enum.KeyCode.X,
+        ToggleUI     = Enum.KeyCode.C,
+        KillScript   = Enum.KeyCode.P,
     },
+}
+local CFG = getgenv().NCBCFG
+
+-- ─────────────────────────────────────────────────────────────
+-- SESSION STATS (read by the UI strip)
+-- ─────────────────────────────────────────────────────────────
+local Stats = {
+    Kills         = 0,
+    TotalDist     = 0,
+    LastVictim    = "—",
+    ActiveDrags   = 0,   -- how many drags are running right now
 }
 
 -- ─────────────────────────────────────────────────────────────
 -- STATE
 -- ─────────────────────────────────────────────────────────────
-local Connections = {}
-local LocalPlayer = Players.LocalPlayer
-local ActiveDrags = {}   -- { [userId] = true }
-local LastDrag    = {}   -- { [userId] = number (tick) }
+local Connections  = {}
+local LocalPlayer  = Players.LocalPlayer
+local ActiveDrags  = {}   -- { [userId] = true }
+local LastDrag     = {}   -- { [userId] = number }
+local currentRemote = nil
 
 -- ─────────────────────────────────────────────────────────────
 -- HELPERS
 -- ─────────────────────────────────────────────────────────────
 local function Notify(text)
-    StarterGui:SetCore("SendNotification", { Title = "NoCBring", Text = text })
+    StarterGui:SetCore("SendNotification", {
+        Title = "NoCBring",
+        Text  = text,
+        Duration = 2,
+    })
 end
 
 local function SuppressSignal(signal)
-    for _, conn in ipairs(getconnections(signal)) do
-        pcall(function() conn:Disable() end)
+    for _, c in ipairs(getconnections(signal)) do
+        pcall(function() c:Disable() end)
     end
 end
 
 local function RestoreSignal(signal)
-    for _, conn in ipairs(getconnections(signal)) do
-        pcall(function() conn:Enable() end)
+    for _, c in ipairs(getconnections(signal)) do
+        pcall(function() c:Enable() end)
     end
 end
 
---[[
-    IsInFrontArc: returns true if the victim's torso falls within the
-    cheater's forward arc (CFG.AngleCap degrees wide).
-
-    Why bother?  Because the kill-angle statistical model on the server
-    looks at the distribution of angles between the attacker's facing
-    direction and where the victim was at time of kill.  If we kill
-    people at 180° (directly behind us), that's a massive red flag.
-    Restricting to a plausible forward arc keeps the distribution normal.
-
-    The server computes this angle using SERVER-SIDE positions.
-    Our local drag does NOT change the server's view of the victim's
-    position.  So the angle the server measures is:
-        attacker real pos → victim real pos
-    This is why we ALSO restrict by real-position angle before dragging —
-    we only drag victims who are already in a geometrically plausible
-    position from the server's perspective.
---]]
 local function IsInFrontArc(attackerRoot, victimTorso)
     local toVictim = (victimTorso.Position - attackerRoot.Position)
     if toVictim.Magnitude < 0.1 then return false end
     local dot   = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
     local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
-    return angle <= (CFG.AngleCap / 2)
+    return angle <= CFG.AngleCap
 end
 
--- ─────────────────────────────────────────────────────────────
--- REMOTE RESOLVER
---
--- Finds the DamageRemote in the tool.  Most games put this inside
--- the Tool instance itself, or inside ReplicatedStorage.
--- The exploit searches both locations.
--- ─────────────────────────────────────────────────────────────
 local function FindRemote(tool)
-    -- Check inside the tool first
     local r = tool:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-        return r
-    end
-    -- Check ReplicatedStorage
-    r = game:GetService("ReplicatedStorage"):FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
-        return r
-    end
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    r = ReplicatedStorage:FindFirstChild(CFG.RemoteName, true)
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
     return nil
 end
 
--- ─────────────────────────────────────────────────────────────
--- CORE DRAG ROUTINE
---
--- This is a CLIENT-LOCAL operation.  Nothing written here reaches
--- the server or any other player's client.  The ONLY thing that
--- reaches the server is the RemoteEvent fire at the end.
---
--- Timeline on the cheater's client:
---   Frame 0  : Suppress Changed/CFrame signals on victim's Torso
---              (locally — because the game's own scripts may react
---               to CFrame changes and cancel the drag)
---              Assign spoofed velocity to match lerp direction.
---   Frames 1–N: EaseInQuad lerp toward destination.
---              Signals stay suppressed.
---   Final frame: Restore signals.  Fire the damage RemoteEvent.
---              We fire AFTER restore so the local Touched handler
---              (if any) doesn't double-fire.
---
--- After RestoreSignal, the torso slowly drifts back to its real
--- server position via normal replication.  The cheater's client
--- sees the victim snap back.  This is acceptable — the kill has
--- already been registered.
--- ─────────────────────────────────────────────────────────────
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 1 — VISUAL REACH INDICATOR
+-- ═══════════════════════════════════════════════════════════════
+--[[
+    The visualizer consists of:
+      • A massless, unanchored Part parented to CoreGui
+        (keeps it off the workspace hierarchy, avoids game-side cleanup)
+      • A SelectionSphere adorning that Part
+      • Every Heartbeat: Part.CFrame = Handle.CFrame, Part.Size = radius sphere
+
+    Color states:
+      GRAY   (#888)  disabled
+      GREEN  (#00FF88) enabled, no targets in range
+      YELLOW (#FFD700) target(s) in range, about to fire
+      RED    (#FF2040) drag actively running
+--]]
+
+local VisPart   = nil   -- the invisible Part
+local VisSphere = nil   -- the SelectionSphere
+
+local COLOR = {
+    DISABLED = Color3.fromRGB(130, 130, 130),
+    CLEAR    = Color3.fromRGB(0,   220, 120),
+    TARGET   = Color3.fromRGB(255, 200, 0  ),
+    FIRING   = Color3.fromRGB(255, 30,  60 ),
+}
+
+local function BuildVisualizer()
+    if VisPart then VisPart:Destroy() end
+
+    local part        = Instance.new("Part")
+    part.Name         = "_NCBVis"
+    part.Anchored     = false
+    part.CanCollide   = false
+    part.Massless     = true
+    part.Transparency = 1
+    part.Size         = Vector3.new(1, 1, 1)
+    part.Parent       = game:GetService("CoreGui")
+
+    local sphere               = Instance.new("SelectionSphere")
+    sphere.Name                = "_NCBSphere"
+    sphere.Adornee             = part
+    sphere.SurfaceTransparency = 0.85
+    sphere.Transparency        = 0.3
+    sphere.Color3              = COLOR.CLEAR
+    sphere.SurfaceColor3       = COLOR.CLEAR
+    sphere.Parent              = part
+
+    VisPart   = part
+    VisSphere = sphere
+end
+
+local function DestroyVisualizer()
+    if VisPart then
+        VisPart:Destroy()
+        VisPart   = nil
+        VisSphere = nil
+    end
+end
+
+-- Called every Heartbeat with current handle + targets-in-range count
+local function UpdateVisualizer(handle, targetsInRange, activeDragCount)
+    if not CFG.VisualizerEnabled then
+        DestroyVisualizer()
+        return
+    end
+
+    if not VisPart or not VisPart.Parent then
+        BuildVisualizer()
+    end
+
+    -- Sync size to current CFG.Size
+    local s = CFG.Size * 2   -- diameter
+    VisPart.Size   = Vector3.new(s, s, s)
+    VisPart.CFrame = handle.CFrame
+
+    -- Color logic
+    local col
+    if not CFG.Enabled then
+        col = COLOR.DISABLED
+    elseif activeDragCount > 0 then
+        col = COLOR.FIRING
+    elseif targetsInRange > 0 then
+        col = COLOR.TARGET
+    else
+        col = COLOR.CLEAR
+    end
+
+    if VisSphere then
+        VisSphere.Color3        = col
+        VisSphere.SurfaceColor3 = col
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 2 — LIVE CONFIG GUI
+-- ═══════════════════════════════════════════════════════════════
+--[[
+    Layout:
+    ┌──────────────────────────────────────────┐
+    │  NoCBring Config               [×] [_]   │  ← title bar (draggable)
+    ├──────────────────────────────────────────┤
+    │  Size          [━━━●─────]  11           │
+    │  LerpFrames    [━━━━●────]   6           │
+    │  DragCooldown  [━●───────]  0.40 s       │
+    │  AngleCap      [━━━━━●───]  50 °         │
+    │  RemoteName    [ DamageRemote          ] │
+    ├──────────────────────────────────────────┤
+    │  ● Enabled    ○ Visualizer              │
+    ├──────────────────────────────────────────┤
+    │  Kills: 0   AvgDist: —   Last: —        │  ← live stats strip
+    └──────────────────────────────────────────┘
+
+    Every slider writes directly to CFG and the heartbeat loop reads
+    CFG on the next frame — no intermediate state.
+
+    The RemoteName field is a TextBox; committing (Enter/FocusLost) updates
+    CFG.RemoteName and clears the cached remote so FindRemote runs again.
+--]]
+
+local ScreenGui = nil
+
+-- ── UI constants ────────────────────────────────────────────
+local UI = {
+    W            = 320,
+    H            = 310,
+    TitleH       = 32,
+    RowH         = 34,
+    Pad          = 12,
+    SliderW      = 170,
+    SliderH      = 8,
+    KnobSz       = 16,
+    Font         = Enum.Font.GothamBold,
+    FontBody     = Enum.Font.Gotham,
+    TextSz       = 13,
+    TitleSz      = 14,
+    BG           = Color3.fromRGB(15,  15,  20 ),
+    PANEL        = Color3.fromRGB(22,  22,  30 ),
+    ACCENT       = Color3.fromRGB(0,   200, 120),
+    ACCENT2      = Color3.fromRGB(255, 60,  100),
+    TEXT         = Color3.fromRGB(220, 220, 230),
+    MUTED        = Color3.fromRGB(110, 110, 130),
+    BORDER       = Color3.fromRGB(40,  40,  55 ),
+}
+
+-- ── Helper: make a Frame ─────────────────────────────────────
+local function MkFrame(parent, size, pos, color, zindex)
+    local f         = Instance.new("Frame")
+    f.Size          = size
+    f.Position      = pos
+    f.BackgroundColor3 = color or UI.PANEL
+    f.BorderSizePixel  = 0
+    f.ZIndex        = zindex or 1
+    f.Parent        = parent
+    return f
+end
+
+-- ── Helper: make a Label ────────────────────────────────────
+local function MkLabel(parent, text, size, pos, font, tsz, color, zindex, xalign)
+    local l         = Instance.new("TextLabel")
+    l.Size          = size
+    l.Position      = pos
+    l.Text          = text
+    l.Font          = font or UI.FontBody
+    l.TextSize      = tsz or UI.TextSz
+    l.TextColor3    = color or UI.TEXT
+    l.BackgroundTransparency = 1
+    l.ZIndex        = zindex or 2
+    l.TextXAlignment = xalign or Enum.TextXAlignment.Left
+    l.Parent        = parent
+    return l
+end
+
+-- ── Helper: make a rounded corner UICorner ──────────────────
+local function MkCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, radius or 6)
+    c.Parent = parent
+end
+
+-- ── Helper: make a UIStroke ─────────────────────────────────
+local function MkStroke(parent, color, thickness)
+    local s = Instance.new("UIStroke")
+    s.Color = color or UI.BORDER
+    s.Thickness = thickness or 1
+    s.Parent = parent
+end
+
+-- ── Slider builder ──────────────────────────────────────────
+--[[
+    Creates a labeled slider row.
+    Parameters:
+        parent    : Frame to attach to
+        yOffset   : UDim2 Y position of the row
+        label     : display name
+        min/max   : value range
+        default   : initial value
+        fmt       : function(value) → string suffix  e.g. " studs"
+        onChange  : function(value) called on every drag step
+    Returns:
+        { SetValue = fn, GetValue = fn, Label = TextLabel }
+--]]
+local function MkSlider(parent, yOffset, label, min, max, default, fmt, onChange)
+    local ROW_H = UI.RowH
+    local PAD   = UI.Pad
+
+    -- Row container
+    local row = MkFrame(parent,
+        UDim2.new(1, 0, 0, ROW_H),
+        UDim2.new(0, 0, 0, yOffset),
+        Color3.fromRGB(0,0,0), 2)
+    row.BackgroundTransparency = 1
+
+    -- Left label
+    MkLabel(row, label,
+        UDim2.new(0, 95, 1, 0),
+        UDim2.new(0, PAD, 0, 0),
+        UI.FontBody, UI.TextSz, UI.MUTED, 3)
+
+    -- Track background
+    local trackBG = MkFrame(row,
+        UDim2.new(0, UI.SliderW, 0, UI.SliderH),
+        UDim2.new(0, 108, 0.5, -UI.SliderH/2),
+        Color3.fromRGB(40, 40, 55), 3)
+    MkCorner(trackBG, 4)
+
+    -- Track fill (accent color, grows left → right)
+    local trackFill = MkFrame(trackBG,
+        UDim2.new(0, 0, 1, 0),
+        UDim2.new(0, 0, 0, 0),
+        UI.ACCENT, 4)
+    MkCorner(trackFill, 4)
+
+    -- Knob
+    local KS = UI.KnobSz
+    local knob = MkFrame(trackBG,
+        UDim2.new(0, KS, 0, KS),
+        UDim2.new(0, -KS/2, 0.5, -KS/2),
+        Color3.fromRGB(255, 255, 255), 5)
+    MkCorner(knob, KS)
+    MkStroke(knob, UI.ACCENT, 2)
+
+    -- Value label (right of slider)
+    local valLabel = MkLabel(row,
+        fmt(default),
+        UDim2.new(0, 60, 1, 0),
+        UDim2.new(0, 108 + UI.SliderW + 6, 0, 0),
+        UI.Font, UI.TextSz, UI.ACCENT, 3)
+
+    -- ── State ──────────────────────────────────────────────
+    local current = default
+    local dragging = false
+
+    local function SetValue(val)
+        val     = math.clamp(val, min, max)
+        -- round to 2 dp for floats, integer for ints
+        if math.floor(min) == min and math.floor(max) == max and math.floor(default) == default then
+            val = math.round(val)
+        else
+            val = math.floor(val * 100 + 0.5) / 100
+        end
+        current = val
+
+        local alpha = (val - min) / (max - min)
+        trackFill.Size     = UDim2.new(alpha, 0, 1, 0)
+        knob.Position      = UDim2.new(alpha, -KS/2, 0.5, -KS/2)
+        valLabel.Text      = fmt(val)
+
+        if onChange then onChange(val) end
+    end
+
+    local function GetValue() return current end
+
+    -- Initialize position
+    SetValue(default)
+
+    -- ── Drag logic ─────────────────────────────────────────
+    knob.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+        end
+    end)
+
+    UIS.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(inp)
+        if not dragging then return end
+        if inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local absPos  = trackBG.AbsolutePosition
+        local absSize = trackBG.AbsoluteSize
+        local relX    = math.clamp(inp.Position.X - absPos.X, 0, absSize.X)
+        local alpha   = relX / absSize.X
+        SetValue(min + alpha * (max - min))
+    end)
+
+    -- Also allow clicking anywhere on the track
+    trackBG.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            local absPos  = trackBG.AbsolutePosition
+            local absSize = trackBG.AbsoluteSize
+            local relX    = math.clamp(inp.Position.X - absPos.X, 0, absSize.X)
+            SetValue(min + (relX / absSize.X) * (max - min))
+        end
+    end)
+
+    return { SetValue = SetValue, GetValue = GetValue, Label = valLabel }
+end
+
+-- ── Toggle button builder ────────────────────────────────────
+local function MkToggle(parent, xOffset, yOffset, label, default, onChange)
+    local BTN_W, BTN_H = 46, 22
+
+    local container = MkFrame(parent,
+        UDim2.new(0, BTN_W + 8 + 70, 0, BTN_H + 4),
+        UDim2.new(0, xOffset, 0, yOffset),
+        Color3.fromRGB(0,0,0), 2)
+    container.BackgroundTransparency = 1
+
+    -- Pill track
+    local track = MkFrame(container,
+        UDim2.new(0, BTN_W, 0, BTN_H),
+        UDim2.new(0, 0, 0, 2),
+        Color3.fromRGB(50, 50, 65), 3)
+    MkCorner(track, BTN_H)
+    MkStroke(track, UI.BORDER, 1)
+
+    -- Knob
+    local KS = BTN_H - 6
+    local knob = MkFrame(track,
+        UDim2.new(0, KS, 0, KS),
+        UDim2.new(0, 3, 0.5, -KS/2),
+        Color3.fromRGB(180, 180, 200), 4)
+    MkCorner(knob, KS)
+
+    -- Label
+    MkLabel(container, label,
+        UDim2.new(0, 70, 1, 0),
+        UDim2.new(0, BTN_W + 8, 0, 0),
+        UI.FontBody, UI.TextSz, UI.TEXT, 3)
+
+    -- ── State ──────────────────────────────────────────────
+    local enabled = default
+
+    local tweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
+
+    local function SetState(state)
+        enabled = state
+        local targetX  = state and (BTN_W - KS - 3) or 3
+        local trackCol = state and UI.ACCENT or Color3.fromRGB(50, 50, 65)
+        local knobCol  = state and Color3.fromRGB(255,255,255) or Color3.fromRGB(180,180,200)
+
+        TweenService:Create(knob, tweenInfo,
+            { Position = UDim2.new(0, targetX, 0.5, -KS/2),
+              BackgroundColor3 = knobCol }):Play()
+        TweenService:Create(track, tweenInfo,
+            { BackgroundColor3 = trackCol }):Play()
+
+        if onChange then onChange(state) end
+    end
+
+    SetState(default)
+
+    track.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            SetState(not enabled)
+        end
+    end)
+
+    return { SetState = SetState, GetState = function() return enabled end }
+end
+
+-- ── Stats strip updater (returns a function to refresh labels) ─
+local function MkStatsStrip(parent, yOffset)
+    local strip = MkFrame(parent,
+        UDim2.new(1, 0, 0, 28),
+        UDim2.new(0, 0, 0, yOffset),
+        Color3.fromRGB(10, 10, 15), 2)
+    MkStroke(strip, UI.BORDER, 1)
+
+    local killLbl = MkLabel(strip, "Kills: 0",
+        UDim2.new(0, 80, 1, 0),
+        UDim2.new(0, UI.Pad, 0, 0),
+        UI.Font, 12, UI.ACCENT, 3)
+
+    local distLbl = MkLabel(strip, "AvgDist: —",
+        UDim2.new(0, 90, 1, 0),
+        UDim2.new(0, 95, 0, 0),
+        UI.Font, 12, UI.TEXT, 3)
+
+    local lastLbl = MkLabel(strip, "Last: —",
+        UDim2.new(0, 110, 1, 0),
+        UDim2.new(0, 195, 0, 0),
+        UI.Font, 12, UI.MUTED, 3)
+
+    return function()
+        killLbl.Text = "Kills: " .. Stats.Kills
+        local avg = Stats.Kills > 0
+            and string.format("%.1f", Stats.TotalDist / Stats.Kills)
+            or "—"
+        distLbl.Text = "AvgDist: " .. avg
+        lastLbl.Text = "Last: " .. Stats.LastVictim
+    end
+end
+
+-- ── BUILD FULL GUI ───────────────────────────────────────────
+local sliders  = {}   -- keyed by config field name
+local toggles  = {}
+local refreshStats = nil
+local guiVisible   = true
+
+local function BuildGUI()
+    if ScreenGui then ScreenGui:Destroy() end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name                    = "_NCBConfig"
+    sg.ResetOnSpawn            = false
+    sg.ZIndexBehavior          = Enum.ZIndexBehavior.Global
+    sg.DisplayOrder            = 999
+    sg.IgnoreGuiInset          = true
+    sg.Parent                  = game:GetService("CoreGui")
+    ScreenGui = sg
+
+    -- ── Main window ──────────────────────────────────────────
+    local win = MkFrame(sg,
+        UDim2.new(0, UI.W, 0, UI.H),
+        UDim2.new(0, 60, 0, 120),
+        UI.BG, 1)
+    MkCorner(win, 8)
+    MkStroke(win, UI.BORDER, 1)
+
+    -- Shadow
+    local shadow = MkFrame(sg,
+        UDim2.new(0, UI.W + 16, 0, UI.H + 16),
+        UDim2.new(0, 60 - 8, 0, 120 - 8),
+        Color3.fromRGB(0,0,0), 0)
+    shadow.BackgroundTransparency = 0.6
+    MkCorner(shadow, 12)
+
+    -- ── Title bar ────────────────────────────────────────────
+    local titleBar = MkFrame(win,
+        UDim2.new(1, 0, 0, UI.TitleH),
+        UDim2.new(0, 0, 0, 0),
+        Color3.fromRGB(20, 20, 28), 2)
+    MkCorner(titleBar, 8)
+
+    -- Bottom square fill for titleBar (to hide bottom-radius)
+    MkFrame(titleBar,
+        UDim2.new(1, 0, 0, 8),
+        UDim2.new(0, 0, 1, -8),
+        Color3.fromRGB(20, 20, 28), 2)
+
+    -- Accent left bar
+    local accentBar = MkFrame(titleBar,
+        UDim2.new(0, 3, 0, 18),
+        UDim2.new(0, UI.Pad, 0.5, -9),
+        UI.ACCENT, 3)
+    MkCorner(accentBar, 2)
+
+    MkLabel(titleBar, "NoCBring Config",
+        UDim2.new(0, 180, 1, 0),
+        UDim2.new(0, UI.Pad + 10, 0, 0),
+        UI.Font, UI.TitleSz, UI.TEXT, 3)
+
+    -- Close button
+    local closeBtn = MkFrame(titleBar,
+        UDim2.new(0, 24, 0, 24),
+        UDim2.new(1, -32, 0.5, -12),
+        Color3.fromRGB(60, 20, 30), 3)
+    MkCorner(closeBtn, 4)
+    MkLabel(closeBtn, "×", UDim2.new(1,0,1,0), UDim2.new(0,0,0,0),
+        UI.Font, 16, UI.ACCENT2, 4, Enum.TextXAlignment.Center)
+
+    closeBtn.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            win.Visible = false
+            shadow.Visible = false
+            guiVisible = false
+        end
+    end)
+
+    -- ── Drag logic for window ────────────────────────────────
+    local draggingWin = false
+    local dragStart, winStart
+
+    titleBar.InputBegan:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingWin = true
+            dragStart   = inp.Position
+            winStart    = win.Position
+        end
+    end)
+    UIS.InputEnded:Connect(function(inp)
+        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
+            draggingWin = false
+        end
+    end)
+    UIS.InputChanged:Connect(function(inp)
+        if draggingWin and inp.UserInputType == Enum.UserInputType.MouseMovement then
+            local delta = inp.Position - dragStart
+            win.Position    = UDim2.new(
+                winStart.X.Scale, winStart.X.Offset + delta.X,
+                winStart.Y.Scale, winStart.Y.Offset + delta.Y)
+            shadow.Position = UDim2.new(
+                winStart.X.Scale, winStart.X.Offset + delta.X - 8,
+                winStart.Y.Scale, winStart.Y.Offset + delta.Y - 8)
+        end
+    end)
+
+    -- ── Content area ─────────────────────────────────────────
+    local content = MkFrame(win,
+        UDim2.new(1, 0, 1, -UI.TitleH),
+        UDim2.new(0, 0, 0, UI.TitleH),
+        UI.BG, 2)
+
+    local y = 4  -- running Y offset inside content
+
+    -- ── Sliders section header ───────────────────────────────
+    MkLabel(content, "REACH & TIMING",
+        UDim2.new(1, -UI.Pad*2, 0, 16),
+        UDim2.new(0, UI.Pad, 0, y),
+        UI.Font, 10, UI.MUTED, 3)
+    y = y + 18
+
+    -- Divider
+    MkFrame(content,
+        UDim2.new(1, -UI.Pad*2, 0, 1),
+        UDim2.new(0, UI.Pad, 0, y),
+        UI.BORDER, 3)
+    y = y + 6
+
+    -- SIZE slider  (5 – 30 studs)
+    sliders.Size = MkSlider(content, y, "Size",
+        5, 30, CFG.Size,
+        function(v) return string.format("%.0f st", v) end,
+        function(v)
+            CFG.Size = v
+            -- Live-update visualizer sphere size
+            if VisPart then
+                local s = v * 2
+                VisPart.Size = Vector3.new(s, s, s)
+            end
+        end)
+    y = y + UI.RowH
+
+    -- LERP FRAMES slider  (2 – 12 frames)
+    sliders.LerpFrames = MkSlider(content, y, "LerpFrames",
+        2, 12, CFG.LerpFrames,
+        function(v) return string.format("%.0f fr", v) end,
+        function(v) CFG.LerpFrames = math.round(v) end)
+    y = y + UI.RowH
+
+    -- DRAG COOLDOWN slider  (0.10 – 1.50 s)
+    sliders.DragCooldown = MkSlider(content, y, "Cooldown",
+        0.10, 1.50, CFG.DragCooldown,
+        function(v) return string.format("%.2f s", v) end,
+        function(v) CFG.DragCooldown = v end)
+    y = y + UI.RowH
+
+    -- ANGLE CAP slider  (15 – 90 °)
+    sliders.AngleCap = MkSlider(content, y, "AngleCap",
+        15, 90, CFG.AngleCap,
+        function(v) return string.format("%.0f °", v) end,
+        function(v) CFG.AngleCap = v end)
+    y = y + UI.RowH + 4
+
+    -- ── Remote name textbox ──────────────────────────────────
+    MkLabel(content, "RemoteName",
+        UDim2.new(0, 95, 0, 20),
+        UDim2.new(0, UI.Pad, 0, y),
+        UI.FontBody, UI.TextSz, UI.MUTED, 3)
+
+    local remoteBG = MkFrame(content,
+        UDim2.new(0, UI.W - 116, 0, 22),
+        UDim2.new(0, 108, 0, y + 1),
+        Color3.fromRGB(30, 30, 42), 3)
+    MkCorner(remoteBG, 4)
+    MkStroke(remoteBG, UI.BORDER, 1)
+
+    local remoteBox              = Instance.new("TextBox")
+    remoteBox.Size               = UDim2.new(1, -8, 1, 0)
+    remoteBox.Position           = UDim2.new(0, 4, 0, 0)
+    remoteBox.Text               = CFG.RemoteName
+    remoteBox.Font               = UI.FontBody
+    remoteBox.TextSize           = UI.TextSz
+    remoteBox.TextColor3         = UI.TEXT
+    remoteBox.BackgroundTransparency = 1
+    remoteBox.BorderSizePixel    = 0
+    remoteBox.ZIndex             = 4
+    remoteBox.PlaceholderText    = "e.g. DamageRemote"
+    remoteBox.PlaceholderColor3  = UI.MUTED
+    remoteBox.ClearTextOnFocus   = false
+    remoteBox.Parent             = remoteBG
+
+    remoteBox.FocusLost:Connect(function()
+        if remoteBox.Text ~= "" then
+            CFG.RemoteName  = remoteBox.Text
+            currentRemote   = nil   -- force re-search
+            Notify("Remote: " .. CFG.RemoteName)
+        end
+    end)
+
+    y = y + 30
+
+    -- ── Toggle row ───────────────────────────────────────────
+    MkFrame(content,
+        UDim2.new(1, -UI.Pad*2, 0, 1),
+        UDim2.new(0, UI.Pad, 0, y),
+        UI.BORDER, 3)
+    y = y + 6
+
+    toggles.Enabled = MkToggle(content, UI.Pad, y, "Enabled",
+        CFG.Enabled, function(v) CFG.Enabled = v end)
+
+    toggles.Visualizer = MkToggle(content, UI.W/2, y, "Visualizer",
+        CFG.VisualizerEnabled, function(v)
+            CFG.VisualizerEnabled = v
+            if not v then DestroyVisualizer() end
+        end)
+
+    y = y + 30
+
+    -- ── Stats strip ──────────────────────────────────────────
+    MkFrame(content,
+        UDim2.new(1, -UI.Pad*2, 0, 1),
+        UDim2.new(0, UI.Pad, 0, y),
+        UI.BORDER, 3)
+    y = y + 4
+
+    refreshStats = MkStatsStrip(content, y)
+end
+
+BuildGUI()
+
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 3 — CORE DRAG ROUTINE
+-- ═══════════════════════════════════════════════════════════════
 local function DragAndFire(victim, attackerRoot, remote)
     local uid  = victim.UserId
     local char = victim.Character
@@ -273,116 +779,64 @@ local function DragAndFire(victim, attackerRoot, remote)
     local humanoid = char:FindFirstChild("Humanoid")
     if not torso or not humanoid or humanoid.Health <= 0 then return end
 
-    -- Cooldown: prevent rapid-fire RemoteEvents that the AC rate-limiter
-    -- would catch immediately.
     if ActiveDrags[uid] then return end
     if tick() - (LastDrag[uid] or 0) < CFG.DragCooldown then return end
-
-    --[[
-        Critical pre-flight check:
-        We validate the angle using REAL positions (server's view).
-        If the victim is already behind us in real space, firing the
-        RemoteEvent would produce an anomalous kill angle on the server.
-        We skip the drag in that case — the AC's angle model never sees
-        an anomalous sample.
-    --]]
     if not IsInFrontArc(attackerRoot, torso) then return end
+
+    -- Record distance BEFORE drag (real server-side distance)
+    local realDist = (attackerRoot.Position - torso.Position).Magnitude
 
     ActiveDrags[uid] = true
     LastDrag[uid]    = tick()
+    Stats.ActiveDrags = Stats.ActiveDrags + 1
 
     coroutine.wrap(function()
-        -- Destination: just inside our hit radius, slightly to the left
-        -- and in front of the attacker.  This produces a kill distance of
-        -- roughly 3–4 studs from the attacker's root when measured SERVER-
-        -- SIDE — because the server sees the victim at their REAL position,
-        -- which is not where we dragged them locally.
-        --
-        -- Wait — if the victim is, say, 30 studs away in real space,
-        -- and the server sees them at 30 studs, won't the AC's distance
-        -- check catch us?
-        --
-        -- YES.  This is the fundamental tension.  See CFG.Size:
-        -- We only drag victims who are within CFG.Size studs in LOCAL space,
-        -- which initially equals their REAL position (before any drag).
-        -- The first scan runs before the drag, so a victim 30 studs away
-        -- is never dragged — they were too far to begin with.
-        -- We're expanding the LOCAL effective range by only ~3–5 studs
-        -- beyond what the tool's real hitbox would allow.
         local destination = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
 
-        -- ── Suppress signals on victim's Torso (local only) ───────────
+        -- Suppress signals (same-frame, no yield)
         SuppressSignal(torso.Changed)
         SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        -- ── Spoof velocity ─────────────────────────────────────────────
+        -- Velocity spoof
         local lerpPath   = destination.Position - torso.Position
         local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 55)
         torso.AssemblyLinearVelocity = lerpPath.Unit * spoofSpeed
 
-        -- ── Lerp (client-local only) ───────────────────────────────────
+        -- EaseInQuad lerp over CFG.LerpFrames frames
         local origin = torso.CFrame
         for i = 1, CFG.LerpFrames do
-            local alpha      = i / CFG.LerpFrames
-            local easedAlpha = alpha * alpha   -- EaseInQuad
-            torso.CFrame     = origin:Lerp(destination, easedAlpha)
+            local alpha = (i / CFG.LerpFrames) ^ 2
+            torso.CFrame = origin:Lerp(destination, alpha)
             RunService.Heartbeat:Wait()
         end
 
-        -- ── Restore signals ────────────────────────────────────────────
+        -- Restore signals
         RestoreSignal(torso.Changed)
         RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        --[[
-            Fire the RemoteEvent.
-            This is the ONLY action the server ever sees.
-            The drag existed only on our screen.
-
-            The RemoteEvent signature depends on the game.
-            Common patterns:
-                remote:FireServer(victim)                 -- target only
-                remote:FireServer(victim, damage)         -- target + damage
-                remote:FireServer(victim, tool)           -- target + tool ref
-
-            We pass `victim` as the first argument (the player object,
-            not the character) because most games resolve the character
-            from the player reference server-side.
-        --]]
+        -- Fire damage event
         if remote then
-            pcall(function()
-                remote:FireServer(victim)
-            end)
+            pcall(function() remote:FireServer(victim) end)
         end
 
-        ActiveDrags[uid] = nil
+        -- Update session stats
+        Stats.Kills       = Stats.Kills + 1
+        Stats.TotalDist   = Stats.TotalDist + realDist
+        Stats.LastVictim  = victim.Name
+
+        Stats.ActiveDrags = math.max(0, Stats.ActiveDrags - 1)
+        ActiveDrags[uid]  = nil
     end)()
 end
 
--- ─────────────────────────────────────────────────────────────
--- HEARTBEAT SCAN
---
--- Every frame while a tool is equipped and mouse is held:
---   1. Find all players within CFG.Size studs of our Handle.
---      This is measured using REAL positions — same positions
---      the server has.  So CFG.Size here is an extended melee
---      range, not a teleportation range.
---   2. For each in-range victim, initiate a drag.
---
--- The scan uses Handle.Position (real) as the origin, not our
--- predicted post-drag position.  This is intentional:
---   • The server validates distance from attacker to victim
---     using the positions IT knows.
---   • The server's attacker position ≈ our real position.
---   • If we only scan victims who are within CFG.Size of our
---     real Handle, the server's distance check will be close
---     to CFG.Size, not some wildly different number.
---   • We're not teleporting across the map — we're extending
---     our melee range by a few studs.
--- ─────────────────────────────────────────────────────────────
-local currentRemote = nil   -- cached per-tool reference
-
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 4 — HEARTBEAT (scan + visualizer update)
+-- ═══════════════════════════════════════════════════════════════
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
-    if not CFG.Enabled or CFG.ScriptKilled then return end
+    -- Refresh stats strip every frame (cheap label writes)
+    if refreshStats then refreshStats() end
+
+    if CFG.ScriptKilled then return end
 
     local char = LocalPlayer.Character
     if not char then return end
@@ -390,21 +844,27 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     local tool     = char:FindFirstChildOfClass("Tool")
     local humanoid = char:FindFirstChild("Humanoid")
     local root     = char:FindFirstChild("HumanoidRootPart")
+
     if not tool or not humanoid or not root then
         currentRemote = nil
+        DestroyVisualizer()
         return
     end
 
     local handle = tool:FindFirstChild("Handle")
-    if not handle then return end
+    if not handle then
+        DestroyVisualizer()
+        return
+    end
 
-    -- Cache the remote so we don't search every frame
+    -- Cache remote reference
     if not currentRemote then
         currentRemote = FindRemote(tool)
     end
 
-    -- Only scan on mouse-down frames
-    if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
+    -- ── Count targets in range (for visualizer color) ───────
+    local targetsInRange = 0
+    local mouseDown = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
 
     for _, player in ipairs(Players:GetPlayers()) do
         if player == LocalPlayer then continue end
@@ -413,16 +873,56 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
         local pTorso = pchar:FindFirstChild("Torso")
         if not pTorso then continue end
 
-        -- Distance check uses REAL positions — same as what the server sees
         local dist = (handle.Position - pTorso.Position).Magnitude
         if dist <= CFG.Size then
-            DragAndFire(player, root, currentRemote)
+            targetsInRange = targetsInRange + 1
+            -- Only drag on mouse-down
+            if CFG.Enabled and mouseDown then
+                DragAndFire(player, root, currentRemote)
+            end
         end
+    end
+
+    -- ── Update visualizer ────────────────────────────────────
+    UpdateVisualizer(handle, targetsInRange, Stats.ActiveDrags)
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 5 — KEYBINDS
+-- ═══════════════════════════════════════════════════════════════
+Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+
+    if input.KeyCode == CFG.Keybinds.Toggle then
+        CFG.Enabled = not CFG.Enabled
+        if toggles.Enabled then toggles.Enabled.SetState(CFG.Enabled) end
+        Notify("Enabled: " .. tostring(CFG.Enabled))
+
+    elseif input.KeyCode == CFG.Keybinds.ToggleVis then
+        CFG.VisualizerEnabled = not CFG.VisualizerEnabled
+        if toggles.Visualizer then toggles.Visualizer.SetState(CFG.VisualizerEnabled) end
+        if not CFG.VisualizerEnabled then DestroyVisualizer() end
+        Notify("Visualizer: " .. tostring(CFG.VisualizerEnabled))
+
+    elseif input.KeyCode == CFG.Keybinds.ToggleUI then
+        guiVisible = not guiVisible
+        if ScreenGui then
+            for _, obj in ipairs(ScreenGui:GetChildren()) do
+                obj.Visible = guiVisible
+            end
+        end
+
+    elseif input.KeyCode == CFG.Keybinds.KillScript then
+        CFG.ScriptKilled = true
+        DestroyVisualizer()
+        if ScreenGui then ScreenGui:Destroy() end
+        for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
+        Notify("Script killed.")
     end
 end)
 
 -- ─────────────────────────────────────────────────────────────
--- TOOL CHANGE LISTENER — clear remote cache on tool swap
+-- CHARACTER WIRING (clear remote cache on tool swap)
 -- ─────────────────────────────────────────────────────────────
 local function OnCharacter(char)
     char.ChildAdded:Connect(function(child)
@@ -436,39 +936,29 @@ end
 if LocalPlayer.Character then OnCharacter(LocalPlayer.Character) end
 LocalPlayer.CharacterAdded:Connect(OnCharacter)
 
--- ─────────────────────────────────────────────────────────────
--- KEYBINDS
--- ─────────────────────────────────────────────────────────────
-Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-    if input.KeyCode == CFG.Keybinds.Toggle then
-        CFG.Enabled = not CFG.Enabled
-        Notify("Enabled: " .. tostring(CFG.Enabled))
-    elseif input.KeyCode == CFG.Keybinds.KillScript then
-        CFG.ScriptKilled = true
-        for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
-        Notify("Killed.")
-    end
-end)
-
-Notify("NoCBring loaded. Size=" .. CFG.Size)
+Notify("NoCBring v2 loaded. Size=" .. CFG.Size .. "  [C] toggle UI")
 
 --[[
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WHAT THE SERVER SEES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- For a victim who is CFG.Size (9–14) studs away in real space:
-   • Attacker position  : real, server-side accurate
-   • Victim position    : real (server owns it, drag was local-only)
-   • Kill distance      : 9–14 studs (the real, un-dragged distance)
-   • Kill angle         : real angle (we enforce AngleCap pre-drag)
-   • RemoteEvent timing : spaced by DragCooldown (0.40 s)
-   • No BreakJoints     : no joint anomaly event
-   • No position delta  : server never saw victim move
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ KEYBIND REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ Z  — Toggle drag on/off
+ X  — Toggle reach visualizer sphere
+ C  — Show / hide config window
+ P  — Kill script entirely
 
- The only detectable signal is:
-   1. Kill distances slightly elevated vs true melee range
-   2. RemoteEvent fires at a consistent rate just under the burst limit
-   3. Kills register at the edge of "plausible" range, consistently
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ CONFIG PANEL CONTROLS
+   Size slider       — live reach radius (also resizes the sphere)
+   LerpFrames        — drag smoothness / duration
+   Cooldown          — minimum gap between damage events
+   AngleCap          — forward cone width (lower = more restricted)
+   RemoteName field  — type + Enter to change target remote
+   Enabled toggle    — mirrors Z keybind
+   Visualizer toggle — mirrors X keybind
+
+ STATS STRIP (bottom of panel)
+   Kills     — total registered kills this session
+   AvgDist   — mean real attacker→victim distance at time of kill
+   Last      — most recent victim's username
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
