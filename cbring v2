@@ -1,103 +1,53 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  NO-BREAKJOINTS CBRING v7 — ALWAYS-ON MODE + ARC-ONLY VISUALIZER          ║
+║  NO-BREAKJOINTS CBRING v8 — TARGET TEAM + PLAYER FILTERS                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
- New in v7:
-   AlwaysOn  — toggle in the INPUTS section.  When on, drag fires every
-               Heartbeat without any button held.  IsTriggerActive()
-               short-circuits to `true` before any UIS poll — zero cost
-               on the normal code path.  The Trigger chip and REBIND
-               button are dimmed in the UI to signal they are bypassed.
-               Switching back to AlwaysOn=false restores normal trigger
-               behaviour and un-dims the row.
+ New in v8:
+   TargetTeam      — Restricts the hit scan to ONLY target players on a
+                     chosen team.  Configured via a live autocomplete input
+                     in the FILTERS panel.  Clicking the field opens a
+                     dropdown populated from Teams:GetTeams(); typing
+                     narrows the list in real-time.  Clicking a row or
+                     pressing Enter commits the selection and closes the
+                     dropdown.  Clearing the field (or choosing "All Teams")
+                     resets to nil — all teams are valid targets again.
 
-   Sphere removed — the SelectionSphere visualizer (Section 1, v6) has
-               been deleted.  The arc cone already encodes both the reach
-               radius (line length) and the angle cap (sweep), making the
-               sphere purely redundant.  Removes: VisPart, VisSphere,
-               BuildSphereVis, DestroySphereVis, UpdateSphereVis,
-               lastSphereSize, lastSphereColor, and ~50 call-sites.
+   IgnoreDead      — Toggle (default true).  Skips any player whose cached
+                     Humanoid.Health ≤ 0 or whose state is Dead during the
+                     Heartbeat scan.  Dead bodies no longer count as targets
+                     or whitelist hits.  The DragAndFire guard is kept as a
+                     secondary safety net.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- BUGS INHERITED FROM v5 — FIXED IN v6
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   IgnoreInvisible — Toggle (default true).  Skips players whose cached
+                     torso Part has Transparency ≥ 1 (fully invisible).
+                     Uses the already-cached Part reference — zero extra
+                     instance lookups.
 
- V5-1  RESTORESIGNAL NOT GUARANTEED ON DRAG ERROR
-        DragAndFire wrapped the ENTIRE coroutine body in a single
-        pcall, including the lerp loop and both RestoreSignal calls.
-        If an error occurred after SuppressSignal but before
-        RestoreSignal (e.g. torso destroyed mid-lerp), the victim's
-        Changed and CFrame signals stayed suppressed indefinitely.
-        Fix: "finally" pattern — suppress into a local `suppressed`
-        flag, then call cleanup() unconditionally after pcall returns,
-        inside task.spawn so it works across yields correctly.
+   MaxTargetHealth — Slider 0–500 (default 100).  Skips players whose
+                     Humanoid.Health exceeds this threshold.  Set to 0
+                     to disable the cap entirely (any health is valid).
 
- V5-2  PLAYER.TEAM READ PER-PLAYER PER-FRAME
-        IsTeammate cached cachedLocalTeam (our own team) but still
-        called `player.Team` (a Roblox property access) for each
-        enemy in range every Heartbeat.  On a 15-player server that
-        is 14 property reads per tick at ~60 ticks/s = ~840 reads/s.
-        Fix: per-player team cache.  WirePlayerTeam() connects a
-        signal on each enemy player that updates PlayerTeamCache[uid].
-        IsTeammate reads PlayerTeamCache — zero property reads.
-        Connections stored in PlayerTeamConns[uid], disconnected on
-        PlayerRemoving.
+   HumanoidCache   — [userId] = Humanoid, mirrors the TorsoCache pattern
+                     introduced in v5-8.  Eliminates FindFirstChildOfClass
+                     from the Heartbeat hot path.
 
- V5-3  ptX/ptY/ptZ TABLE ALLOCATED EVERY HEARTBEAT
-        UpdateArcVis declared `local ptX,ptY,ptZ = {},{},{}` each
-        call.  3 table allocations + 45 field writes per frame just
-        to hold intermediate arc point coordinates.
-        Fix: module-level pre-allocated flat arrays arcPtX/Y/Z of
-        size ARC_SEGS+1.  Reused by index assignment every frame —
-        zero allocations.
-
- V5-4  lp.Unit CALLED ON POTENTIALLY ZERO VECTOR
-        Velocity spoof: `lp.Unit * math.clamp(...)`.  If destination
-        == torso.Position (both already at the same point), lp is
-        Vector3.zero and lp.Unit = (nan, nan, nan), poisoning
-        AssemblyLinearVelocity.
-        Fix: `if lp.Magnitude > 0.01 then ... end` guard.
-
- V5-5  DUPLICATE Team SIGNAL BINDING IN BuildGUI
-        Both the module-level init block (line 1053) and the GUI's
-        live team chip handler called `cachedLocalTeam = LocalPlayer.Team`.
-        Two simultaneous signal firings wrote the same property twice.
-        The GUI handler read LocalPlayer.Team directly instead of the
-        already-updated cachedLocalTeam, creating a redundant property
-        access and a potential ordering dependency.
-        Fix: GUI handler only updates the label, reading cachedLocalTeam
-        which the module-level handler already wrote.
-
- V5-6  coroutine.wrap FOR ASYNC DRAG
-        coroutine.wrap errors after a RunService.Heartbeat:Wait() yield
-        become "dead coroutine" silent failures — not caught by any
-        outer pcall.  Roblox's task scheduler cannot report them.
-        Fix: task.spawn, which routes post-yield errors to the task
-        scheduler's error handler (visible in the output window).
-
- V5-7  TWO TABLE ALLOCATIONS PER HEARTBEAT IN WL TRACKING
-        `wlNow = {}` (line 947) and `WLInRangePrev = wlNow` (line 977)
-        created one new table per frame and discarded the old one, plus
-        the boolean value per WL player.  At 60 fps that is 60 GC-eligible
-        tables per second, each with up to N boolean fields.
-        Fix: monotonic wlFrameId counter (integer).  WLInRangePrev stores
-        the frameId when the player was last seen in range.  Entry comparison
-        (`WLInRangePrev[uid] ~= wlFrameId-1`) detects the 0→1 transition
-        without any table allocation.  Zero allocations in the hot path.
-
- V5-8  PlayerCache STORES PLAYER OBJECTS (3 FindFirstChild/frame)
-        GetTorso(pc) calls FindFirstChild up to 3 times per player per
-        Heartbeat.  Character structure is stable between respawns.
-        Fix: TorsoCache[uid] updated on CharacterAdded and cleared on
-        CharacterRemoving.  GetTorso() becomes a single table lookup.
-        Stale entries cleared when the player leaves.
+   WireCharacter   — Replaces WireCharacterTorso.  Populates both
+                     TorsoCache and HumanoidCache on CharacterAdded and
+                     handles the 0.5 s retry for slow-loading rigs.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- TEAM AWARENESS (IgnoreTeam toggle, GUI chip shows live team name)
- WHITELIST     (GitHub raw URL, # comments, 3-retry back-off,
-                concurrent-fetch guard, per-encounter hit counter,
-                REFRESH button, blue sphere state)
+ INHERITED FIXES FROM v5 – v7  (full details in original header)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  V5-1  Finally-pattern for signal restore in DragAndFire
+  V5-2  Per-player team cache — zero Team property reads
+  V5-3  Pre-allocated arc point buffers — zero Heartbeat allocs
+  V5-4  Zero-vector guard on velocity spoof
+  V5-5  Deduplicated Team signal binding
+  V5-6  task.spawn instead of coroutine.wrap
+  V5-7  Monotonic frame-ID for WL range tracking
+  V5-8  TorsoCache — single table lookup per player per frame
+  V7    AlwaysOn mode; SelectionSphere removed
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  WHITELIST FORMAT  (raw.githubusercontent.com recommended)
    # This is a comment — line is ignored
@@ -106,8 +56,8 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
-if getgenv()._NOCBRING_V7_LOADED then return end
-getgenv()._NOCBRING_V7_LOADED = true
+if getgenv()._NOCBRING_V8_LOADED then return end
+getgenv()._NOCBRING_V8_LOADED = true
 
 -- ─────────────────────────────────────────────────────────────
 -- SERVICES
@@ -118,24 +68,35 @@ local UIS               = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
 local StarterGui        = game:GetService("StarterGui")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Teams             = game:GetService("Teams")
 
 -- ─────────────────────────────────────────────────────────────
 -- LIVE CONFIG
 -- ─────────────────────────────────────────────────────────────
 getgenv().NCBCFG = getgenv().NCBCFG or {
-    Size         = math.random(9, 14),
-    LerpFrames   = 6,
-    DragCooldown = 0.40,
-    AngleCap     = 50,
-    RemoteName   = "DamageRemote",
-    IgnoreTeam   = true,
-    WhitelistURL = "",
-    AlwaysOn          = false,   -- fire every Heartbeat; no trigger hold needed
+    -- Reach & timing
+    Size            = math.random(9, 14),
+    LerpFrames      = 6,
+    DragCooldown    = 0.40,
+    AngleCap        = 50,
+    -- Remote
+    RemoteName      = "DamageRemote",
+    -- Team filters
+    IgnoreTeam      = true,   -- skip players on your own team
+    TargetTeam      = "",     -- only target this team name ("" = all teams)
+    -- Player filters
+    IgnoreDead      = true,   -- skip players with Health ≤ 0 / Dead state
+    IgnoreInvisible = true,   -- skip fully-transparent characters
+    MaxTargetHealth = 100,    -- skip players with Health > this value (0 = disabled)
+    -- Whitelist
+    WhitelistURL    = "",
+    -- Control
+    AlwaysOn          = false,
     Enabled           = true,
     VisualizerEnabled = true,
     ScriptKilled      = false,
     TriggerInput = { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" },
-    Keybinds     = {
+    Keybinds = {
         Toggle    = Enum.KeyCode.Z,
         ToggleVis = Enum.KeyCode.X,
         ToggleUI  = Enum.KeyCode.C,
@@ -152,19 +113,19 @@ local Stats = {
     TotalDist     = 0,
     LastVictim    = "—",
     ActiveDrags   = 0,
-    WhitelistHits = 0,   -- per-encounter transitions (V5-7)
+    WhitelistHits = 0,
 }
 
 -- ─────────────────────────────────────────────────────────────
 -- WHITELIST STATE
 -- ─────────────────────────────────────────────────────────────
-local Whitelist       = {}         -- [userId]=true, O(1) lookup
+local Whitelist       = {}
 local WhitelistStatus = "Not loaded"
 local isFetching      = false
 local WL_MAX_RETRIES  = 3
 
 -- ─────────────────────────────────────────────────────────────
--- DERIVED CACHES  (updated when sliders change; never in hot path)
+-- DERIVED CACHES  (updated when sliders change; never in the hot path)
 -- ─────────────────────────────────────────────────────────────
 local sizeSq      = CFG.Size * CFG.Size          -- avoids sqrt in distance check
 local cosAngleCap = math.cos(math.rad(CFG.AngleCap))  -- avoids acos in arc check
@@ -172,7 +133,7 @@ local cosAngleCap = math.cos(math.rad(CFG.AngleCap))  -- avoids acos in arc chec
 -- V4-8: local-player team cache
 local cachedLocalTeam = nil
 
--- V5-2: per-enemy team cache — zero property reads in IsTeammate
+-- V5-2: per-enemy team cache — zero Team property reads in filter functions
 local PlayerTeamCache = {}  -- [userId] = Team object | nil
 local PlayerTeamConns = {}  -- [userId] = signal connection (disconnected on leave)
 
@@ -181,7 +142,7 @@ local ARC_SEGS      = 14
 local ArcAngles     = {}
 local arcAngleDirty = true
 
--- V5-3: pre-allocated arc point buffers — zero table allocations in UpdateArcVis
+-- V5-3: pre-allocated arc point buffers — zero table allocations per frame
 local arcPtX = table.create(ARC_SEGS + 1, 0)
 local arcPtY = table.create(ARC_SEGS + 1, 0)
 local arcPtZ = table.create(ARC_SEGS + 1, 0)
@@ -195,11 +156,10 @@ local function RebuildArcAngles()
     arcAngleDirty = false
 end
 
--- Visualizer dirty flag
-local lastArcColor    = nil
+local lastArcColor = nil
 
--- V5-7: WL range tracking via monotonic frame counter (no table allocs)
-local wlFrameId    = 0
+-- V5-7: WL range tracking via monotonic frame counter (zero table allocations)
+local wlFrameId     = 0
 local WLInRangePrev = {}  -- [userId] = wlFrameId when last seen in WL range
 
 -- ─────────────────────────────────────────────────────────────
@@ -218,18 +178,20 @@ local wlRefLbl            = nil
 local frameCount          = 0
 local STATS_THROTTLE      = 20
 
--- Window drag state (V4-9: module-level, not BuildGUI-local)
-local winDragging = false
+-- Window drag state (module-level — V4-9)
+local winDragging   = false
 local winDragStart, winPosStart, shadowPosStart = nil, nil, nil
 local winRef, shadowRef = nil, nil
-local wiredChars = {}
-local activeDrag = nil  -- shared slider drag dispatcher
-local triggerRowDimRefs = nil  -- { chipStroke, chipLbl, rbLbl, rbStroke } — set by BuildGUI
+local wiredChars    = {}
+local activeDrag    = nil   -- shared slider drag dispatcher
+local triggerRowDimRefs = nil  -- { chipStroke, chipLbl, rbLbl, rbStroke }
 
 -- ─────────────────────────────────────────────────────────────
--- V5-8: TORSO CACHE — single table lookup instead of FindFirstChild ×3
+-- V5-8 / V8: TORSO + HUMANOID CACHES
+-- Single table lookups replace FindFirstChild calls in the hot path.
 -- ─────────────────────────────────────────────────────────────
-local TorsoCache = {}   -- [userId] = Part  (updated on CharacterAdded, cleared on respawn)
+local TorsoCache    = {}   -- [userId] = BasePart
+local HumanoidCache = {}   -- [userId] = Humanoid
 
 local function FindTorso(char)
     return char:FindFirstChild("Torso")
@@ -237,20 +199,27 @@ local function FindTorso(char)
         or char:FindFirstChild("HumanoidRootPart")
 end
 
-local function WireCharacterTorso(player)
+--[[
+    WireCharacter — populates TorsoCache and HumanoidCache for a player.
+    Clears both on CharacterAdded (new rig, parts not yet loaded) and retries
+    once after 0.5 s for characters that are slow to fully replicate.
+--]]
+local function WireCharacter(player)
     local uid = player.UserId
     local function OnChar(char)
-        -- Clear immediately; torso may not exist yet in the new character
-        TorsoCache[uid] = nil
-        -- Wait for the torso to appear (handles slow-loading characters)
-        local torso = FindTorso(char)
-        if torso then
-            TorsoCache[uid] = torso
-        else
-            -- Retry once after a short wait for the rig to load
+        TorsoCache[uid]    = nil
+        HumanoidCache[uid] = nil
+        local torso    = FindTorso(char)
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if torso    then TorsoCache[uid]    = torso    end
+        if humanoid then HumanoidCache[uid] = humanoid end
+        -- Retry once for slow-loading rigs
+        if not torso or not humanoid then
             task.delay(0.5, function()
-                local c = player.Character
-                if c == char then TorsoCache[uid] = FindTorso(char) end
+                if player.Character == char then
+                    TorsoCache[uid]    = TorsoCache[uid]    or FindTorso(char)
+                    HumanoidCache[uid] = HumanoidCache[uid] or char:FindFirstChildOfClass("Humanoid")
+                end
             end)
         end
     end
@@ -280,30 +249,30 @@ Players.PlayerAdded:Connect(function(p)
     PlayerTeamConns[p.UserId] = p:GetPropertyChangedSignal("Team"):Connect(function()
         PlayerTeamCache[p.UserId] = p.Team
     end)
-    WireCharacterTorso(p)
+    WireCharacter(p)
     RebuildPlayerCache()
 end)
 
 Players.PlayerRemoving:Connect(function(p)
     local uid = p.UserId
-    -- Disconnect per-player team signal
-    if PlayerTeamConns[uid] then PlayerTeamConns[uid]:Disconnect(); PlayerTeamConns[uid]=nil end
+    if PlayerTeamConns[uid] then PlayerTeamConns[uid]:Disconnect(); PlayerTeamConns[uid] = nil end
     PlayerTeamCache[uid] = nil
     TorsoCache[uid]      = nil
+    HumanoidCache[uid]   = nil
     ActiveDrags[uid]     = nil
     LastDrag[uid]        = nil
     WLInRangePrev[uid]   = nil
     RebuildPlayerCache()
 end)
 
--- Wire all currently connected players
+-- Wire all players already in the server at load time
 for _, p in ipairs(Players:GetPlayers()) do
     if p ~= LocalPlayer then
         PlayerTeamCache[p.UserId] = p.Team
         PlayerTeamConns[p.UserId] = p:GetPropertyChangedSignal("Team"):Connect(function()
             PlayerTeamCache[p.UserId] = p.Team
         end)
-        WireCharacterTorso(p)
+        WireCharacter(p)
     end
 end
 
@@ -327,9 +296,14 @@ local function RestoreSignal(sig)
     for _, c in ipairs(conns) do pcall(c.Enable, c) end
 end
 
+-- ─────────────────────────────────────────────────────────────
+-- FILTER FUNCTIONS
+-- ─────────────────────────────────────────────────────────────
+
 --[[
-    IsTeammate — V5-2: reads PlayerTeamCache (set via signal, zero property reads).
+    IsTeammate — V5-2: reads PlayerTeamCache (zero property reads).
     Two nil-team players are NOT considered teammates (FFA scenario).
+    Returns true → skip this player.
 --]]
 local function IsTeammate(player)
     if not CFG.IgnoreTeam then return false end
@@ -337,17 +311,62 @@ local function IsTeammate(player)
     return PlayerTeamCache[player.UserId] == cachedLocalTeam
 end
 
+--[[
+    IsTargetTeam — V8: returns true (allow) when TargetTeam is unset or
+    when the player is on the configured team.  Returns false (skip) when
+    a team is configured and the player is on a different (or no) team.
+--]]
+local function IsTargetTeam(player)
+    if not CFG.TargetTeam or CFG.TargetTeam == "" then return true end
+    local team = PlayerTeamCache[player.UserId]
+    return team ~= nil and team.Name == CFG.TargetTeam
+end
+
+--[[
+    IsAlive — V8: uses HumanoidCache.  Returns false (skip) when
+    CFG.IgnoreDead is true and the humanoid is dead or not found.
+--]]
+local function IsAlive(uid)
+    if not CFG.IgnoreDead then return true end
+    local hum = HumanoidCache[uid]
+    if not hum then return false end
+    if hum.Health <= 0 then return false end
+    if hum:GetState() == Enum.HumanoidStateType.Dead then return false end
+    return true
+end
+
+--[[
+    IsVisible — V8: uses the cached torso Part.
+    Returns false (skip) when CFG.IgnoreInvisible is true and the
+    torso's Transparency is ≥ 1 (fully invisible character).
+--]]
+local function IsVisible(torso)
+    if not CFG.IgnoreInvisible then return true end
+    return torso.Transparency < 1
+end
+
+--[[
+    IsWithinHealthCap — V8: uses HumanoidCache.
+    Returns false (skip) when Health > MaxTargetHealth.
+    CFG.MaxTargetHealth = 0 disables the check entirely.
+--]]
+local function IsWithinHealthCap(uid)
+    if CFG.MaxTargetHealth <= 0 then return true end
+    local hum = HumanoidCache[uid]
+    if not hum then return false end
+    return hum.Health <= CFG.MaxTargetHealth
+end
+
 local function IsWhitelisted(player)
     return Whitelist[player.UserId] == true
 end
 
 --[[
-    IsInFrontArc — one sqrt, one dot, one compare.
+    IsInFrontArc — one sqrt, one dot product, one compare.
     arcCF is a composite CFrame: position = handle.Position (sword origin),
     rotation = HumanoidRootPart.CFrame (player facing).
-    Built once per Heartbeat; both checks and visualiser share the same value.
-    Uses cached cosAngleCap (cos of CFG.AngleCap in radians).
-    No acos, no degrees conversion.
+    Built once per Heartbeat; shared by this check and the visualiser.
+    Uses cached cosAngleCap — no acos, no degrees conversion.
 --]]
 local function IsInFrontArc(arcCF, torso)
     local dx = torso.Position.X - arcCF.Position.X
@@ -374,7 +393,6 @@ local function IsTriggerActive()
     -- AlwaysOn bypasses all UIS polling — short-circuit before any branch
     if CFG.AlwaysOn then return true end
     local ti = CFG.TriggerInput
-    -- V5: pcall guard — malformed TriggerInput won't crash the Heartbeat
     if ti.Kind == "Mouse" then
         local ok, v = pcall(UIS.IsMouseButtonPressed, UIS, ti.Button)
         return ok and v
@@ -418,8 +436,7 @@ end
     ParseWhitelist — pure function, no side effects.
     Accepts CR+LF and LF line endings.
     Lines starting with # (after trimming) are comments.
-    Only positive integers are stored.
-    Returns (set, count).
+    Only positive integers are stored.  Returns (set, count).
 --]]
 local function ParseWhitelist(raw)
     local set, count = {}, 0
@@ -436,37 +453,32 @@ end
 
 --[[
     FetchWhitelist — called via task.spawn AFTER BuildGUI (V4-4).
-    - isFetching guard prevents concurrent runs (V4-3).
-    - 3-attempt exponential back-off (1s, 2s, 4s).
-    - On success: atomic table swap + WhitelistHits reset (V4-11).
-    - On failure: status label turns red; warn() logs full error.
+    isFetching guard prevents concurrent runs (V4-3).
+    3-attempt exponential back-off (1 s, 2 s, 4 s).
+    On success: atomic table swap + WhitelistHits reset (V4-11).
+    On failure: status label turns red; warn() logs the full error.
 --]]
 local function FetchWhitelist()
     if isFetching then return end
     isFetching = true
-
     local url = CFG.WhitelistURL
     if not url or url == "" then
         WhitelistStatus = "No URL set"
         if wlStatusLabel then wlStatusLabel.Text = WhitelistStatus end
         isFetching = false; return
     end
-
     WhitelistStatus = "Loading..."
     if wlStatusLabel then wlStatusLabel.Text = WhitelistStatus end
     if wlRefLbl      then wlRefLbl.Text      = "..." end
-
     local delay, lastErr = 1, "unknown"
-
     for attempt = 1, WL_MAX_RETRIES do
         if attempt > 1 then task.wait(delay); delay = delay * 2 end
         local ok, result = pcall(function() return game:HttpGet(url, true) end)
         if ok and type(result) == "string" and #result > 0 then
             local set, count = ParseWhitelist(result)
-            -- Atomic swap so Heartbeat never sees a partial write
             Whitelist           = set
             WhitelistStatus     = string.format("Loaded %d id%s", count, count==1 and "" or "s")
-            Stats.WhitelistHits = 0   -- V4-11: reset for new list
+            Stats.WhitelistHits = 0
             WLInRangePrev       = {}
             if wlStatusLabel then wlStatusLabel.Text = WhitelistStatus; wlStatusLabel.TextColor3 = Color3.fromRGB(0,180,255) end
             if wlRefLbl      then wlRefLbl.Text = "REFRESH" end
@@ -476,7 +488,6 @@ local function FetchWhitelist()
             lastErr = tostring(result)
         end
     end
-
     WhitelistStatus = string.format("Failed (%d tries)", WL_MAX_RETRIES)
     if wlStatusLabel then wlStatusLabel.Text = WhitelistStatus; wlStatusLabel.TextColor3 = Color3.fromRGB(255,80,80) end
     if wlRefLbl      then wlRefLbl.Text = "REFRESH" end
@@ -502,22 +513,13 @@ local COLOR = {
     FIRING    = Color3.fromRGB(255, 30,  55 ),
     WHITELIST = Color3.fromRGB(0,   180, 255),
 }
--- ═══════════════════════════════════════════════════════════════
+
 --[[
-    V5-3: arcPtX/Y/Z are pre-allocated at module level.
-    UpdateArcVis writes into them by index — zero heap allocations.
-
-    SetBeam signature: (part, x1,y1,z1, x2,y2,z2, thick)
-    Uses CFrame.lookAt(mid, mid+dir) — -Z axis aligns with p1→p2,
-    Size.Z is the part's long axis.
-
-    Origin: arcCF — composite CFrame (handle.Position, root.CFrame rotation).
-    The two radius lines span that origin → left/right boundary at CFG.Size studs.
-    The 14 arc segments trace the curved boundary between them.
-    Both reach radius (line length) and angle cap (arc sweep) are directly
-    visible, making a separate sphere redundant.
+    V5-3: arcPtX/Y/Z pre-allocated at module level.
+    SetBeam: CFrame.lookAt aligns the -Z axis with p1→p2; Size.Z = length.
+    Origin: arcCF (handle.Position, root.CFrame rotation).
+    Both radius lines and arc segments share this one composite CFrame.
 --]]
-
 local ArcPool = {}
 
 local function BuildArcVis()
@@ -546,8 +548,8 @@ local function SetBeam(part, x1,y1,z1, x2,y2,z2, thick)
     local inv = 1/len
     part.Size = Vector3.new(thick,thick,len)
     part.CFrame = CFrame.lookAt(
-        Vector3.new((x1+x2)*0.5, (y1+y2)*0.5, (z1+z2)*0.5),
-        Vector3.new((x1+x2)*0.5+dx*inv, (y1+y2)*0.5+dy*inv, (z1+z2)*0.5+dz*inv)
+        Vector3.new((x1+x2)*0.5,(y1+y2)*0.5,(z1+z2)*0.5),
+        Vector3.new((x1+x2)*0.5+dx*inv,(y1+y2)*0.5+dy*inv,(z1+z2)*0.5+dz*inv)
     )
 end
 
@@ -555,30 +557,22 @@ local function UpdateArcVis(baseCF, col)
     if not CFG.VisualizerEnabled then DestroyArcVis(); return end
     if #ArcPool == 0 then BuildArcVis() end
     if arcAngleDirty then RebuildArcAngles() end
-
     local reach = CFG.Size
     local bx,by,bz = baseCF.Position.X, baseCF.Position.Y, baseCF.Position.Z
     local fx,fy,fz = baseCF.LookVector.X, baseCF.LookVector.Y, baseCF.LookVector.Z
     local rx,ry,rz = baseCF.RightVector.X, baseCF.RightVector.Y, baseCF.RightVector.Z
-
-    --[[
-        V5-3: write directly into pre-allocated arrays.
-        arcPtX/Y/Z[i] = world position of arc boundary point i.
-        Fully inlined from ArcAngles table — zero function calls.
-    --]]
+    -- V5-3: write into pre-allocated arrays — zero allocations
     for i = 1, ARC_SEGS+1 do
         local a = ArcAngles[i]; local c,s = a.c, a.s
         arcPtX[i] = bx + (fx*c + rx*s) * reach
         arcPtY[i] = by + (fy*c + ry*s) * reach
         arcPtZ[i] = bz + (fz*c + rz*s) * reach
     end
-
     SetBeam(ArcPool[1], bx,by,bz, arcPtX[1],arcPtY[1],arcPtZ[1], 0.09)
     SetBeam(ArcPool[2], bx,by,bz, arcPtX[ARC_SEGS+1],arcPtY[ARC_SEGS+1],arcPtZ[ARC_SEGS+1], 0.09)
     for i = 1, ARC_SEGS do
         SetBeam(ArcPool[2+i], arcPtX[i],arcPtY[i],arcPtZ[i], arcPtX[i+1],arcPtY[i+1],arcPtZ[i+1], 0.07)
     end
-
     if col ~= lastArcColor then
         for i = 1, 2+ARC_SEGS do ArcPool[i].Color = col end
         lastArcColor = col
@@ -595,7 +589,7 @@ local guiVisible   = true
 local refreshStats = nil
 
 local UI = {
-    W=338, H=550, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
+    W=338, H=720, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
     Font=Enum.Font.GothamBold, FontBody=Enum.Font.Gotham, TextSz=13, TitleSz=14,
     BG=Color3.fromRGB(13,13,18), ACCENT=Color3.fromRGB(0,200,115),
     ACCENT2=Color3.fromRGB(255,55,95), WARN=Color3.fromRGB(255,195,0),
@@ -603,24 +597,34 @@ local UI = {
     MUTED=Color3.fromRGB(105,105,128), BORDER=Color3.fromRGB(38,38,52),
 }
 
+-- ── GUI WIDGET FACTORIES ──────────────────────────────────────
+
 local function MkFrame(par,sz,pos,col,z)
     local f=Instance.new("Frame"); f.Size=sz; f.Position=pos
     f.BackgroundColor3=col or UI.BG; f.BorderSizePixel=0; f.ZIndex=z or 1
     f.Parent=par; return f
 end
+
 local function MkLabel(par,txt,sz,pos,font,tsz,col,z,xa)
     local l=Instance.new("TextLabel"); l.Size=sz; l.Position=pos; l.Text=txt
     l.Font=font or UI.FontBody; l.TextSize=tsz or UI.TextSz; l.TextColor3=col or UI.TEXT
     l.BackgroundTransparency=1; l.ZIndex=z or 2
     l.TextXAlignment=xa or Enum.TextXAlignment.Left; l.Parent=par; return l
 end
-local function MkCorner(par,r) local c=Instance.new("UICorner");c.CornerRadius=UDim.new(0,r or 6);c.Parent=par end
-local function MkStroke(par,col,t) local s=Instance.new("UIStroke");s.Color=col or UI.BORDER;s.Thickness=t or 1;s.Parent=par;return s end
+
+local function MkCorner(par,r)
+    local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 6); c.Parent=par
+end
+
+local function MkStroke(par,col,t)
+    local s=Instance.new("UIStroke"); s.Color=col or UI.BORDER; s.Thickness=t or 1
+    s.Parent=par; return s
+end
 
 --[[
     MkSlider — no UIS global listeners inside (V4-9).
     Sets module-level `activeDrag` on mouse-press; the module-level
-    UIS.InputChanged/Ended dispatch to it.
+    UIS.InputChanged/Ended listeners dispatch to it.
 --]]
 local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
     local row=MkFrame(par,UDim2.new(1,0,0,UI.RowH),UDim2.new(0,0,0,y),Color3.fromRGB(0,0,0),2)
@@ -634,7 +638,6 @@ local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
     MkCorner(knob,KS); MkStroke(knob,UI.ACCENT,2)
     local valLbl=MkLabel(row,fmt(def),UDim2.new(0,58,1,0),UDim2.new(0,108+UI.SliderW+6,0,0),UI.Font,UI.TextSz,UI.ACCENT,3)
     local isInt=math.floor(mn)==mn and math.floor(mx)==mx and math.floor(def)==def
-
     local function SetVal(v)
         v=math.clamp(v,mn,mx)
         v=isInt and math.round(v) or (math.floor(v*100+0.5)/100)
@@ -643,7 +646,6 @@ local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
         valLbl.Text=fmt(v); if onChange then onChange(v) end
     end
     SetVal(def)
-
     local info={track=track,mn=mn,mx=mx,SetVal=SetVal}
     knob.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then activeDrag=info end end)
     track.InputBegan:Connect(function(i)
@@ -673,17 +675,18 @@ local function MkToggle(par,xOff,yOff,label,def,onChange)
         TweenService:Create(track,twi,{BackgroundColor3=st and UI.ACCENT or Color3.fromRGB(46,46,60)}):Play()
         if onChange then onChange(st) end
     end
-    SetState(def); track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then SetState(not on) end end)
-    return {SetState=SetState,GetState=function() return on end}
+    SetState(def)
+    track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then SetState(not on) end end)
+    return {SetState=SetState, GetState=function() return on end}
 end
 
 local function MkStatsStrip(par,y)
     local strip=MkFrame(par,UDim2.new(1,0,0,28),UDim2.new(0,0,0,y),Color3.fromRGB(9,9,14),2)
     MkStroke(strip,UI.BORDER,1)
-    local kl=MkLabel(strip,"Kills: 0",UDim2.new(0,66,1,0),UDim2.new(0,UI.Pad,0,0),UI.Font,11,UI.ACCENT,3)
-    local dl=MkLabel(strip,"Avg: —",  UDim2.new(0,64,1,0),UDim2.new(0,82,0,0),   UI.Font,11,UI.TEXT,  3)
-    local ll=MkLabel(strip,"Last: —", UDim2.new(0,100,1,0),UDim2.new(0,150,0,0), UI.Font,11,UI.MUTED, 3)
-    local wl=MkLabel(strip,"WL↑: 0", UDim2.new(0,56,1,0), UDim2.new(0,260,0,0), UI.Font,11,UI.WLC,   3)
+    local kl=MkLabel(strip,"Kills: 0", UDim2.new(0,66,1,0),  UDim2.new(0,UI.Pad,0,0), UI.Font,11,UI.ACCENT,3)
+    local dl=MkLabel(strip,"Avg: —",   UDim2.new(0,64,1,0),  UDim2.new(0,82,0,0),     UI.Font,11,UI.TEXT,  3)
+    local ll=MkLabel(strip,"Last: —",  UDim2.new(0,100,1,0), UDim2.new(0,150,0,0),    UI.Font,11,UI.MUTED, 3)
+    local wl=MkLabel(strip,"WL↑: 0",  UDim2.new(0,56,1,0),  UDim2.new(0,260,0,0),    UI.Font,11,UI.WLC,   3)
     return function()
         kl.Text="Kills: "..Stats.Kills
         dl.Text="Avg: "..(Stats.Kills>0 and string.format("%.1f",Stats.TotalDist/Stats.Kills) or "—")
@@ -692,14 +695,156 @@ local function MkStatsStrip(par,y)
     end
 end
 
+--[[
+    MkTeamDropdown — V8: live autocomplete team selector.
+
+    Layout (relative to `par`):
+      • "Target Team" label on the left.
+      • TextBox on the right showing the current value (placeholder "All Teams").
+      • Clicking or focusing the box opens a dropdown panel positioned directly
+        below it.  The panel is clipped and scrolls if needed.
+      • Each row in the dropdown is a clickable frame.  The first row is always
+        "All Teams" (commits empty string → no filter).
+      • Typing in the box filters rows in real-time (case-insensitive substring).
+      • Pressing Enter or clicking a row commits the selection and closes the
+        dropdown.  FocusLost without Enter restores the last committed value.
+      • The dropdown is re-populated from Teams:GetTeams() each time it opens,
+        so it reflects any teams added after the GUI was built.
+--]]
+local function MkTeamDropdown(par, y, onChange)
+    local ROW_H   = 22   -- height of each dropdown row
+    local MAX_VIS = 5    -- max rows shown before the panel clips
+    local DD_PAD  = 4    -- vertical padding inside the dropdown
+
+    MkLabel(par,"Target Team",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+
+    -- Input field
+    local inputBG = MkFrame(par,UDim2.new(0,UI.W-116,0,24),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(inputBG,4); MkStroke(inputBG,UI.BORDER,1)
+    local box = Instance.new("TextBox")
+    box.Size=UDim2.new(1,-8,1,0); box.Position=UDim2.new(0,4,0,0)
+    box.Text=CFG.TargetTeam or ""; box.PlaceholderText="All Teams"
+    box.PlaceholderColor3=UI.MUTED; box.Font=UI.FontBody; box.TextSize=11
+    box.TextColor3=UI.WLC; box.BackgroundTransparency=1; box.BorderSizePixel=0
+    box.ZIndex=4; box.ClearTextOnFocus=false; box.Parent=inputBG
+
+    -- Dropdown panel (hidden until box is focused)
+    local ddH  = ROW_H * MAX_VIS + DD_PAD * 2
+    local ddBG = MkFrame(par,UDim2.new(0,UI.W-116,0,ddH),UDim2.new(0,108,0,y+27),Color3.fromRGB(20,20,30),8)
+    MkCorner(ddBG,4); MkStroke(ddBG,UI.BORDER,1)
+    ddBG.Visible=false; ddBG.ClipsDescendants=true
+
+    -- Scrollable list inside the panel
+    local listFrame = Instance.new("Frame")
+    listFrame.Size=UDim2.new(1,0,0,0); listFrame.Position=UDim2.new(0,0,0,DD_PAD)
+    listFrame.BackgroundTransparency=1; listFrame.ZIndex=9; listFrame.Parent=ddBG
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.SortOrder=Enum.SortOrder.LayoutOrder; listLayout.Parent=listFrame
+
+    local ddOpen  = false
+    local rowRefs = {}
+
+    -- Collect team names: "" sentinel for "All Teams" + real team names
+    local function GetTeamNames()
+        local names = {""}
+        for _, t in ipairs(Teams:GetTeams()) do names[#names+1] = t.Name end
+        return names
+    end
+
+    local function CommitTeam(name)
+        CFG.TargetTeam = name
+        box.Text       = name
+        ddBG.Visible   = false
+        ddOpen         = false
+        if onChange then onChange(name) end
+    end
+
+    -- Rebuild the row list filtered by `query` (empty = show all)
+    local function RebuildList(query)
+        for _, r in ipairs(rowRefs) do pcall(r.Destroy, r) end
+        rowRefs = {}
+
+        local names = GetTeamNames()
+        local lo    = 0
+        for _, name in ipairs(names) do
+            local display = name == "" and "All Teams" or name
+            if query == "" or display:lower():find(query:lower(), 1, true) then
+                lo = lo + 1
+                local rowBG = MkFrame(listFrame,UDim2.new(1,0,0,ROW_H),UDim2.new(0,0,0,0),Color3.fromRGB(0,0,0),9)
+                rowBG.BackgroundTransparency=1; rowBG.LayoutOrder=lo
+                MkLabel(rowBG,display,UDim2.new(1,-8,1,0),UDim2.new(0,6,0,0),UI.FontBody,11,
+                    name == (CFG.TargetTeam or "") and UI.ACCENT or UI.TEXT, 10)
+                rowBG.MouseEnter:Connect(function()
+                    TweenService:Create(rowBG,TweenInfo.new(0.08),{BackgroundColor3=Color3.fromRGB(30,30,48),BackgroundTransparency=0}):Play()
+                end)
+                rowBG.MouseLeave:Connect(function()
+                    TweenService:Create(rowBG,TweenInfo.new(0.08),{BackgroundTransparency=1}):Play()
+                end)
+                rowBG.InputBegan:Connect(function(i)
+                    if i.UserInputType==Enum.UserInputType.MouseButton1 then CommitTeam(name) end
+                end)
+                table.insert(rowRefs, rowBG)
+            end
+        end
+
+        -- Resize panel to fit visible rows
+        listFrame.Size = UDim2.new(1,0,0,lo*ROW_H)
+        ddBG.Size      = UDim2.new(0,UI.W-116,0,math.min(lo,MAX_VIS)*ROW_H+DD_PAD*2)
+    end
+
+    local function OpenDropdown()
+        RebuildList("")  -- show all on initial open
+        ddBG.Visible = true
+        ddOpen       = true
+    end
+
+    local function CloseDropdown()
+        ddBG.Visible = false
+        ddOpen       = false
+        box.Text     = CFG.TargetTeam or ""  -- restore committed value
+    end
+
+    -- Live filtering as the user types
+    box:GetPropertyChangedSignal("Text"):Connect(function()
+        if ddOpen then RebuildList(box.Text) end
+    end)
+
+    box.Focused:Connect(OpenDropdown)
+
+    box.FocusLost:Connect(function(enter)
+        -- Delay so a row click fires before this handler runs
+        task.delay(0.15, function()
+            if not ddOpen then return end   -- row click already closed it
+            if enter then
+                -- Try to match typed text to a real team name
+                local typed = box.Text
+                if typed == "" then
+                    CommitTeam("")
+                else
+                    local matched = false
+                    for _, t in ipairs(Teams:GetTeams()) do
+                        if t.Name:lower() == typed:lower() then
+                            CommitTeam(t.Name); matched=true; break
+                        end
+                    end
+                    if not matched then CloseDropdown() end
+                end
+            else
+                CloseDropdown()
+            end
+        end)
+    end)
+
+    return { SetTeam = CommitTeam }
+end
+
 -- ── BUILD FULL GUI ────────────────────────────────────────────
 local function BuildGUI()
     if ScreenGui then ScreenGui:Destroy() end
-    local sg=Instance.new("ScreenGui"); sg.Name="_NCBv6"; sg.ResetOnSpawn=false
+    local sg=Instance.new("ScreenGui"); sg.Name="_NCBv8"; sg.ResetOnSpawn=false
     sg.ZIndexBehavior=Enum.ZIndexBehavior.Global; sg.DisplayOrder=999
     sg.IgnoreGuiInset=true; sg.Parent=game:GetService("CoreGui")
     ScreenGui=sg
-
     sg.AncestryChanged:Connect(function() if not sg.Parent then listeningForTrigger=false end end)
 
     local shadow=MkFrame(sg,UDim2.new(0,UI.W+16,0,UI.H+16),UDim2.new(0,52,0,112),Color3.fromRGB(0,0,0),0)
@@ -715,7 +860,9 @@ local function BuildGUI()
     MkLabel(tb,"NoCBring Config",UDim2.new(0,180,1,0),UDim2.new(0,UI.Pad+10,0,0),UI.Font,UI.TitleSz,UI.TEXT,3)
     local cb=MkFrame(tb,UDim2.new(0,24,0,24),UDim2.new(1,-32,0.5,-12),Color3.fromRGB(52,17,26),3); MkCorner(cb,4)
     MkLabel(cb,"×",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,16,UI.ACCENT2,4,Enum.TextXAlignment.Center)
-    cb.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then win.Visible=false;shadow.Visible=false;guiVisible=false end end)
+    cb.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then win.Visible=false;shadow.Visible=false;guiVisible=false end
+    end)
     tb.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
             winDragging=true; winDragStart=i.Position
@@ -732,10 +879,7 @@ local function BuildGUI()
 
     sliders.Size=MkSlider(content,y,"Size",5,30,CFG.Size,
         function(v) return string.format("%.0f st",v) end,
-        function(v)
-            CFG.Size=v; sizeSq=v*v
-            -- V4-10: size change does NOT set arcAngleDirty (ArcAngles has no size data)
-        end)
+        function(v) CFG.Size=v; sizeSq=v*v end)
     y=y+UI.RowH
     sliders.Lerp=MkSlider(content,y,"LerpFrames",2,12,CFG.LerpFrames,
         function(v) return string.format("%.0f fr",v) end,
@@ -756,12 +900,16 @@ local function BuildGUI()
 
     -- Remote name
     MkLabel(content,"RemoteName",UDim2.new(0,95,0,20),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
-    local rBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3); MkCorner(rBG,4); MkStroke(rBG,UI.BORDER,1)
+    local rBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(rBG,4); MkStroke(rBG,UI.BORDER,1)
     local rBox=Instance.new("TextBox"); rBox.Size=UDim2.new(1,-8,1,0); rBox.Position=UDim2.new(0,4,0,0)
     rBox.Text=CFG.RemoteName; rBox.Font=UI.FontBody; rBox.TextSize=UI.TextSz; rBox.TextColor3=UI.TEXT
     rBox.BackgroundTransparency=1; rBox.BorderSizePixel=0; rBox.ZIndex=4
-    rBox.PlaceholderText="e.g. DamageRemote"; rBox.PlaceholderColor3=UI.MUTED; rBox.ClearTextOnFocus=false; rBox.Parent=rBG
-    rBox.FocusLost:Connect(function() if rBox.Text~="" then CFG.RemoteName=rBox.Text; currentRemote=nil; Notify("Remote: "..CFG.RemoteName) end end)
+    rBox.PlaceholderText="e.g. DamageRemote"; rBox.PlaceholderColor3=UI.MUTED
+    rBox.ClearTextOnFocus=false; rBox.Parent=rBG
+    rBox.FocusLost:Connect(function()
+        if rBox.Text~="" then CFG.RemoteName=rBox.Text; currentRemote=nil; Notify("Remote: "..CFG.RemoteName) end
+    end)
     y=y+30
 
     -- Trigger chip + REBIND
@@ -774,22 +922,25 @@ local function BuildGUI()
     local _rbLbl=MkLabel(rbBG,"REBIND",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,11,UI.MUTED,4,Enum.TextXAlignment.Center)
     rbBG.MouseEnter:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.TEXT;rbStroke.Color=UI.MUTED end end)
     rbBG.MouseLeave:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.MUTED;rbStroke.Color=UI.BORDER end end)
-    rbBG.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.WARN;rbStroke.Color=UI.WARN;chipStroke.Color=UI.WARN;StartRebind() end end)
-    -- Store refs for AlwaysOn dimming and rebind visual restore
+    rbBG.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 and not CFG.AlwaysOn then
+            _rbLbl.TextColor3=UI.WARN; rbStroke.Color=UI.WARN; chipStroke.Color=UI.WARN; StartRebind()
+        end
+    end)
+    -- Refs for AlwaysOn dimming and rebind visual restore
     triggerRowDimRefs = { chipStroke=chipStroke, chipLbl=triggerBindLabel, rbLbl=_rbLbl, rbStroke=rbStroke }
-    getgenv()._NCBRebindUI={rbLbl=_rbLbl,rbStroke=rbStroke,chipStroke=chipStroke}
-    -- Apply initial dim state if AlwaysOn was already true when GUI built
+    getgenv()._NCBRebindUI = { rbLbl=_rbLbl, rbStroke=rbStroke, chipStroke=chipStroke }
     if CFG.AlwaysOn then
-        chipStroke.Color = UI.MUTED; triggerBindLabel.TextColor3 = UI.MUTED
-        _rbLbl.TextColor3 = UI.MUTED; rbStroke.Color = UI.BORDER
+        chipStroke.Color=UI.MUTED; triggerBindLabel.TextColor3=UI.MUTED
+        _rbLbl.TextColor3=UI.MUTED; rbStroke.Color=UI.BORDER
     end
     y=y+UI.RowH
 
-    -- Always On toggle  (placed immediately after Trigger row, still in INPUTS)
+    -- Always On toggle
     --[[
         When on: IsTriggerActive() short-circuits to true — no button hold needed.
-        The trigger chip and REBIND are dimmed to show they are bypassed.
-        Switching off restores normal trigger-hold behavior and un-dims the row.
+        The trigger chip and REBIND button are dimmed to show they are bypassed.
+        Switching off restores normal trigger-hold behaviour and un-dims the row.
     --]]
     toggles.AlwaysOn=MkToggle(content,UI.Pad,y,"Always On",CFG.AlwaysOn,function(v)
         CFG.AlwaysOn=v
@@ -813,34 +964,56 @@ local function BuildGUI()
     -- Ignore Team toggle + live team name chip
     --[[
         V5-5: the team chip signal handler ONLY updates tcLbl.Text.
-        It reads the already-updated cachedLocalTeam (set by the
-        module-level signal at the bottom of this file) — no redundant
-        LocalPlayer.Team property read, no duplicate assignment.
+        It reads cachedLocalTeam (already set by the module-level handler
+        at the bottom of this file) — no redundant property read.
     --]]
     toggles.IgnoreTeam=MkToggle(content,UI.Pad,y,"Ignore Team",CFG.IgnoreTeam,function(v) CFG.IgnoreTeam=v end)
-    local tcBG=MkFrame(content,UDim2.new(0,120,0,22),UDim2.new(0,UI.W-138,0,y+5),Color3.fromRGB(22,22,34),3); MkCorner(tcBG,5); MkStroke(tcBG,UI.BORDER,1)
+    local tcBG=MkFrame(content,UDim2.new(0,120,0,22),UDim2.new(0,UI.W-138,0,y+5),Color3.fromRGB(22,22,34),3)
+    MkCorner(tcBG,5); MkStroke(tcBG,UI.BORDER,1)
     local tcLbl=MkLabel(tcBG,cachedLocalTeam and cachedLocalTeam.Name or "No Team",UDim2.new(1,-4,1,0),UDim2.new(0,4,0,0),UI.FontBody,11,UI.MUTED,4)
     LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
-        -- V5-5: read cachedLocalTeam, NOT LocalPlayer.Team (already updated by module-level handler)
         tcLbl.Text = cachedLocalTeam and cachedLocalTeam.Name or "No Team"
     end)
     y=y+UI.RowH
 
-    -- Whitelist URL
+    -- Target Team autocomplete dropdown
+    MkTeamDropdown(content, y, function(name)
+        Notify("Target Team: " .. (name == "" and "All" or name))
+    end)
+    y=y+30
+
+    -- Ignore Dead + Ignore Invisible (side by side)
+    toggles.IgnoreDead=MkToggle(content,UI.Pad,y,"Ignore Dead",CFG.IgnoreDead,function(v) CFG.IgnoreDead=v end)
+    toggles.IgnoreInvisible=MkToggle(content,UI.W/2,y,"Ignore Invis",CFG.IgnoreInvisible,function(v) CFG.IgnoreInvisible=v end)
+    y=y+30
+
+    -- Max Target Health slider  (0 = filter disabled)
+    sliders.MaxHealth=MkSlider(content,y,"Max HP",0,500,CFG.MaxTargetHealth,
+        function(v) return v==0 and "Off" or string.format("%.0f hp",v) end,
+        function(v) CFG.MaxTargetHealth=math.round(v) end)
+    y=y+UI.RowH+4
+
+    -- ── WHITELIST ────────────────────────────────────────────
+    MkLabel(content,"WHITELIST",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
     MkLabel(content,"WL URL",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
-    local wlBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3); MkCorner(wlBG,4); MkStroke(wlBG,UI.BORDER,1)
+    local wlBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(wlBG,4); MkStroke(wlBG,UI.BORDER,1)
     local wlBox=Instance.new("TextBox"); wlBox.Size=UDim2.new(1,-8,1,0); wlBox.Position=UDim2.new(0,4,0,0)
     wlBox.Text=CFG.WhitelistURL; wlBox.Font=UI.FontBody; wlBox.TextSize=11; wlBox.TextColor3=UI.WLC
     wlBox.BackgroundTransparency=1; wlBox.BorderSizePixel=0; wlBox.ZIndex=4
-    wlBox.PlaceholderText="https://raw.githubusercontent.com/..."; wlBox.PlaceholderColor3=UI.MUTED; wlBox.ClearTextOnFocus=false; wlBox.Parent=wlBG
+    wlBox.PlaceholderText="https://raw.githubusercontent.com/..."
+    wlBox.PlaceholderColor3=UI.MUTED; wlBox.ClearTextOnFocus=false; wlBox.Parent=wlBG
     wlBox.FocusLost:Connect(function() CFG.WhitelistURL=wlBox.Text end)
     y=y+30
 
-    -- WL Status + REFRESH
     MkLabel(content,"WL Status",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
-    local wlStatBG=MkFrame(content,UDim2.new(0,UI.W-186,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(22,22,34),3); MkCorner(wlStatBG,4); MkStroke(wlStatBG,UI.BORDER,1)
+    local wlStatBG=MkFrame(content,UDim2.new(0,UI.W-186,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(22,22,34),3)
+    MkCorner(wlStatBG,4); MkStroke(wlStatBG,UI.BORDER,1)
     wlStatusLabel=MkLabel(wlStatBG,WhitelistStatus,UDim2.new(1,-4,1,0),UDim2.new(0,4,0,0),UI.FontBody,11,UI.WLC,4)
-    local wlRefBG=MkFrame(content,UDim2.new(0,60,0,22),UDim2.new(0,UI.W-70,0,y+1),Color3.fromRGB(22,22,34),3); MkCorner(wlRefBG,4); MkStroke(wlRefBG,UI.BORDER,1)
+    local wlRefBG=MkFrame(content,UDim2.new(0,60,0,22),UDim2.new(0,UI.W-70,0,y+1),Color3.fromRGB(22,22,34),3)
+    MkCorner(wlRefBG,4); MkStroke(wlRefBG,UI.BORDER,1)
     wlRefLbl=MkLabel(wlRefBG,"REFRESH",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,11,UI.MUTED,4,Enum.TextXAlignment.Center)
     wlRefBG.MouseEnter:Connect(function() wlRefLbl.TextColor3=UI.WLC end)
     wlRefBG.MouseLeave:Connect(function() if not isFetching then wlRefLbl.TextColor3=UI.MUTED end end)
@@ -864,7 +1037,7 @@ local function BuildGUI()
     refreshStats=MkStatsStrip(content,y)
 end
 
--- V4-9: module-level UIS listeners (registered ONCE, stored in Connections)
+-- Module-level UIS listeners (V4-9: registered once, stored in Connections)
 Connections.InputEnded = UIS.InputEnded:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 then
         winDragging=false; activeDrag=nil
@@ -875,7 +1048,7 @@ Connections.InputChanged = UIS.InputChanged:Connect(function(i)
     if i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
     if winDragging and winRef and winDragStart then
         local d=i.Position-winDragStart
-        winRef.Position    = UDim2.new(winPosStart.X.Scale,    winPosStart.X.Offset+d.X, winPosStart.Y.Scale,    winPosStart.Y.Offset+d.Y)
+        winRef.Position    = UDim2.new(winPosStart.X.Scale,    winPosStart.X.Offset+d.X,    winPosStart.Y.Scale,    winPosStart.Y.Offset+d.Y)
         shadowRef.Position = UDim2.new(shadowPosStart.X.Scale, shadowPosStart.X.Offset+d.X-8, shadowPosStart.Y.Scale, shadowPosStart.Y.Offset+d.Y-8)
     end
     if activeDrag then
@@ -892,40 +1065,32 @@ task.spawn(FetchWhitelist)
 --  SECTION 3 — CORE DRAG ROUTINE
 -- ═══════════════════════════════════════════════════════════════
 --[[
-    V5-1 FIX — "finally" pattern for signal restore.
-
-    The `suppressed` flag tracks whether SuppressSignal has been
-    called.  Cleanup() is called after pcall returns — unconditionally
-    — ensuring RestoreSignal always runs, even if the lerp loop errors
-    (e.g. torso is destroyed mid-drag, RunService.Heartbeat:Wait()
-    throws because the runner is disconnected, etc.).
-
-    V5-6 FIX — task.spawn instead of coroutine.wrap.
-    Errors after a yield are routed to the task scheduler and appear
-    in the output window instead of silently killing the coroutine.
+    V5-1: "finally" pattern — cleanup() runs after pcall unconditionally,
+    ensuring RestoreSignal fires even if the lerp loop errors mid-drag.
+    V5-6: task.spawn routes post-yield errors to the task scheduler.
 --]]
 local function DragAndFire(victim, attackerRoot, remote, arcCF)
     local uid  = victim.UserId
     local char = victim.Character; if not char then return end
-    local torso    = TorsoCache[uid] or FindTorso(char)   -- V5-8: cache first
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    -- V5-8 / V8: cache lookup first, then fall back to FindFirstChild
+    local torso    = TorsoCache[uid]    or FindTorso(char)
+    local humanoid = HumanoidCache[uid] or char:FindFirstChildOfClass("Humanoid")
     if not torso or not humanoid then return end
+
+    -- Safety guards (also enforced upstream in the Heartbeat filter chain)
     if humanoid.Health <= 0 then return end
     if humanoid:GetState() == Enum.HumanoidStateType.Dead then return end
+
     if ActiveDrags[uid] then return end
     if tick()-(LastDrag[uid] or 0) < CFG.DragCooldown then return end
     if not IsInFrontArc(arcCF, torso) then return end
 
-    local realDist=(arcCF.Position-torso.Position).Magnitude
+    local realDist = (arcCF.Position - torso.Position).Magnitude
     ActiveDrags[uid]=true; LastDrag[uid]=tick(); Stats.ActiveDrags=Stats.ActiveDrags+1
 
-    task.spawn(function()   -- V5-6
+    task.spawn(function()
         local suppressed = false
 
-        --[[
-            V5-1: cleanup() always runs.  Called after pcall regardless
-            of success or failure, so signals are never left suppressed.
-        --]]
         local function cleanup()
             if suppressed then
                 RestoreSignal(torso.Changed)
@@ -941,7 +1106,7 @@ local function DragAndFire(victim, attackerRoot, remote, arcCF)
             suppressed = true
 
             local lp = dest.Position - torso.Position
-            -- V5-4: guard against zero-vector (co-located attacker/victim)
+            -- V5-4: guard against zero-vector (attacker and victim at the same point)
             if lp.Magnitude > 0.01 then
                 torso.AssemblyLinearVelocity = lp.Unit
                     * math.clamp(lp.Magnitude * (60 / CFG.LerpFrames), 0, 55)
@@ -954,7 +1119,7 @@ local function DragAndFire(victim, attackerRoot, remote, arcCF)
             end
         end)
 
-        cleanup()   -- V5-1: unconditional — called whether pcall succeeded or not
+        cleanup()  -- V5-1: unconditional
 
         if ok then
             if remote then pcall(function() remote:FireServer(victim) end) end
@@ -985,10 +1150,10 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
 
     --[[
         arcCF: composite CFrame built once per frame.
-          Position  = handle.Position  (sword origin — where hits land)
-          Rotation  = root.CFrame      (player facing — not tool mesh axis)
-        Both IsInFrontArc and UpdateArcVis receive the same value so the
-        visual cone is pixel-accurate with the effective hit zone.
+          Position = handle.Position  (sword origin — where hits land)
+          Rotation = root.CFrame      (player facing — not tool mesh axis)
+        IsInFrontArc and UpdateArcVis share this value so the visual cone
+        is pixel-accurate with the effective hit zone.
     --]]
     local arcCF = root.CFrame + (handle.Position - root.Position)
 
@@ -996,7 +1161,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     local targetsInRange = 0
     local wlInRange      = 0
 
-    -- Localize hot-path values to avoid repeated global/upvalue lookups
+    -- Localize hot-path values to avoid repeated upvalue lookups
     local hx,hy,hz = handle.Position.X, handle.Position.Y, handle.Position.Z
     local _sizeSq   = sizeSq
     local cache     = PlayerCache
@@ -1008,25 +1173,39 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     for idx = 1, #cache do
         local player = cache[idx]
         local pc     = player.Character; if not pc then continue end
+        local uid    = player.UserId
 
         -- V5-8: torso from cache (single table lookup, no FindFirstChild)
-        local pt = TorsoCache[player.UserId]; if not pt then continue end
+        local pt = TorsoCache[uid]; if not pt then continue end
 
         -- Squared distance check — no sqrt
         local dx=hx-pt.Position.X; local dy=hy-pt.Position.Y; local dz=hz-pt.Position.Z
         if dx*dx+dy*dy+dz*dz > _sizeSq then continue end
 
-        -- V5-2: IsTeammate reads PlayerTeamCache — zero property reads
+        -- ── FILTER CHAIN ────────────────────────────────────
+        -- V5-2: own-team check via cache — zero property reads
         if IsTeammate(player) then continue end
 
-        local uid = player.UserId
+        -- V8: target-team filter — skip anyone NOT on the chosen team
+        if not IsTargetTeam(player) then continue end
+
+        -- V8: skip dead bodies
+        if not IsAlive(uid) then continue end
+
+        -- V8: skip invisible characters
+        if not IsVisible(pt) then continue end
+
+        -- V8: skip over-health characters
+        if not IsWithinHealthCap(uid) then continue end
+        -- ────────────────────────────────────────────────────
+
         if IsWhitelisted(player) then
             wlInRange = wlInRange + 1
-            -- V5-7: detect 0→1 transition via frame counter (no table alloc)
+            -- V5-7: detect 0→1 transition via frame counter (zero allocs)
             if WLInRangePrev[uid] ~= prevFrameId then
                 Stats.WhitelistHits = Stats.WhitelistHits + 1
             end
-            WLInRangePrev[uid] = wlFrameId   -- mark "seen this frame"
+            WLInRangePrev[uid] = wlFrameId
             continue
         end
 
@@ -1036,7 +1215,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- State color (shared by sphere and arc)
+    -- State color (drives the arc cone colour)
     local col
     if not CFG.Enabled           then col=COLOR.DISABLED
     elseif Stats.ActiveDrags > 0 then col=COLOR.FIRING
@@ -1052,7 +1231,7 @@ end)
 --  SECTION 5 — INPUT / KEYBINDS
 -- ═══════════════════════════════════════════════════════════════
 Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
-    -- Rebind intercept BEFORE gpe guard
+    -- Rebind intercept BEFORE gpe guard (works even when game has focus)
     if listeningForTrigger then
         if tick()-rebindStartTick < 0.10 then return end
         if input.KeyCode==Enum.KeyCode.Escape then
@@ -1109,9 +1288,9 @@ end
 if LocalPlayer.Character then OnChar(LocalPlayer.Character) end
 LocalPlayer.CharacterAdded:Connect(OnChar)
 
--- Module-level team cache for local player (V4-8)
--- This is the ONLY place cachedLocalTeam is written — the GUI's signal
--- handler (V5-5) reads it rather than calling LocalPlayer.Team again.
+-- Module-level local-player team cache (V4-8 / V5-5).
+-- This is the ONLY place cachedLocalTeam is written.
+-- The GUI team chip reads it rather than calling LocalPlayer.Team again.
 cachedLocalTeam = LocalPlayer.Team
 LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
     cachedLocalTeam = LocalPlayer.Team
@@ -1119,15 +1298,20 @@ end)
 
 RebuildArcAngles()
 
-Notify(string.format("NoCBring v7  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
+Notify(string.format("NoCBring v8  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
     CFG.Size, CFG.TriggerInput.Name, tostring(CFG.AlwaysOn), CFG.WhitelistURL~="" and "set" or "off"))
 
 --[[
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- v6 → v7 CHANGES
+ v7 → v8 CHANGES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- AlwaysOn  IsTriggerActive short-circuits; trigger row dimmed in UI
- Sphere    Removed entirely (arc encodes both radius and angle)
+ TargetTeam       CFG field + MkTeamDropdown autocomplete UI
+ IgnoreDead       CFG toggle + IsAlive() — short-circuits Heartbeat
+ IgnoreInvisible  CFG toggle + IsVisible() — uses cached torso Part
+ MaxTargetHealth  CFG slider + IsWithinHealthCap() — 0 = disabled
+ HumanoidCache    [userId]=Humanoid, mirrors TorsoCache pattern
+ WireCharacter    Replaces WireCharacterTorso; wires both caches
+ Teams service    Added to service block for dropdown population
 
  KEYBINDS
    Z  toggle drag   X  toggle arc visualizer   C  show/hide panel   P  kill
@@ -1137,6 +1321,5 @@ Notify(string.format("NoCBring v7  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
  ALWAYS ON
    INPUTS section → Always On toggle
    When on: drag fires every Heartbeat — no button hold required
-   When off: trigger-hold behavior resumes
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
