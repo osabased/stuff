@@ -1,0 +1,172 @@
+if getgenv().GLOBALENABLED == true then return end
+
+getgenv().GLOBALENABLED = true
+
+getgenv().Settings = {
+    ScriptKilled = false,
+    Enabled = true,
+    VisualizerEnabled = false,
+    Size = 10,
+    Increment = 1,
+    Keybinds = {
+        Increase = Enum.KeyCode.J,
+        Decrease = Enum.KeyCode.K,
+        Toggle = Enum.KeyCode.Z,
+        VisualizerToggle = Enum.KeyCode.X,
+        KillScript = Enum.KeyCode.P
+    }
+}
+
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local StarterGui = game:GetService("StarterGui")
+local Players = game:GetService("Players")
+
+local Connections = {}
+local Instances = {}
+
+local LocalPlayer = Players.LocalPlayer
+
+local function Notify(Text)
+    StarterGui:SetCore("SendNotification", {
+        Title = "Summer Cbring",
+        Text = Text,
+    })
+end
+
+Notify("Loaded.")
+
+Connections.InputBegan = UIS.InputBegan:Connect(function(Input, GPE)
+    local Success, Error = pcall(function()
+        if GPE then return end
+        
+        if Input.KeyCode == getgenv().Settings.Keybinds.Increase then
+            getgenv().Settings.Size = getgenv().Settings.Size + getgenv().Settings.Increment
+            Notify("Size is " .. getgenv().Settings.Size)
+        elseif Input.KeyCode == getgenv().Settings.Keybinds.Decrease then
+            getgenv().Settings.Size = getgenv().Settings.Size - getgenv().Settings.Increment
+            Notify("Size is " .. getgenv().Settings.Size)
+        elseif Input.KeyCode == getgenv().Settings.Keybinds.Toggle then
+            getgenv().Settings.Enabled = not getgenv().Settings.Enabled
+            Notify("Enabled: " .. tostring(getgenv().Settings.Enabled))
+        elseif Input.KeyCode == getgenv().Settings.Keybinds.VisualizerToggle then
+            getgenv().Settings.VisualizerEnabled = not getgenv().Settings.VisualizerEnabled
+            Notify("Visualizer: " .. tostring(getgenv().Settings.VisualizerEnabled))
+        elseif Input.KeyCode == getgenv().Settings.Keybinds.KillScript then
+            getgenv().Settings.ScriptKilled = true
+            Notify("Killed script.")
+            for i, v in pairs(Connections) do
+                pcall(function() v:Disconnect() end)
+            end
+            for j, k in pairs(Instances) do
+                k:Destroy()
+            end
+        end
+    end)
+    
+    if Error then
+        warn(Error)
+    end
+end)
+
+local function DisableConnections(Connection)
+    for i, v in pairs(getconnections(Connection)) do
+		pcall(function()
+			v:Disable()
+		end)
+	end
+end
+
+local function EnableConnections(Connection)
+    for i, v in pairs(getconnections(Connection)) do
+		pcall(function()
+			v:Enable()
+		end)
+	end
+end
+
+Connections.Heartbeat = RunService.Heartbeat:Connect(function()
+    local Character = LocalPlayer.Character
+    if not Character then return end
+    
+    local Humanoid = Character:FindFirstChild("Humanoid")
+    local Tool = Character:FindFirstChildOfClass("Tool")
+    
+    if getgenv().Settings.Enabled == true and Tool and Humanoid then
+        pcall(function()
+            local Handle = Tool.Handle
+            
+            if Handle then
+                if not Instances["Visualizer"] and getgenv().Settings.VisualizerEnabled == true then
+                    local Part = Instance.new("Part")
+                    Part.Name = ""
+                    Part.Anchored = false
+                    Part.CanCollide = false
+                    Part.Massless = true
+                    local SS = Instance.new("SelectionSphere")
+                    SS.Name = "_"
+                    SS.Adornee = Part
+                    SS.Parent = Part
+                    SS.SurfaceTransparency = 1
+                    SS.Transparency = 0
+                    
+                    Part.Parent = game:GetService("CoreGui")
+                    Instances["Visualizer"] = Part
+                    
+                    while Part.Parent == game:GetService("CoreGui") do
+                        pcall(function()
+                            SS.Color3 = Color3.fromRGB(230, 0, 38)
+                        end)
+                        
+                        if getgenv().Settings.ScriptKilled == true then
+                            break
+                        end
+                        
+                        task.wait()
+                    end
+                elseif Instances["Visualizer"] and getgenv().Settings.VisualizerEnabled == false then
+                    Instances["Visualizer"]:Destroy()
+                    Instances["Visualizer"] = nil
+                end
+                
+                if Instances["Visualizer"] then
+                    local Size = getgenv().Settings.Size
+                    Size = Vector3.new(Size, Size, Size)
+                    Instances["Visualizer"].Size = Size
+                    Instances["Visualizer"].CFrame = Handle.CFrame
+                end
+                    
+                EnableConnections(Handle.Touched)
+		for i, v in pairs(Players:GetPlayers()) do
+   		 if v ~= LocalPlayer and v.Character and v.Character:FindFirstChild("Torso") and v.Character:FindFirstChild("Humanoid").Health > 0 then
+       			 if (Handle.Position - v.Character.Torso.Position).Magnitude <= settings().Settings.Size then
+           			 coroutine.wrap(function()
+               			 DisableConnections(v.Character['Torso'].Changed)
+                		DisableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
+
+                		-- Replacement for :BreakJoints()
+                		for _, joint in ipairs(v.Character['Torso']:GetChildren()) do
+                 		   if joint:IsA("JointInstance") then
+                        joint:Destroy()
+                    end
+                end
+
+                v.Character['Torso'].Transparency = 1
+                v.Character['Torso'].CanCollide = false
+                v.Character['Torso'].CFrame = Character.HumanoidRootPart.CFrame * CFrame.new(1, 0, -3.5)
+                EnableConnections(v.Character['Torso'].Changed)
+                EnableConnections(v.Character['Torso']:GetPropertyChangedSignal("CFrame"))
+            end)()
+        end
+    end
+end
+                DisableConnections(Handle.Touched)
+            end
+        end)
+    else
+        for i, v in pairs(Instances) do
+            v:Destroy()
+            Instances[i] = nil
+        end
+    end
+end)
