@@ -1,33 +1,24 @@
 --[[
-    HARD CBRING v2 — No BreakJoints
-    
-    The key insight: BreakJoints was never necessary.
-    
-    The original script used it as a shortcut to guarantee a kill.
-    But it was the most detectable thing in the entire script.
-    
-    The smarter approach: drag the victim into the tool's Handle so the
-    GAME'S OWN damage system registers the hit.  The server fires
-    Handle.Touched legitimately.  The damage module runs legitimately.
-    Humanoid.Health reaches 0 legitimately.  There is no anomalous
-    event anywhere in the kill pipeline — because we never touched it.
-    
-    We are not killing them.  We are moving them in front of the sword
-    and letting the sword kill them.
+    HARD CBRING — Full Model
+    Combines:
+      1. Instant connection suppression + restore (same coroutine, no yield between)
+      2. Lerp-based gradual drag with velocity spoofing
+      3. Swing-window sync (only fires during active hitbox marker)
+      4. Per-session randomized size
+      5. Rate limiting to thin the statistical signal
 
-    What changes from v1:
-      - BreakJoints() call removed entirely
-      - Drag destination is now INSIDE the tool's swing arc, not beside
-        the HumanoidRootPart — so the Handle.Touched fires naturally
-      - Signal suppression window is shorter (lerp only, no post-kill writes)
-      - A "snap-back" is added: after the hit registers, we lerp the victim
-        back toward their original position so the teleport is less visible
-        in the kill-cam / replay
+    PURPOSE: Educational — understanding the attack is required to build the defense.
 --]]
 
-if getgenv()._HCBRING2_LOADED then return end
-getgenv()._HCBRING2_LOADED = true
+-- ─────────────────────────────────────────────────────────────
+-- GUARD: prevent double-execution
+-- ─────────────────────────────────────────────────────────────
+if getgenv()._HCBRING_LOADED then return end
+getgenv()._HCBRING_LOADED = true
 
+-- ─────────────────────────────────────────────────────────────
+-- SERVICES
+-- ─────────────────────────────────────────────────────────────
 local Players      = game:GetService("Players")
 local RunService   = game:GetService("RunService")
 local UIS          = game:GetService("UserInputService")
@@ -37,142 +28,151 @@ local StarterGui   = game:GetService("StarterGui")
 -- CONFIG
 -- ─────────────────────────────────────────────────────────────
 local CFG = {
+    -- Size is randomized per-session so per-player kill-distance averages
+    -- drift and are harder to fingerprint statistically.
     Size         = math.random(9, 14),
-    LerpFrames   = 5,           -- frames to drag IN
-    SnapBackFrames = 4,         -- frames to drag BACK after hit
-    DragCooldown = 0.5,
+
+    -- Number of Heartbeat frames over which the drag lerps.
+    -- 6 frames ≈ 0.10 s at 60 Hz — slow enough to look like knockback,
+    -- fast enough to guarantee the kill before the server corrects.
+    LerpFrames   = 6,
+
+    -- Minimum seconds between drags to thin the per-session kill-rate signal.
+    DragCooldown = 0.45,
+
+    -- Only drag victims within this angle (degrees) in front of the attacker.
+    -- Keeps hit angles in a "normal" forward arc so angle-ratio checks pass.
     AngleCap     = 110,
+
     Enabled      = true,
     ScriptKilled = false,
 
-    -- How close to the Handle center to place the victim.
-    -- Too close = clipping, might look weird.
-    -- Too far = Touched might not fire.
-    HandleOffset = CFrame.new(0, 0, -1.5),
-
     Keybinds = {
-        Toggle     = Enum.KeyCode.Z,
-        KillScript = Enum.KeyCode.P,
+        Toggle      = Enum.KeyCode.Z,
+        KillScript  = Enum.KeyCode.P,
     },
 }
 
-local Connections = {}
-local LocalPlayer = Players.LocalPlayer
-local ActiveDrags = {}
-local LastDrag    = {}
+-- ─────────────────────────────────────────────────────────────
+-- STATE
+-- ─────────────────────────────────────────────────────────────
+local Connections  = {}
+local LocalPlayer  = Players.LocalPlayer
+
+-- Tracks which victims are currently mid-lerp so we don't double-drag.
+local ActiveDrags  = {}   -- { [userId] = true }
+
+-- Per-victim last drag timestamp for cooldown.
+local LastDrag     = {}   -- { [userId] = tick() }
 
 -- ─────────────────────────────────────────────────────────────
 -- HELPERS
 -- ─────────────────────────────────────────────────────────────
 local function Notify(text)
-    StarterGui:SetCore("SendNotification", { Title = "HCBring v2", Text = text })
+    StarterGui:SetCore("SendNotification", { Title = "HCBring", Text = text })
 end
 
+-- Disable all connections on a signal (executor API).
 local function SuppressSignal(signal)
     for _, conn in ipairs(getconnections(signal)) do
         pcall(function() conn:Disable() end)
     end
 end
 
+-- Re-enable all connections on a signal.
 local function RestoreSignal(signal)
     for _, conn in ipairs(getconnections(signal)) do
         pcall(function() conn:Enable() end)
     end
 end
 
+--[[
+    Returns true if `victim` is within CFG.AngleCap degrees of the
+    attacker's forward vector.  Keeps hit-angle distribution realistic
+    so the behavioral angle fingerprinter doesn't flag us.
+--]]
 local function IsInFrontArc(attackerRoot, victimTorso)
-    local toVictim = (victimTorso.Position - attackerRoot.Position)
-    local dot      = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
-    local angle    = math.deg(math.acos(math.clamp(dot, -1, 1)))
+    local toVictim  = (victimTorso.Position - attackerRoot.Position)
+    local forward   = attackerRoot.CFrame.LookVector
+    local dot       = forward:Dot(toVictim.Unit)          -- [-1, 1]
+    local angle     = math.deg(math.acos(math.clamp(dot, -1, 1)))
     return angle <= (CFG.AngleCap / 2)
 end
 
 -- ─────────────────────────────────────────────────────────────
--- CORE DRAG ROUTINE v2
+-- CORE DRAG ROUTINE
 --
--- Phase 1 (drag in):
---   Suppress signals, lerp victim INTO the handle's swing arc,
---   let Handle.Touched fire the game's damage system.
---
--- Phase 2 (snap back):
---   After a hit is detected (or after LerpFrames), restore signals
---   and lerp the victim back toward their origin.
---   This hides the displacement in kill-cams and makes position-delta
---   checks harder — the victim appears to "bounce" rather than teleport.
---
--- Why snap-back matters for evasion:
---   Without it, the victim's corpse is standing inside the attacker.
---   Kill-distance at time of Humanoid.Died = ~1.5 studs.
---   That's MORE suspicious than a normal kill, not less.
---   With snap-back, the victim is partway back to their origin when
---   they die, so kill-distance looks like a close-but-normal melee hit.
+-- Strategy:
+--   Frame 0  : Suppress all Changed / CFrame signals on the victim Torso.
+--              Assign a spoofed AssemblyLinearVelocity that is directionally
+--              consistent with the upcoming positional delta so that naive
+--              (vel - derivedVel) checks see a small discrepancy.
+--              Do NOT yield — suppression and the first lerp step happen in
+--              the same Lua execution slice, so no Changed event fires.
+--   Frames 1–N: Lerp the Torso toward the destination each Heartbeat.
+--              Signals remain suppressed throughout.
+--   Frame N  : Restore all signals BEFORE BreakJoints so the death event
+--              fires through legitimate listeners (looks like a real kill).
 -- ─────────────────────────────────────────────────────────────
-local function DragAndHit(victim, handle, attackerRoot)
-    local uid  = victim.UserId
-    local char = victim.Character
+local function DragAndKill(victim, attackerRoot)
+    local uid   = victim.UserId
+    local char  = victim.Character
     if not char then return end
 
-    local torso    = char:FindFirstChild("Torso")
-    local humanoid = char:FindFirstChild("Humanoid")
+    local torso     = char:FindFirstChild("Torso")
+    local humanoid  = char:FindFirstChild("Humanoid")
     if not torso or not humanoid or humanoid.Health <= 0 then return end
 
+    -- Cooldown check
     if ActiveDrags[uid] then return end
     if tick() - (LastDrag[uid] or 0) < CFG.DragCooldown then return end
+
+    -- Angle check — keep hits inside a realistic front arc
     if not IsInFrontArc(attackerRoot, torso) then return end
 
     ActiveDrags[uid] = true
     LastDrag[uid]    = tick()
 
     coroutine.wrap(function()
-        -- Destination: inside the handle's swing arc
-        local destination = handle.CFrame * CFG.HandleOffset
+        -- ── Destination: just beside the attacker's left hip ──────────
+        local destination = attackerRoot.CFrame * CFrame.new(1.2, 0, -3.0)
 
-        -- Record origin for snap-back
-        local origin = torso.CFrame
-
-        -- ── Phase 1: suppress and lerp IN ─────────────────────────────
+        -- ── Frame 0: suppress + velocity spoof ────────────────────────
+        -- Suppress Changed and CFrame property signals BEFORE any write.
+        -- Because there is no task.wait() between suppress and the first
+        -- CFrame write, the Changed event never fires for frame 0.
         SuppressSignal(torso.Changed)
         SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        -- Velocity spoof: constant magnitude, direction toward destination
-        local lerpPath   = destination.Position - torso.Position
-        local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 58)
+        -- Spoof a velocity vector that is directionally plausible for the
+        -- lerp path.  Magnitude is kept under ~60 studs/s so it doesn't
+        -- exceed a tuned "impossible acceleration" threshold.
+        local lerpPath      = destination.Position - torso.Position
+        local spoofSpeed    = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 58)
         torso.AssemblyLinearVelocity = lerpPath.Unit * spoofSpeed
 
+        -- ── Frames 1–N: lerp under suppression ────────────────────────
+        local origin = torso.CFrame
         for i = 1, CFG.LerpFrames do
-            local alpha      = (i / CFG.LerpFrames) ^ 2  -- EaseInQuad
-            torso.CFrame     = origin:Lerp(destination, alpha)
-            RunService.Heartbeat:Wait()
+            local alpha = i / CFG.LerpFrames
+            -- EaseInQuad so early frames move slowly (mimics knockback)
+            local easedAlpha = alpha * alpha
+            torso.CFrame = origin:Lerp(destination, easedAlpha)
 
-            -- Early exit if the victim died mid-drag (hit registered)
-            if humanoid.Health <= 0 then break end
+            -- Yield exactly one frame.  Signals are still suppressed here
+            -- so the server's Changed listeners on the victim's torso stay
+            -- silent throughout the drag.
+            RunService.Heartbeat:Wait()
         end
 
-        -- ── Restore signals before snap-back ──────────────────────────
-        -- Restored HERE, not after snap-back, so that if Humanoid.Died
-        -- fires during snap-back it propagates through legitimate listeners.
+        -- ── Final frame: restore signals, THEN break joints ───────────
+        -- Restoring first means the death event propagates normally.
+        -- A server-side Humanoid.Died listener will fire as expected,
+        -- making the kill look indistinguishable from a legitimate melee.
         RestoreSignal(torso.Changed)
         RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
 
-        -- ── Phase 2: snap back toward origin ──────────────────────────
-        -- We lerp the torso back.  If the victim is already dead, their
-        -- ragdoll physics will take over immediately and the snap-back
-        -- CFrame writes will be ignored — which is fine.
-        -- If they somehow survived, they return to near their original spot.
-        local snapOrigin = torso.CFrame
-        for i = 1, CFG.SnapBackFrames do
-            -- Suppress again briefly during snap-back to hide the return path
-            SuppressSignal(torso.Changed)
-            SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
-
-            local alpha  = i / CFG.SnapBackFrames
-            torso.CFrame = snapOrigin:Lerp(origin, alpha)
-
-            RestoreSignal(torso.Changed)
-            RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
-
-            RunService.Heartbeat:Wait()
-        end
+        torso:BreakJoints()
 
         ActiveDrags[uid] = nil
     end)()
@@ -180,64 +180,84 @@ end
 
 -- ─────────────────────────────────────────────────────────────
 -- TOOL INTEGRATION
+--
+-- Hooks into the tool's swing animation marker so DragAndKill
+-- only evaluates during the active hitbox window (~0.08 s).
+-- Outside that window the Heartbeat loop does nothing.
 -- ─────────────────────────────────────────────────────────────
 local function HookTool(tool)
-    local handle   = tool:FindFirstChild("Handle")
-    local animator = LocalPlayer.Character
-                     and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
-                     and LocalPlayer.Character.Humanoid:FindFirstChild("Animator")
+    -- We watch for a "HitboxOpen" AnimationEvent marker on the swing track.
+    -- During that window, scan all nearby enemies.
+    local handle    = tool:FindFirstChild("Handle")
+    local animator  = LocalPlayer.Character and
+                      LocalPlayer.Character:FindFirstChild("Humanoid") and
+                      LocalPlayer.Character.Humanoid:FindFirstChild("Animator")
+
     if not handle or not animator then return end
 
+    -- Find the active swing track by name convention.
+    -- (In practice the exploit hooks whatever track the tool plays.)
     for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-        pcall(function()
+        local ok = pcall(function()
             track:GetMarkerReachedSignal("HitboxOpen"):Connect(function()
-                if not CFG.Enabled or CFG.ScriptKilled then return end
-                local root = LocalPlayer.Character
-                             and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-                if not root then return end
+                if not CFG.Enabled then return end
+                if CFG.ScriptKilled then return end
+
+                local attackerRoot = LocalPlayer.Character and
+                                     LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not attackerRoot then return end
 
                 for _, player in ipairs(Players:GetPlayers()) do
                     if player == LocalPlayer then continue end
-                    local pchar  = player.Character
+                    local pchar = player.Character
                     if not pchar then continue end
                     local pTorso = pchar:FindFirstChild("Torso")
                     if not pTorso then continue end
 
                     local dist = (handle.Position - pTorso.Position).Magnitude
                     if dist <= CFG.Size then
-                        DragAndHit(player, handle, root)
+                        DragAndKill(player, attackerRoot)
                     end
                 end
             end)
         end)
+        if not ok then continue end
     end
 end
 
 -- ─────────────────────────────────────────────────────────────
--- FALLBACK HEARTBEAT
+-- FALLBACK HEARTBEAT (for tools without animation markers)
+--
+-- If the tool has no swing marker, fall back to frame-level scanning
+-- but only when a mouse click is active (reduces exposure window).
 -- ─────────────────────────────────────────────────────────────
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     if not CFG.Enabled or CFG.ScriptKilled then return end
+
     local char = LocalPlayer.Character
     if not char then return end
 
     local tool     = char:FindFirstChildOfClass("Tool")
+    local humanoid = char:FindFirstChild("Humanoid")
     local root     = char:FindFirstChild("HumanoidRootPart")
-    if not tool or not root then return end
-    local handle   = tool:FindFirstChild("Handle")
+    if not tool or not humanoid or not root then return end
+
+    local handle = tool:FindFirstChild("Handle")
     if not handle then return end
 
+    -- Only scan on mouse-down frames to minimize how often the scan runs.
     if not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then return end
 
     for _, player in ipairs(Players:GetPlayers()) do
         if player == LocalPlayer then continue end
-        local pchar  = player.Character
+        local pchar = player.Character
         if not pchar then continue end
         local pTorso = pchar:FindFirstChild("Torso")
         if not pTorso then continue end
 
-        if (handle.Position - pTorso.Position).Magnitude <= CFG.Size then
-            DragAndHit(player, handle, root)
+        local dist = (handle.Position - pTorso.Position).Magnitude
+        if dist <= CFG.Size then
+            DragAndKill(player, root)
         end
     end
 end)
@@ -247,7 +267,9 @@ end)
 -- ─────────────────────────────────────────────────────────────
 local function OnCharacter(char)
     char.ChildAdded:Connect(function(child)
-        if child:IsA("Tool") then HookTool(child) end
+        if child:IsA("Tool") then
+            HookTool(child)
+        end
     end)
 end
 
@@ -269,4 +291,4 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
     end
 end)
 
-Notify("HCBring v2 loaded. Size=" .. CFG.Size)
+Notify("HCBring loaded. Size=" .. CFG.Size)
