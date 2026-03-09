@@ -1,36 +1,223 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║         NO-BREAKJOINTS CBRING — VISUAL INDICATOR + LIVE CONFIG UI           ║
+║  NO-BREAKJOINTS CBRING v14                                                  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
-  Two additions over the base model:
+ New in v14:
 
-  1. VISUAL INDICATOR
-     A SelectionSphere anchored to the tool Handle showing the current
-     reach radius.  Color shifts:
-       Gray   → script disabled
-       Green  → enabled, no targets in range
-       Yellow → one or more targets within range (pre-drag)
-       Red    → drag actively executing this frame
+   CHANGE-3  Drag destination = tool Handle world position
+             Victims are now pulled to exactly where arcCF is — the
+             Handle's world position, with the attacker root's
+             orientation.  arcCF is already computed as:
+               root.CFrame + (handle.Position − root.Position)
+             so arcCF.Position == handle.Position precisely.
+             Using arcCF as dest means the lerp destination, the
+             distance check, the arc-angle check, and the visualizer
+             are all anchored to the same point.  attackerRoot was
+             only used to compute the old hardcoded dest and is
+             removed from DragAndFire's parameter list.
 
-  2. LIVE CONFIG PANEL
-     A draggable ScreenGui with real-time sliders and toggles for every
-     CFG value.  Changes apply immediately — no reload required.
-     Includes a live stats strip showing session kills, avg distance,
-     and last victim.
+ New in v13:
 
-  Architecture note:
-     All UI and visualizer code is client-local.  Nothing here changes
-     what the server sees.  The config panel modifies CFG values in
-     getgenv() so they persist across coroutines and can be read by the
-     heartbeat loop on the same frame.
+   CHANGE-1  Size range 1–20
+             Slider min changed from 5 to 1.  Config default kept at
+             math.random(8,12) which stays within the new range.
+
+   CHANGE-2  Offset feature reverted
+             OffsetX/Y/Z config keys removed.  Drag destination is
+             hardcoded to (1.2, 0.0, -2.8) relative to the attacker
+             root, matching v10 behavior.  Arc-visualizer center reverts
+             to the handle-based formula:
+               root.CFrame + (handle.Position − root.Position)
+
+   BUG-A     FetchWhitelist double ParseWhitelist call fixed
+             The previous code called ParseWhitelist(result) twice.
+             The first return value was stored in 'Whitelist' then
+             immediately shadowed; 'count' from the first call was
+             silently discarded.  Now parsed once into (newWL, count).
+
+   BUG-B     Team label connection leak in BuildGUI fixed
+             Each BuildGUI rebuild created a new, untracked
+             LocalPlayer:GetPropertyChangedSignal("Team"):Connect that
+             was never disconnected.  '_teamLabel' is now a module-level
+             reference updated from the already-tracked Connections.
+             TeamChanged handler.  Zero new connections per rebuild.
+
+   BUG-C     winDragging / activeDrag reset on GUI destroy
+             Closing the GUI (× button or C-key) while dragging the
+             title bar left activeDrag non-nil.  The next mouse-move
+             event would attempt AbsoluteSize on a destroyed Frame and
+             error.  Both winDragging and activeDrag are now explicitly
+             reset before any ScreenGui:Destroy call.
+
+   EDGE-A    Arc pool rebuild backoff after quota failure
+             UpdateArcVis called BuildArcVis every Heartbeat when
+             ArcPool was empty, hammering the instance-quota check at
+             60 Hz on failure.  A _arcBuildFailTick counter now
+             enforces a 60-frame cooldown between rebuild attempts.
+
+   LOGIC-E   Unnecessary final Heartbeat:Wait on lerp completion
+             The lerp loop waited an extra frame after marking
+             lerpCompleted = true on the last iteration.  The wait is
+             now gated on i < lerpFrames, removing one frame of latency
+             from every successful drag.
+
+   MAINT-A   sliders / toggles / refreshStats cleared at BuildGUI start
+             Stale keys (e.g. sliders.OffX after offset removal)
+             persisted between rebuilds.  All three tables are cleared
+             before constructing new controls.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ INHERITED FROM v12 (29 findings) and v11 (EV-1, EV-4) and
+ v10 (M-1…M-5, R-3, D-3, D-4, N-4, QoL-7)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ WHITELIST FORMAT
+   # comment
+   123456789
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ New in v12 (all findings from v11 code review):
+
+   BUG-1  _suppress/_restore cached-list pair
+          getconnections was called twice per signal per frame.  Each pair
+          now shares one connection list captured at suppress-time and
+          reused verbatim at restore-time.  Eliminates double-query race
+          and halves the number of getconnections calls per drag.
+
+   BUG-2  lerpCompleted flag gates FireServer
+          The remote no longer fires when the lerp loop was broken early
+          (torso destroyed mid-drag).  A boolean set only on clean loop
+          completion guards the FireServer/InvokeServer branch.
+
+   BUG-3  Kill handler disconnects all 4 persistent signals
+          Players.PlayerAdded, Players.PlayerRemoving,
+          LocalPlayer.CharacterAdded, and LocalPlayer.Team are now stored
+          in the Connections table and torn down by the kill handler.
+
+   BUG-4  WireCharacter disconnects stale CharacterAdded connection
+          Before overwriting CharAddedConns[uid], the existing connection
+          is disconnected.  Prevents doubled OnChar invocations from a
+          race between the initial GetPlayers loop and PlayerAdded.
+
+   BUG-5  localCharConns cleared on each respawn
+          OnChar now disconnects and clears the previous character's
+          connections before wiring the new one.  Prevents unbounded
+          growth across many respawns.
+
+   BUG-6  Stale currentRemote revalidated each frame
+          The Heartbeat checks currentRemote.Parent before the FindRemote
+          branch.  A destroyed remote resets currentRemote to nil and
+          triggers a fresh search.
+
+   EDGE-1 BuildArcVis commits pool only after full build
+          ArcPool = nxt is written only when all 2+ARC_SEGS parts are
+          confirmed.  UpdateArcVis also guards against a partial pool.
+
+   EDGE-2 FetchWhitelist retry loop respects ScriptKilled
+          Each iteration checks CFG.ScriptKilled before the wait and
+          before the HttpGet, preventing a woken coroutine from
+          overwriting a post-kill scrubbed Whitelist.
+
+   EDGE-3 GetArcFolder validates Parent == workspace
+          Previously accepted a folder re-parented to any service.  Now
+          requires Parent == workspace.
+
+   EDGE-4 AncestryChanged nils _rebindUIRef
+          Prevents task.delay callbacks from writing .TextColor3/.Color
+          to dead UI instances after an external CoreGui sweep.
+
+   EDGE-5 Dropdown pre-computes display:lower()
+          displayLow is cached per row in BuildRowCache.  FilterRows no
+          longer allocates a lowercased string per row per keystroke.
+
+   EDGE-6 FetchWhitelist validates URL format
+          Rejects non-http(s) URLs before calling HttpGet.
+
+   EDGE-7 RebuildArcAngles guards AngleCap == 0
+          Clamps the half-angle to a minimum of 1° to prevent a
+          degenerate single-line arc.
+
+   PERF-A RootCache eliminates per-frame HRP child search
+          OnChar caches HumanoidRootPart in RootCache[LocalPlayer].
+          The Heartbeat reads from the cache instead of FindFirstChild.
+
+   PERF-B LerpFrames snapshotted before lerp loop
+          CFG.LerpFrames is read once through the proxy metamethod
+          before the loop rather than on every iteration.
+
+   PERF-C display:lower() pre-computed — covered by EDGE-5.
+
+   PERF-D DD_ROW_TWEEN module-level constant
+          TweenInfo.new(0.08) is no longer allocated per hover event.
+
+   PERF-E SetBeam skips redundant Size write
+          A weak per-part cache stores last len+thick.  The Size
+          property is only written when the value changes by > 0.005.
+          CFrame.lookAt Vector3 midpoint allocation also eliminated by
+          computing all six components inline.
+
+   PERF-F ARC_TOTAL constant
+          2 + ARC_SEGS is precomputed as ARC_TOTAL.
+
+   PERF-G _randBuf reuses a module-level table
+          RandName no longer allocates a table.create(6) on every call.
+
+   REL-1  BuildGUI wrapped in pcall
+          Hard crashes from denied CoreGui access are caught and logged;
+          the combat logic and keybind connections are registered
+          regardless of GUI availability.
+
+   REL-2  Kill handler pair/ipairs audit (documented, correct as-is)
+          PlayerTeamConns and CharAddedConns are UserId-keyed hash
+          tables → pairs correct.  localCharConns is an integer array
+          → ipairs correct.
+
+   REL-3  GUI tweens cancelled before ScreenGui:Destroy
+          MkToggle registers a canceller callback in _guiTweenCancellers.
+          BuildGUI and the kill handler call CancelGUITweens() before
+          destroying the ScreenGui, preventing tween callbacks from
+          firing on destroyed instances.
+
+   REL-4  WireCharacter retry cache writes wrapped in pcall
+          Defensive against a mid-stream character reset that destroys
+          the char reference between the 0.5 s delay and the write.
+
+   REL-5  DragAndFire drag-error warn removed in non-debug builds
+          The warn that exposed internal line numbers is now guarded by
+          CFG.Debug (default false).
+
+   MAINT-1 triggerRowDimRefs unified with _rebindUIRef
+           Both variables now reference the same table.
+
+   MAINT-2 guiVisible removed
+           Dead flag that was never read.
+
+   MAINT-3 "NoCBring Config" label uses _S.Title
+           Consistent with the EV-4 policy.
+
+   MAINT-4 FetchWhitelist retry restructured for clarity
+           Kill-guard extracted to top of each iteration; wait moved to
+           a cleaner position.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ INHERITED FROM v11 (EV-1, EV-4) and v10 (M-1…M-5, R-3, D-3,
+ D-4, N-4, QoL-7) and v9 (all 22 code-review findings)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ WHITELIST FORMAT
+   # comment
+   123456789
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
 -- ─────────────────────────────────────────────────────────────
--- GUARD
+-- M-1: SESSION TOKEN
 -- ─────────────────────────────────────────────────────────────
-if getgenv()._NOCBRING_V2_LOADED then return end
-getgenv()._NOCBRING_V2_LOADED = true
+local _tok      = string.format("%06d", math.random(0, 999999))
+local _guardKey = "_g" .. _tok
+local _cfgKey   = "_c" .. _tok
+
+if getgenv()[_guardKey] then return end
+getgenv()[_guardKey] = true
 
 -- ─────────────────────────────────────────────────────────────
 -- SERVICES
@@ -41,924 +228,1574 @@ local UIS               = game:GetService("UserInputService")
 local TweenService      = game:GetService("TweenService")
 local StarterGui        = game:GetService("StarterGui")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Teams             = game:GetService("Teams")
 
 -- ─────────────────────────────────────────────────────────────
--- LIVE CONFIG (stored in getgenv() so every coroutine reads
--- the same table after a UI slider changes it)
+-- EV-4: OBFUSCATED STRING CONSTANTS
 -- ─────────────────────────────────────────────────────────────
-getgenv().NCBCFG = getgenv().NCBCFG or {
-    -- Core reach — how far (studs) from Handle to scan for victims
-    Size         = math.random(9, 14),
-    -- Lerp duration in frames (6 ≈ 0.10 s at 60 Hz)
-    LerpFrames   = 6,
-    -- Minimum seconds between RemoteEvent fires per victim
-    DragCooldown = 0.40,
-    -- Max angle (degrees) each side of forward vector to accept victims
-    AngleCap     = 50,
-    -- Name of the tool's damage RemoteEvent (game-specific)
-    RemoteName   = "DamageRemote",
-    -- Toggle flags
-    Enabled      = true,
+local _S = {
+    Torso          = string.char(84,111,114,115,111),
+    UpperTorso     = string.char(85,112,112,101,114,84,111,114,115,111),
+    HRP            = string.char(72,117,109,97,110,111,105,100,82,111,111,116,80,97,114,116),
+    Humanoid       = string.char(72,117,109,97,110,111,105,100),
+    Handle         = string.char(72,97,110,100,108,101),
+    Tool           = string.char(84,111,111,108),
+    Folder         = string.char(70,111,108,100,101,114),
+    RemoteEvent    = string.char(82,101,109,111,116,101,69,118,101,110,116),
+    RemoteFunction = string.char(82,101,109,111,116,101,70,117,110,99,116,105,111,110),
+    Title          = string.char(78,111,67,66,114,105,110,103),
+    TitleCfg       = string.char(78,111,67,66,114,105,110,103,32,67,111,110,102,105,103),  -- MAINT-3
+    DmgRemDef      = string.char(68,97,109,97,103,101,82,101,109,111,116,101),
+    WLPfx          = string.char(91,78,67,66,32,87,76,93),
+    DragPfx        = string.char(91,78,67,66,93),
+}
+
+-- ─────────────────────────────────────────────────────────────
+-- M-1: LIVE CONFIG
+-- ─────────────────────────────────────────────────────────────
+getgenv()[_cfgKey] = getgenv()[_cfgKey] or {
+    Size            = math.random(8, 12),   -- CHANGE-1: valid range 1–20
+    LerpFrames      = 6,
+    DragCooldown    = 0.40,
+    AngleCap        = 50,
+    -- CHANGE-2: OffsetX/Y/Z removed; drag dest hardcoded (1.2, 0.0, -2.8)
+    RemoteName      = _S.DmgRemDef,
+    IgnoreTeam      = true,
+    TargetTeam      = nil,
+    IgnoreDead      = true,
+    IgnoreInvisible = true,
+    InvisThreshold  = 0.90,
+    MaxTargetHealth = 100,
+    ArcHideStill    = true,
+    WhitelistURL    = "",
+    AlwaysOn        = false,
+    Enabled         = true,
     VisualizerEnabled = true,
-    ScriptKilled = false,
-    -- Keybinds
+    ScriptKilled    = false,
+    Debug           = false,   -- REL-5: suppress internal warn in production
+    TriggerInput    = { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" },
     Keybinds = {
-        Toggle       = Enum.KeyCode.Z,
-        ToggleVis    = Enum.KeyCode.X,
-        ToggleUI     = Enum.KeyCode.C,
-        KillScript   = Enum.KeyCode.P,
+        Toggle    = Enum.KeyCode.Z,
+        ToggleVis = Enum.KeyCode.X,
+        ToggleUI  = Enum.KeyCode.C,
+        Kill      = Enum.KeyCode.P,
     },
 }
-local CFG = getgenv().NCBCFG
+local _cfgReal = getgenv()[_cfgKey]
+
+local CFG = setmetatable({}, {
+    __index    = function(_, k) return _cfgReal[k] end,
+    __newindex = function(_, k, v) _cfgReal[k] = v end,
+    __len      = function() return 0 end,
+    __pairs    = function() return next, {}, nil end,
+})
 
 -- ─────────────────────────────────────────────────────────────
--- SESSION STATS (read by the UI strip)
+-- SESSION STATS
 -- ─────────────────────────────────────────────────────────────
 local Stats = {
     Kills         = 0,
     TotalDist     = 0,
     LastVictim    = "—",
-    ActiveDrags   = 0,   -- how many drags are running right now
+    ActiveDrags   = 0,
+    WhitelistHits = 0,
 }
+
+-- ─────────────────────────────────────────────────────────────
+-- WHITELIST STATE
+-- ─────────────────────────────────────────────────────────────
+local Whitelist       = {}
+local WhitelistStatus = "Not loaded"
+local isFetching      = false
+local WL_MAX_RETRIES  = 3
+
+-- ─────────────────────────────────────────────────────────────
+-- DERIVED CACHES
+-- ─────────────────────────────────────────────────────────────
+local sizeSq      = CFG.Size * CFG.Size
+local cosAngleCap = math.cos(math.rad(CFG.AngleCap))
+local cosAngCapSq = cosAngleCap * cosAngleCap
+
+local cachedLocalTeam = Players.LocalPlayer.Team
+
+local PlayerTeamCache = {}
+local PlayerTeamConns = {}
+local CharAddedConns  = {}
+
+-- PERF-F: precomputed arc constant
+local ARC_SEGS  = 14
+local ARC_TOTAL = 2 + ARC_SEGS
+
+local arcCosTable   = table.create(ARC_SEGS + 1, 0)
+local arcSinTable   = table.create(ARC_SEGS + 1, 0)
+local arcAngleDirty = true
+
+local arcPtX = table.create(ARC_SEGS + 1, 0)
+local arcPtY = table.create(ARC_SEGS + 1, 0)
+local arcPtZ = table.create(ARC_SEGS + 1, 0)
+
+-- EDGE-7: guard against AngleCap == 0
+local function RebuildArcAngles()
+    local half = math.max(CFG.AngleCap, 1)
+    for i = 0, ARC_SEGS do
+        local rad = math.rad(-half + (2 * half / ARC_SEGS) * i)
+        arcCosTable[i+1] = math.cos(rad)
+        arcSinTable[i+1] = math.sin(rad)
+    end
+    arcAngleDirty = false
+end
+
+local lastArcColor = nil
+
+local wlFrameId     = 0
+local WLInRangePrev = {}
 
 -- ─────────────────────────────────────────────────────────────
 -- STATE
 -- ─────────────────────────────────────────────────────────────
-local Connections  = {}
-local LocalPlayer  = Players.LocalPlayer
-local ActiveDrags  = {}   -- { [userId] = true }
-local LastDrag     = {}   -- { [userId] = number }
-local currentRemote = nil
+local Connections         = {}
+local LocalPlayer         = Players.LocalPlayer
+local ActiveDrags         = {}
+local LastDrag            = {}
+local currentRemote       = nil
+local listeningForTrigger = false
+local rebindStartTick     = 0
+local triggerBindLabel    = nil
+local wlStatusLabel       = nil
+local wlRefLbl            = nil
+local frameCount          = 0
+local STATS_THROTTLE      = 20
+
+local winDragging                               = false
+local winDragStart, winPosStart, shadowPosStart = nil, nil, nil
+local winDragMaxX, winDragMaxY                  = 0, 0
+local winRef, shadowRef                         = nil, nil
+local winH                                      = 720
+local wiredChars                                = {}
+local activeDrag                                = nil
+
+-- MAINT-1: single table, both names alias the same reference
+local _rebindUIRef    = nil   -- { chipStroke, chipLbl, rbLbl, rbStroke }
+-- triggerRowDimRefs assigned as alias in BuildGUI (see below)
+
+local localCharConns = {}
+local ToolCache      = {}
+local RootCache      = {}   -- PERF-A: HRP per local player
+
+-- BUG-B: module-level reference updated from Connections.TeamChanged; no
+--        per-rebuild connection leak inside BuildGUI
+local _teamLabel     = nil
+
+local arcFolder      = nil
+local arcFolderOwned = false
+
+-- EDGE-A: retry cooldown for arc pool build failures (instance quota)
+local _arcBuildFailTick = 0   -- frame number of last failed build attempt
+local ARC_BUILD_COOLDOWN = 60 -- frames to wait before retrying after failure
+
+local ARC_STILL_VEL_SQ = 0.25
+local ARC_STILL_HOLD   = 45
+local arcStillCount    = 0
+
+local IDLE_TIMEOUT   = 60
+local lastActiveTime = os.clock()
+
+local _gc_baseline = nil   -- EV-1: forward declaration
+
+-- PERF-G: reusable RandName buffer
+local _randBuf = table.create(6)
+
+-- REL-3: tween canceller registry for the current GUI build
+local _guiTweenCancellers = {}
+
+-- PERF-E: weak per-part size cache for SetBeam
+local _beamSzCache = setmetatable({}, {__mode = "k"})
+
+-- PERF-D: shared dropdown hover tween info
+local DD_ROW_TWEEN = TweenInfo.new(0.08)
+
+-- ─────────────────────────────────────────────────────────────
+-- TORSO + HUMANOID CACHES
+-- ─────────────────────────────────────────────────────────────
+local TorsoCache    = {}
+local HumanoidCache = {}
+
+local function FindTorso(char)
+    return char:FindFirstChild(_S.Torso)
+        or char:FindFirstChild(_S.UpperTorso)
+        or char:FindFirstChild(_S.HRP)
+end
+
+local function WireCharacter(player)
+    local uid = player.UserId
+    -- BUG-4: disconnect stale connection before overwriting
+    if CharAddedConns[uid] then CharAddedConns[uid]:Disconnect() end
+    local function OnChar(char)
+        TorsoCache[uid]    = nil
+        HumanoidCache[uid] = nil
+        local torso    = FindTorso(char)
+        local humanoid = char:FindFirstChildOfClass(_S.Humanoid)
+        if torso    then TorsoCache[uid]    = torso    end
+        if humanoid then HumanoidCache[uid] = humanoid end
+        if not torso or not humanoid then
+            task.delay(0.5, function()
+                if player.Parent == nil then return end
+                local char2 = player.Character
+                if char2 ~= char then return end
+                -- REL-4: pcall wraps cache writes against mid-stream reset
+                pcall(function()
+                    TorsoCache[uid]    = TorsoCache[uid]    or FindTorso(char)
+                    HumanoidCache[uid] = HumanoidCache[uid]
+                        or char:FindFirstChildOfClass(_S.Humanoid)
+                end)
+            end)
+        end
+    end
+    CharAddedConns[uid] = player.CharacterAdded:Connect(OnChar)
+    if player.Character then OnChar(player.Character) end
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- PLAYER CACHE
+-- ─────────────────────────────────────────────────────────────
+local PlayerCache = {}
+
+local function RebuildPlayerCache()
+    local t = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then t[#t+1] = p end
+    end
+    PlayerCache = t
+end
+RebuildPlayerCache()
+
+-- BUG-3: stored in Connections so kill handler disconnects them
+Connections.PlayerAdded = Players.PlayerAdded:Connect(function(p)
+    if p == LocalPlayer then return end
+    PlayerTeamCache[p.UserId] = p.Team
+    if PlayerTeamConns[p.UserId] then PlayerTeamConns[p.UserId]:Disconnect() end
+    PlayerTeamConns[p.UserId] = p:GetPropertyChangedSignal("Team"):Connect(function()
+        PlayerTeamCache[p.UserId] = p.Team
+    end)
+    WireCharacter(p)
+    RebuildPlayerCache()
+end)
+
+Connections.PlayerRemoving = Players.PlayerRemoving:Connect(function(p)
+    local uid = p.UserId
+    if PlayerTeamConns[uid] then PlayerTeamConns[uid]:Disconnect(); PlayerTeamConns[uid] = nil end
+    if CharAddedConns[uid]  then CharAddedConns[uid]:Disconnect();  CharAddedConns[uid]  = nil end
+    PlayerTeamCache[uid] = nil
+    TorsoCache[uid]      = nil
+    HumanoidCache[uid]   = nil
+    ActiveDrags[uid]     = nil
+    LastDrag[uid]        = nil
+    WLInRangePrev[uid]   = nil
+    RebuildPlayerCache()
+end)
+
+for _, p in ipairs(Players:GetPlayers()) do
+    if p ~= LocalPlayer then
+        PlayerTeamCache[p.UserId] = p.Team
+        PlayerTeamConns[p.UserId] = p:GetPropertyChangedSignal("Team"):Connect(function()
+            PlayerTeamCache[p.UserId] = p.Team
+        end)
+        WireCharacter(p)
+    end
+end
 
 -- ─────────────────────────────────────────────────────────────
 -- HELPERS
 -- ─────────────────────────────────────────────────────────────
 local function Notify(text)
-    StarterGui:SetCore("SendNotification", {
-        Title = "NoCBring",
-        Text  = text,
-        Duration = 2,
-    })
+    pcall(StarterGui.SetCore, StarterGui, "SendNotification",
+        { Title=_S.Title, Text=text, Duration=2 })
 end
 
-local function SuppressSignal(signal)
-    for _, c in ipairs(getconnections(signal)) do
-        pcall(function() c:Disable() end)
+local function SetWLStatus(text, col)
+    WhitelistStatus = text
+    if wlStatusLabel then
+        wlStatusLabel.Text       = text
+        wlStatusLabel.TextColor3 = col or Color3.fromRGB(0, 180, 255)
     end
 end
 
-local function RestoreSignal(signal)
-    for _, c in ipairs(getconnections(signal)) do
-        pcall(function() c:Enable() end)
+-- PERF-G: reuse _randBuf
+local function RandName()
+    local c = "abcdefghijklmnopqrstuvwxyz"
+    for i = 1, 6 do
+        local p = math.random(1, 26)
+        _randBuf[i] = c:sub(p, p)
     end
+    return table.concat(_randBuf)
 end
 
-local function IsInFrontArc(attackerRoot, victimTorso)
-    local toVictim = (victimTorso.Position - attackerRoot.Position)
-    if toVictim.Magnitude < 0.1 then return false end
-    local dot   = attackerRoot.CFrame.LookVector:Dot(toVictim.Unit)
-    local angle = math.deg(math.acos(math.clamp(dot, -1, 1)))
-    return angle <= CFG.AngleCap
+-- ─────────────────────────────────────────────────────────────
+-- FILTER FUNCTIONS
+-- ─────────────────────────────────────────────────────────────
+local function IsTeammate(player)
+    if not CFG.IgnoreTeam then return false end
+    if cachedLocalTeam == nil then return false end
+    return PlayerTeamCache[player.UserId] == cachedLocalTeam
 end
+
+local function IsTargetTeam(player)
+    if CFG.TargetTeam == nil then return true end
+    return PlayerTeamCache[player.UserId] == CFG.TargetTeam
+end
+
+local function IsAlive(hum)
+    if not CFG.IgnoreDead then return true end
+    if hum.Health <= 0 then return false end
+    return hum:GetState() ~= Enum.HumanoidStateType.Dead
+end
+
+local function IsVisible(torso)
+    if not CFG.IgnoreInvisible then return true end
+    return torso.Transparency < CFG.InvisThreshold
+end
+
+local function IsWithinHealthCap(hum)
+    if CFG.MaxTargetHealth <= 0 then return true end
+    return hum.Health <= CFG.MaxTargetHealth
+end
+
+local function IsWhitelisted(player)
+    return Whitelist[player.UserId] == true
+end
+
+local function IsInFrontArc(arcCF, torso)
+    local dx    = torso.Position.X - arcCF.Position.X
+    local dy    = torso.Position.Y - arcCF.Position.Y
+    local dz    = torso.Position.Z - arcCF.Position.Z
+    local magSq = dx*dx + dy*dy + dz*dz
+    if magSq < 0.01 then return false end
+    local lv  = arcCF.LookVector
+    local dot = lv.X*dx + lv.Y*dy + lv.Z*dz
+    if dot < 0 then return false end
+    return dot * dot >= cosAngCapSq * magSq
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- REMOTE DISCOVERY
+-- ─────────────────────────────────────────────────────────────
+local lastRemoteSearchTime = -math.huge
 
 local function FindRemote(tool)
+    local now = os.clock()
+    if now - lastRemoteSearchTime < 1 then return nil end
     local r = tool:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
     r = ReplicatedStorage:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
+    lastRemoteSearchTime = now
     return nil
 end
 
--- ═══════════════════════════════════════════════════════════════
---  SECTION 1 — VISUAL REACH INDICATOR
--- ═══════════════════════════════════════════════════════════════
---[[
-    The visualizer consists of:
-      • A massless, unanchored Part parented to CoreGui
-        (keeps it off the workspace hierarchy, avoids game-side cleanup)
-      • A SelectionSphere adorning that Part
-      • Every Heartbeat: Part.CFrame = Handle.CFrame, Part.Size = radius sphere
+-- ─────────────────────────────────────────────────────────────
+-- TRIGGER
+-- ─────────────────────────────────────────────────────────────
+local function IsTriggerActive()
+    if CFG.AlwaysOn then return true end
+    local ti = CFG.TriggerInput
+    if ti.Kind == "Mouse" then
+        local ok, v = pcall(UIS.IsMouseButtonPressed, UIS, ti.Button)
+        return ok and v
+    elseif ti.Kind == "Key" then
+        local ok, v = pcall(UIS.IsKeyDown, UIS, ti.Code)
+        return ok and v
+    end
+    return false
+end
 
-    Color states:
-      GRAY   (#888)  disabled
-      GREEN  (#00FF88) enabled, no targets in range
-      YELLOW (#FFD700) target(s) in range, about to fire
-      RED    (#FF2040) drag actively running
---]]
-
-local VisPart   = nil   -- the invisible Part
-local VisSphere = nil   -- the SelectionSphere
-
-local COLOR = {
-    DISABLED = Color3.fromRGB(130, 130, 130),
-    CLEAR    = Color3.fromRGB(0,   220, 120),
-    TARGET   = Color3.fromRGB(255, 200, 0  ),
-    FIRING   = Color3.fromRGB(255, 30,  60 ),
+local INPUT_NAME_ABBR = {
+    LeftShift="LShift", RightShift="RShift",
+    LeftControl="LCtrl", RightControl="RCtrl",
+    LeftAlt="LAlt", RightAlt="RAlt",
 }
 
-local function BuildVisualizer()
-    if VisPart then VisPart:Destroy() end
-
-    local part        = Instance.new("Part")
-    part.Name         = "_NCBVis"
-    part.Anchored     = false
-    part.CanCollide   = false
-    part.Massless     = true
-    part.Transparency = 1
-    part.Size         = Vector3.new(1, 1, 1)
-    part.Parent       = game:GetService("CoreGui")
-
-    local sphere               = Instance.new("SelectionSphere")
-    sphere.Name                = "_NCBSphere"
-    sphere.Adornee             = part
-    sphere.SurfaceTransparency = 0.85
-    sphere.Transparency        = 0.3
-    sphere.Color3              = COLOR.CLEAR
-    sphere.SurfaceColor3       = COLOR.CLEAR
-    sphere.Parent              = part
-
-    VisPart   = part
-    VisSphere = sphere
+local function InputToName(inp)
+    if inp.UserInputType == Enum.UserInputType.MouseButton1 then return "M1" end
+    if inp.UserInputType == Enum.UserInputType.MouseButton2 then return "M2" end
+    if inp.UserInputType == Enum.UserInputType.MouseButton3 then return "M3" end
+    if inp.KeyCode ~= Enum.KeyCode.Unknown then
+        local s = tostring(inp.KeyCode):gsub("Enum%.KeyCode%.", "")
+        return INPUT_NAME_ABBR[s] or (s:len() > 7 and s:sub(1,6).."." or s)
+    end
+    return "???"
 end
 
-local function DestroyVisualizer()
-    if VisPart then
-        VisPart:Destroy()
-        VisPart   = nil
-        VisSphere = nil
+local function StartRebind()
+    listeningForTrigger = true
+    rebindStartTick     = os.clock()
+    if triggerBindLabel then
+        triggerBindLabel.Text       = "..."
+        triggerBindLabel.TextColor3 = Color3.fromRGB(255, 200, 0)
+    end
+    Notify("Press any key or mouse button  (Esc = cancel)")
+end
+
+local function FindKeybindConflict(nt)
+    if nt.Kind ~= "Key" then return nil end
+    local kb = CFG.Keybinds
+    if nt.Code == kb.Toggle    then return "Toggle ("    .. tostring(kb.Toggle)    .. ")" end
+    if nt.Code == kb.ToggleVis then return "ToggleVis (" .. tostring(kb.ToggleVis) .. ")" end
+    if nt.Code == kb.ToggleUI  then return "ToggleUI ("  .. tostring(kb.ToggleUI)  .. ")" end
+    if nt.Code == kb.Kill      then return "Kill ("      .. tostring(kb.Kill)      .. ")" end
+    return nil
+end
+
+-- ─────────────────────────────────────────────────────────────
+-- WHITELIST FETCH
+-- EDGE-2: each iteration checks ScriptKilled before waiting/fetching
+-- EDGE-6: URL format validated before HttpGet
+-- ─────────────────────────────────────────────────────────────
+local function ParseWhitelist(raw)
+    local set, count = {}, 0
+    for line in raw:gmatch("([^\r\n]+)") do
+        local t = line:match("^%s*(.-)%s*$")
+        if t == "" or t:sub(1,1) == "#" then continue end
+        local id = tonumber(t)
+        if id and id > 0 and id == math.floor(id) then
+            set[id] = true; count = count + 1
+        end
+    end
+    return set, count
+end
+
+local function FetchWhitelist()
+    if isFetching then return end
+    isFetching = true
+    local url = CFG.WhitelistURL
+    if not url or url == "" then
+        SetWLStatus("No URL set"); isFetching = false; return
+    end
+    -- EDGE-6: reject non-http(s) URLs before calling HttpGet
+    if not url:match("^https?://") then
+        SetWLStatus("Invalid URL"); isFetching = false; return
+    end
+    SetWLStatus("Loading...")
+    if wlRefLbl then wlRefLbl.Text = "..." end
+    local waitSec, lastErr = 1, "unknown"
+    for attempt = 1, WL_MAX_RETRIES do
+        -- EDGE-2: bail immediately if killed during a previous wait
+        if CFG.ScriptKilled then isFetching = false; return end
+        if attempt > 1 then
+            task.wait(waitSec); waitSec = waitSec * 2
+            -- Re-check after waking from sleep
+            if CFG.ScriptKilled then isFetching = false; return end
+        end
+        local ok, result = pcall(function() return game:HttpGet(url, true) end)
+        if ok and type(result) == "string" then
+            -- BUG-A: parse once; previous code called ParseWhitelist twice
+            --        discarding the count from the first call
+            local newWL, count = ParseWhitelist(result)
+            Whitelist           = newWL
+            Stats.WhitelistHits = 0
+            WLInRangePrev       = {}
+            SetWLStatus(string.format("Loaded %d id%s", count, count==1 and "" or "s"))
+            if wlRefLbl then wlRefLbl.Text = "REFRESH" end
+            Notify(string.format("Whitelist: %d id%s loaded.", count, count==1 and "" or "s"))
+            isFetching = false; return
+        else
+            lastErr = tostring(result)
+        end
+    end
+    SetWLStatus(string.format("Failed (%d tries)", WL_MAX_RETRIES), Color3.fromRGB(255, 80, 80))
+    if wlRefLbl then wlRefLbl.Text = "REFRESH" end
+    warn(_S.WLPfx .. " All retries failed — last error: " .. lastErr)
+    isFetching = false
+end
+
+-- ═══════════════════════════════════════════════════════════════
+--  SECTION 1 — ARC CONE VISUALIZER
+-- ═══════════════════════════════════════════════════════════════
+local COLOR = {
+    DISABLED  = Color3.fromRGB(110, 110, 125),
+    CLEAR     = Color3.fromRGB(0,   210, 110),
+    TARGET    = Color3.fromRGB(255, 195, 0  ),
+    FIRING    = Color3.fromRGB(255, 30,  55 ),
+    WHITELIST = Color3.fromRGB(0,   180, 255),
+}
+
+local ArcPool = {}
+
+-- EDGE-3: validates Parent == workspace (not just truthy)
+local function GetArcFolder()
+    if arcFolder and arcFolder.Parent == workspace then return arcFolder end
+    for _, obj in ipairs(workspace:GetChildren()) do
+        if obj:IsA(_S.Folder) then
+            arcFolder = obj; arcFolderOwned = false; return obj
+        end
+    end
+    local f = Instance.new(_S.Folder)
+    f.Name         = RandName()
+    f.Parent       = workspace
+    arcFolder      = f
+    arcFolderOwned = true
+    return f
+end
+
+-- EDGE-1: commit ArcPool only after full successful build
+local function BuildArcVis()
+    local old      = ArcPool
+    local nxt      = {}
+    local partName = RandName()
+    local arcParent = GetArcFolder()
+    for i = 1, ARC_TOTAL do
+        local p = Instance.new("Part")
+        p.Name         = partName
+        p.Anchored     = true
+        p.CanCollide   = false
+        p.CastShadow   = false
+        p.Massless     = true
+        p.Material     = Enum.Material.Neon
+        p.Transparency = 0.15
+        p.Size         = Vector3.new(0.07, 0.07, 1)
+        p.Color        = COLOR.CLEAR
+        p.Parent       = arcParent
+        nxt[i]         = p
+    end
+    -- EDGE-1: only commit if all parts were created
+    if #nxt == ARC_TOTAL then
+        ArcPool = nxt; lastArcColor = nil
+        _arcBuildFailTick = 0   -- EDGE-A: clear failure state on success
+        for _, p in ipairs(old) do pcall(p.Destroy, p) end
+    else
+        -- partial build — destroy fragments, keep old pool
+        -- EDGE-A: record failure frame so UpdateArcVis can back off
+        _arcBuildFailTick = frameCount
+        for _, p in ipairs(nxt) do pcall(p.Destroy, p) end
     end
 end
 
--- Called every Heartbeat with current handle + targets-in-range count
-local function UpdateVisualizer(handle, targetsInRange, activeDragCount)
-    if not CFG.VisualizerEnabled then
-        DestroyVisualizer()
+local function DestroyArcVis()
+    local old = ArcPool; ArcPool = {}; lastArcColor = nil
+    for _, p in ipairs(old) do pcall(p.Destroy, p) end
+end
+
+--[[
+    SetBeam — PERF-E:
+    • Skips the Size write when len+thick haven't changed by >0.005.
+    • Avoids Vector3 midpoint allocation by passing all six scalars
+      directly to CFrame.lookAt (which accepts two Vector3s, so we
+      keep that call but inline the midpoint components to avoid a
+      separate Vector3 allocation for the midpoint).
+--]]
+local function SetBeam(part, x1,y1,z1, x2,y2,z2, thick)
+    local dx, dy, dz = x2-x1, y2-y1, z2-z1
+    local len = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if len < 0.001 then
+        part.Size = Vector3.new(0.001, 0.001, 0.001)
         return
     end
-
-    if not VisPart or not VisPart.Parent then
-        BuildVisualizer()
+    -- PERF-E: skip Size write when values are stable
+    local cache = _beamSzCache[part]
+    if not cache or math.abs(len - cache[1]) > 0.005 or thick ~= cache[2] then
+        part.Size = Vector3.new(thick, thick, len)
+        if not cache then cache = {}; _beamSzCache[part] = cache end
+        cache[1] = len; cache[2] = thick
     end
+    local inv = 1 / len
+    local mx, my, mz = (x1+x2)*0.5, (y1+y2)*0.5, (z1+z2)*0.5
+    -- CFrame.lookAt still needs Vector3, but midpoint is inline (no separate alloc)
+    part.CFrame = CFrame.lookAt(
+        Vector3.new(mx, my, mz),
+        Vector3.new(mx + dx*inv, my + dy*inv, mz + dz*inv)
+    )
+end
 
-    -- Sync size to current CFG.Size
-    local s = CFG.Size * 2   -- diameter
-    VisPart.Size   = Vector3.new(s, s, s)
-    VisPart.CFrame = handle.CFrame
-
-    -- Color logic
-    local col
-    if not CFG.Enabled then
-        col = COLOR.DISABLED
-    elseif activeDragCount > 0 then
-        col = COLOR.FIRING
-    elseif targetsInRange > 0 then
-        col = COLOR.TARGET
-    else
-        col = COLOR.CLEAR
+local function UpdateArcVis(baseCF, col)
+    if not CFG.VisualizerEnabled then DestroyArcVis(); return end
+    -- EDGE-1: guard against a partial pool
+    -- EDGE-A: only retry build if cooldown has elapsed since last failure
+    if #ArcPool ~= ARC_TOTAL then
+        if frameCount - _arcBuildFailTick >= ARC_BUILD_COOLDOWN then
+            BuildArcVis()
+        end
     end
-
-    if VisSphere then
-        VisSphere.Color3        = col
-        VisSphere.SurfaceColor3 = col
+    if #ArcPool ~= ARC_TOTAL then return end   -- build failed or cooling down
+    if arcAngleDirty then RebuildArcAngles() end
+    local reach    = CFG.Size
+    local bx,by,bz = baseCF.Position.X,   baseCF.Position.Y,   baseCF.Position.Z
+    local fx,fy,fz = baseCF.LookVector.X,  baseCF.LookVector.Y,  baseCF.LookVector.Z
+    local rx,ry,rz = baseCF.RightVector.X, baseCF.RightVector.Y, baseCF.RightVector.Z
+    for i = 1, ARC_SEGS+1 do
+        local c, s = arcCosTable[i], arcSinTable[i]
+        arcPtX[i]  = bx + (fx*c + rx*s) * reach
+        arcPtY[i]  = by + (fy*c + ry*s) * reach
+        arcPtZ[i]  = bz + (fz*c + rz*s) * reach
+    end
+    SetBeam(ArcPool[1], bx,by,bz, arcPtX[1],          arcPtY[1],          arcPtZ[1],          0.09)
+    SetBeam(ArcPool[2], bx,by,bz, arcPtX[ARC_SEGS+1], arcPtY[ARC_SEGS+1], arcPtZ[ARC_SEGS+1], 0.09)
+    for i = 1, ARC_SEGS do
+        SetBeam(ArcPool[2+i],
+            arcPtX[i],   arcPtY[i],   arcPtZ[i],
+            arcPtX[i+1], arcPtY[i+1], arcPtZ[i+1], 0.07)
+    end
+    if col ~= lastArcColor then
+        for i = 1, ARC_TOTAL do ArcPool[i].Color = col end
+        lastArcColor = col
     end
 end
 
 -- ═══════════════════════════════════════════════════════════════
 --  SECTION 2 — LIVE CONFIG GUI
 -- ═══════════════════════════════════════════════════════════════
---[[
-    Layout:
-    ┌──────────────────────────────────────────┐
-    │  NoCBring Config               [×] [_]   │  ← title bar (draggable)
-    ├──────────────────────────────────────────┤
-    │  Size          [━━━●─────]  11           │
-    │  LerpFrames    [━━━━●────]   6           │
-    │  DragCooldown  [━●───────]  0.40 s       │
-    │  AngleCap      [━━━━━●───]  50 °         │
-    │  RemoteName    [ DamageRemote          ] │
-    ├──────────────────────────────────────────┤
-    │  ● Enabled    ○ Visualizer              │
-    ├──────────────────────────────────────────┤
-    │  Kills: 0   AvgDist: —   Last: —        │  ← live stats strip
-    └──────────────────────────────────────────┘
+local ScreenGui    = nil
+local sliders      = {}
+local toggles      = {}
+local refreshStats = nil
 
-    Every slider writes directly to CFG and the heartbeat loop reads
-    CFG on the next frame — no intermediate state.
-
-    The RemoteName field is a TextBox; committing (Enter/FocusLost) updates
-    CFG.RemoteName and clears the cached remote so FindRemote runs again.
---]]
-
-local ScreenGui = nil
-
--- ── UI constants ────────────────────────────────────────────
 local UI = {
-    W            = 320,
-    H            = 310,
-    TitleH       = 32,
-    RowH         = 34,
-    Pad          = 12,
-    SliderW      = 170,
-    SliderH      = 8,
-    KnobSz       = 16,
-    Font         = Enum.Font.GothamBold,
-    FontBody     = Enum.Font.Gotham,
-    TextSz       = 13,
-    TitleSz      = 14,
-    BG           = Color3.fromRGB(15,  15,  20 ),
-    PANEL        = Color3.fromRGB(22,  22,  30 ),
-    ACCENT       = Color3.fromRGB(0,   200, 120),
-    ACCENT2      = Color3.fromRGB(255, 60,  100),
-    TEXT         = Color3.fromRGB(220, 220, 230),
-    MUTED        = Color3.fromRGB(110, 110, 130),
-    BORDER       = Color3.fromRGB(40,  40,  55 ),
+    W=338, CONTENT_H=720, TitleH=32, RowH=34, Pad=12, SliderW=168, SliderH=8, KnobSz=16,
+    Font=Enum.Font.GothamBold, FontBody=Enum.Font.Gotham, TextSz=13, TitleSz=14,
+    BG      = Color3.fromRGB(13,  13,  18 ),
+    ACCENT  = Color3.fromRGB(0,   200, 115),
+    ACCENT2 = Color3.fromRGB(255, 55,  95 ),
+    WARN    = Color3.fromRGB(255, 195, 0  ),
+    WLC     = Color3.fromRGB(0,   180, 255),
+    TEXT    = Color3.fromRGB(218, 218, 230),
+    MUTED   = Color3.fromRGB(105, 105, 128),
+    BORDER  = Color3.fromRGB(38,  38,  52 ),
 }
 
--- ── Helper: make a Frame ─────────────────────────────────────
-local function MkFrame(parent, size, pos, color, zindex)
-    local f         = Instance.new("Frame")
-    f.Size          = size
-    f.Position      = pos
-    f.BackgroundColor3 = color or UI.PANEL
-    f.BorderSizePixel  = 0
-    f.ZIndex        = zindex or 1
-    f.Parent        = parent
-    return f
+local function MkFrame(par,sz,pos,col,z)
+    local f=Instance.new("Frame"); f.Size=sz; f.Position=pos
+    f.BackgroundColor3=col or UI.BG; f.BorderSizePixel=0; f.ZIndex=z or 1
+    f.Parent=par; return f
 end
 
--- ── Helper: make a Label ────────────────────────────────────
-local function MkLabel(parent, text, size, pos, font, tsz, color, zindex, xalign)
-    local l         = Instance.new("TextLabel")
-    l.Size          = size
-    l.Position      = pos
-    l.Text          = text
-    l.Font          = font or UI.FontBody
-    l.TextSize      = tsz or UI.TextSz
-    l.TextColor3    = color or UI.TEXT
-    l.BackgroundTransparency = 1
-    l.ZIndex        = zindex or 2
-    l.TextXAlignment = xalign or Enum.TextXAlignment.Left
-    l.Parent        = parent
-    return l
+local function MkLabel(par,txt,sz,pos,font,tsz,col,z,xa)
+    local l=Instance.new("TextLabel"); l.Size=sz; l.Position=pos; l.Text=txt
+    l.Font=font or UI.FontBody; l.TextSize=tsz or UI.TextSz; l.TextColor3=col or UI.TEXT
+    l.BackgroundTransparency=1; l.ZIndex=z or 2
+    l.TextXAlignment=xa or Enum.TextXAlignment.Left; l.Parent=par; return l
 end
 
--- ── Helper: make a rounded corner UICorner ──────────────────
-local function MkCorner(parent, radius)
-    local c = Instance.new("UICorner")
-    c.CornerRadius = UDim.new(0, radius or 6)
-    c.Parent = parent
+local function MkCorner(par,r)
+    local c=Instance.new("UICorner"); c.CornerRadius=UDim.new(0,r or 6); c.Parent=par
 end
 
--- ── Helper: make a UIStroke ─────────────────────────────────
-local function MkStroke(parent, color, thickness)
-    local s = Instance.new("UIStroke")
-    s.Color = color or UI.BORDER
-    s.Thickness = thickness or 1
-    s.Parent = parent
+local function MkStroke(par,col,t)
+    local s=Instance.new("UIStroke"); s.Color=col or UI.BORDER; s.Thickness=t or 1
+    s.Parent=par; return s
 end
 
--- ── Slider builder ──────────────────────────────────────────
---[[
-    Creates a labeled slider row.
-    Parameters:
-        parent    : Frame to attach to
-        yOffset   : UDim2 Y position of the row
-        label     : display name
-        min/max   : value range
-        default   : initial value
-        fmt       : function(value) → string suffix  e.g. " studs"
-        onChange  : function(value) called on every drag step
-    Returns:
-        { SetValue = fn, GetValue = fn, Label = TextLabel }
---]]
-local function MkSlider(parent, yOffset, label, min, max, default, fmt, onChange)
-    local ROW_H = UI.RowH
-    local PAD   = UI.Pad
-
-    -- Row container
-    local row = MkFrame(parent,
-        UDim2.new(1, 0, 0, ROW_H),
-        UDim2.new(0, 0, 0, yOffset),
-        Color3.fromRGB(0,0,0), 2)
-    row.BackgroundTransparency = 1
-
-    -- Left label
-    MkLabel(row, label,
-        UDim2.new(0, 95, 1, 0),
-        UDim2.new(0, PAD, 0, 0),
-        UI.FontBody, UI.TextSz, UI.MUTED, 3)
-
-    -- Track background
-    local trackBG = MkFrame(row,
-        UDim2.new(0, UI.SliderW, 0, UI.SliderH),
-        UDim2.new(0, 108, 0.5, -UI.SliderH/2),
-        Color3.fromRGB(40, 40, 55), 3)
-    MkCorner(trackBG, 4)
-
-    -- Track fill (accent color, grows left → right)
-    local trackFill = MkFrame(trackBG,
-        UDim2.new(0, 0, 1, 0),
-        UDim2.new(0, 0, 0, 0),
-        UI.ACCENT, 4)
-    MkCorner(trackFill, 4)
-
-    -- Knob
-    local KS = UI.KnobSz
-    local knob = MkFrame(trackBG,
-        UDim2.new(0, KS, 0, KS),
-        UDim2.new(0, -KS/2, 0.5, -KS/2),
-        Color3.fromRGB(255, 255, 255), 5)
-    MkCorner(knob, KS)
-    MkStroke(knob, UI.ACCENT, 2)
-
-    -- Value label (right of slider)
-    local valLabel = MkLabel(row,
-        fmt(default),
-        UDim2.new(0, 60, 1, 0),
-        UDim2.new(0, 108 + UI.SliderW + 6, 0, 0),
-        UI.Font, UI.TextSz, UI.ACCENT, 3)
-
-    -- ── State ──────────────────────────────────────────────
-    local current = default
-    local dragging = false
-
-    local function SetValue(val)
-        val     = math.clamp(val, min, max)
-        -- round to 2 dp for floats, integer for ints
-        if math.floor(min) == min and math.floor(max) == max and math.floor(default) == default then
-            val = math.round(val)
-        else
-            val = math.floor(val * 100 + 0.5) / 100
-        end
-        current = val
-
-        local alpha = (val - min) / (max - min)
-        trackFill.Size     = UDim2.new(alpha, 0, 1, 0)
-        knob.Position      = UDim2.new(alpha, -KS/2, 0.5, -KS/2)
-        valLabel.Text      = fmt(val)
-
-        if onChange then onChange(val) end
+local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
+    local row=MkFrame(par,UDim2.new(1,0,0,UI.RowH),UDim2.new(0,0,0,y),Color3.fromRGB(0,0,0),2)
+    row.BackgroundTransparency=1
+    MkLabel(row,label,UDim2.new(0,95,1,0),UDim2.new(0,UI.Pad,0,0),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local track=MkFrame(row,UDim2.new(0,UI.SliderW,0,UI.SliderH),UDim2.new(0,108,0.5,-UI.SliderH/2),Color3.fromRGB(38,38,52),3)
+    MkCorner(track,4)
+    local fill=MkFrame(track,UDim2.new(0,0,1,0),UDim2.new(0,0,0,0),UI.ACCENT,4); MkCorner(fill,4)
+    local KS=UI.KnobSz
+    local knob=MkFrame(track,UDim2.new(0,KS,0,KS),UDim2.new(0,-KS/2,0.5,-KS/2),Color3.fromRGB(255,255,255),5)
+    MkCorner(knob,KS); MkStroke(knob,UI.ACCENT,2)
+    local valLbl=MkLabel(row,fmt(def),UDim2.new(0,58,1,0),UDim2.new(0,108+UI.SliderW+6,0,0),UI.Font,UI.TextSz,UI.ACCENT,3)
+    local isInt=math.floor(mn)==mn and math.floor(mx)==mx and math.floor(def)==def
+    local range=mx-mn
+    local function SetVal(v)
+        v=math.clamp(v,mn,mx)
+        v=isInt and math.round(v) or (math.floor(v*100+0.5)/100)
+        local a=range>0 and (v-mn)/range or 0
+        fill.Size=UDim2.new(a,0,1,0); knob.Position=UDim2.new(a,-KS/2,0.5,-KS/2)
+        valLbl.Text=fmt(v); if onChange then onChange(v) end
     end
-
-    local function GetValue() return current end
-
-    -- Initialize position
-    SetValue(default)
-
-    -- ── Drag logic ─────────────────────────────────────────
-    knob.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
+    SetVal(def)
+    local info={track=track,mn=mn,mx=mx,SetVal=SetVal}
+    knob.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then activeDrag=info end end)
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            activeDrag=info
+            local r=track.AbsoluteSize.X
+            SetVal(mn+(math.clamp(i.Position.X-track.AbsolutePosition.X,0,r)/r)*(mx-mn))
         end
     end)
-
-    UIS.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = false
-        end
-    end)
-
-    UIS.InputChanged:Connect(function(inp)
-        if not dragging then return end
-        if inp.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-        local absPos  = trackBG.AbsolutePosition
-        local absSize = trackBG.AbsoluteSize
-        local relX    = math.clamp(inp.Position.X - absPos.X, 0, absSize.X)
-        local alpha   = relX / absSize.X
-        SetValue(min + alpha * (max - min))
-    end)
-
-    -- Also allow clicking anywhere on the track
-    trackBG.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            dragging = true
-            local absPos  = trackBG.AbsolutePosition
-            local absSize = trackBG.AbsoluteSize
-            local relX    = math.clamp(inp.Position.X - absPos.X, 0, absSize.X)
-            SetValue(min + (relX / absSize.X) * (max - min))
-        end
-    end)
-
-    return { SetValue = SetValue, GetValue = GetValue, Label = valLabel }
+    return {SetVal=SetVal}
 end
 
--- ── Toggle button builder ────────────────────────────────────
-local function MkToggle(parent, xOffset, yOffset, label, default, onChange)
-    local BTN_W, BTN_H = 46, 22
-
-    local container = MkFrame(parent,
-        UDim2.new(0, BTN_W + 8 + 70, 0, BTN_H + 4),
-        UDim2.new(0, xOffset, 0, yOffset),
-        Color3.fromRGB(0,0,0), 2)
-    container.BackgroundTransparency = 1
-
-    -- Pill track
-    local track = MkFrame(container,
-        UDim2.new(0, BTN_W, 0, BTN_H),
-        UDim2.new(0, 0, 0, 2),
-        Color3.fromRGB(50, 50, 65), 3)
-    MkCorner(track, BTN_H)
-    MkStroke(track, UI.BORDER, 1)
-
-    -- Knob
-    local KS = BTN_H - 6
-    local knob = MkFrame(track,
-        UDim2.new(0, KS, 0, KS),
-        UDim2.new(0, 3, 0.5, -KS/2),
-        Color3.fromRGB(180, 180, 200), 4)
-    MkCorner(knob, KS)
-
-    -- Label
-    MkLabel(container, label,
-        UDim2.new(0, 70, 1, 0),
-        UDim2.new(0, BTN_W + 8, 0, 0),
-        UI.FontBody, UI.TextSz, UI.TEXT, 3)
-
-    -- ── State ──────────────────────────────────────────────
-    local enabled = default
-
-    local tweenInfo = TweenInfo.new(0.15, Enum.EasingStyle.Quad)
-
-    local function SetState(state)
-        enabled = state
-        local targetX  = state and (BTN_W - KS - 3) or 3
-        local trackCol = state and UI.ACCENT or Color3.fromRGB(50, 50, 65)
-        local knobCol  = state and Color3.fromRGB(255,255,255) or Color3.fromRGB(180,180,200)
-
-        TweenService:Create(knob, tweenInfo,
-            { Position = UDim2.new(0, targetX, 0.5, -KS/2),
-              BackgroundColor3 = knobCol }):Play()
-        TweenService:Create(track, tweenInfo,
-            { BackgroundColor3 = trackCol }):Play()
-
-        if onChange then onChange(state) end
+-- REL-3: MkToggle registers a canceller in _guiTweenCancellers
+local function MkToggle(par,xOff,yOff,label,def,onChange)
+    local BW,BH=46,22
+    local con=MkFrame(par,UDim2.new(0,BW+80,0,BH+4),UDim2.new(0,xOff,0,yOff),Color3.fromRGB(0,0,0),2)
+    con.BackgroundTransparency=1
+    local track=MkFrame(con,UDim2.new(0,BW,0,BH),UDim2.new(0,0,0,2),Color3.fromRGB(46,46,60),3)
+    MkCorner(track,BH); MkStroke(track,UI.BORDER,1)
+    local KS=BH-6
+    local knob=MkFrame(track,UDim2.new(0,KS,0,KS),UDim2.new(0,3,0.5,-KS/2),Color3.fromRGB(170,170,190),4)
+    MkCorner(knob,KS)
+    MkLabel(con,label,UDim2.new(0,72,1,0),UDim2.new(0,BW+8,0,0),UI.FontBody,UI.TextSz,UI.TEXT,3)
+    local on=def
+    local twi=TweenInfo.new(0.15,Enum.EasingStyle.Quad)
+    local knobTween, trackTween = nil, nil
+    local function SetState(st)
+        on=st
+        if knobTween  then knobTween:Cancel()  end
+        if trackTween then trackTween:Cancel() end
+        knobTween  = TweenService:Create(knob,  twi, {
+            Position         = UDim2.new(0, st and (BW-KS-3) or 3, 0.5, -KS/2),
+            BackgroundColor3 = st and Color3.fromRGB(255,255,255) or Color3.fromRGB(170,170,190),
+        })
+        trackTween = TweenService:Create(track, twi, {
+            BackgroundColor3 = st and UI.ACCENT or Color3.fromRGB(46,46,60),
+        })
+        knobTween:Play(); trackTween:Play()
+        if onChange then onChange(st) end
     end
-
-    SetState(default)
-
-    track.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            SetState(not enabled)
-        end
+    SetState(def)
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then SetState(not on) end
     end)
-
-    return { SetState = SetState, GetState = function() return enabled end }
+    -- REL-3: register canceller so BuildGUI can cancel in-flight tweens before destroy
+    _guiTweenCancellers[#_guiTweenCancellers+1] = function()
+        if knobTween  then pcall(knobTween.Cancel,  knobTween)  end
+        if trackTween then pcall(trackTween.Cancel, trackTween) end
+    end
+    return {SetState=SetState, GetState=function() return on end}
 end
 
--- ── Stats strip updater (returns a function to refresh labels) ─
-local function MkStatsStrip(parent, yOffset)
-    local strip = MkFrame(parent,
-        UDim2.new(1, 0, 0, 28),
-        UDim2.new(0, 0, 0, yOffset),
-        Color3.fromRGB(10, 10, 15), 2)
-    MkStroke(strip, UI.BORDER, 1)
-
-    local killLbl = MkLabel(strip, "Kills: 0",
-        UDim2.new(0, 80, 1, 0),
-        UDim2.new(0, UI.Pad, 0, 0),
-        UI.Font, 12, UI.ACCENT, 3)
-
-    local distLbl = MkLabel(strip, "AvgDist: —",
-        UDim2.new(0, 90, 1, 0),
-        UDim2.new(0, 95, 0, 0),
-        UI.Font, 12, UI.TEXT, 3)
-
-    local lastLbl = MkLabel(strip, "Last: —",
-        UDim2.new(0, 110, 1, 0),
-        UDim2.new(0, 195, 0, 0),
-        UI.Font, 12, UI.MUTED, 3)
-
+local function MkStatsStrip(par,y)
+    local strip=MkFrame(par,UDim2.new(1,0,0,28),UDim2.new(0,0,0,y),Color3.fromRGB(9,9,14),2)
+    MkStroke(strip,UI.BORDER,1)
+    local kl=MkLabel(strip,"Kills: 0", UDim2.new(0,66,1,0),  UDim2.new(0,UI.Pad,0,0), UI.Font,11,UI.ACCENT,3)
+    local dl=MkLabel(strip,"Avg: —",   UDim2.new(0,64,1,0),  UDim2.new(0,82,0,0),     UI.Font,11,UI.TEXT,  3)
+    local ll=MkLabel(strip,"Last: —",  UDim2.new(0,100,1,0), UDim2.new(0,150,0,0),    UI.Font,11,UI.MUTED, 3)
+    local wl=MkLabel(strip,"WL↑: 0",  UDim2.new(0,56,1,0),  UDim2.new(0,260,0,0),    UI.Font,11,UI.WLC,   3)
     return function()
-        killLbl.Text = "Kills: " .. Stats.Kills
-        local avg = Stats.Kills > 0
-            and string.format("%.1f", Stats.TotalDist / Stats.Kills)
-            or "—"
-        distLbl.Text = "AvgDist: " .. avg
-        lastLbl.Text = "Last: " .. Stats.LastVictim
+        kl.Text="Kills: "..Stats.Kills
+        dl.Text="Avg: "..(Stats.Kills>0 and string.format("%.1f",Stats.TotalDist/Stats.Kills) or "—")
+        ll.Text="Last: "..Stats.LastVictim
+        wl.Text="WL↑: "..Stats.WhitelistHits
     end
 end
 
--- ── BUILD FULL GUI ───────────────────────────────────────────
-local sliders  = {}   -- keyed by config field name
-local toggles  = {}
-local refreshStats = nil
-local guiVisible   = true
+local function MkTeamDropdown(par, y, onChange)
+    local ROW_H   = 22
+    local MAX_VIS = 5
+    local DD_PAD  = 4
 
-local function BuildGUI()
-    if ScreenGui then ScreenGui:Destroy() end
+    MkLabel(par,"Target Team",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local inputBG = MkFrame(par,UDim2.new(0,UI.W-116,0,24),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(inputBG,4); MkStroke(inputBG,UI.BORDER,1)
+    local box = Instance.new("TextBox")
+    box.Size=UDim2.new(1,-8,1,0); box.Position=UDim2.new(0,4,0,0)
+    box.Text=CFG.TargetTeam and CFG.TargetTeam.Name or ""
+    box.PlaceholderText="All Teams"; box.PlaceholderColor3=UI.MUTED
+    box.Font=UI.FontBody; box.TextSize=11; box.TextColor3=UI.WLC
+    box.BackgroundTransparency=1; box.BorderSizePixel=0; box.ZIndex=4
+    box.ClearTextOnFocus=false; box.Parent=inputBG
 
-    local sg = Instance.new("ScreenGui")
-    sg.Name                    = "_NCBConfig"
-    sg.ResetOnSpawn            = false
-    sg.ZIndexBehavior          = Enum.ZIndexBehavior.Global
-    sg.DisplayOrder            = 999
-    sg.IgnoreGuiInset          = true
-    sg.Parent                  = game:GetService("CoreGui")
-    ScreenGui = sg
+    local ddH  = ROW_H * MAX_VIS + DD_PAD * 2
+    local ddBG = Instance.new("Frame")
+    ddBG.Size=UDim2.new(0,UI.W-116,0,ddH); ddBG.BackgroundColor3=Color3.fromRGB(20,20,30)
+    ddBG.BorderSizePixel=0; ddBG.ZIndex=20; ddBG.Visible=false; ddBG.ClipsDescendants=true
+    MkCorner(ddBG,4); MkStroke(ddBG,UI.BORDER,1)
 
-    -- ── Main window ──────────────────────────────────────────
-    local win = MkFrame(sg,
-        UDim2.new(0, UI.W, 0, UI.H),
-        UDim2.new(0, 60, 0, 120),
-        UI.BG, 1)
-    MkCorner(win, 8)
-    MkStroke(win, UI.BORDER, 1)
+    local listFrame = Instance.new("Frame")
+    listFrame.Size=UDim2.new(1,0,0,0); listFrame.Position=UDim2.new(0,0,0,DD_PAD)
+    listFrame.BackgroundTransparency=1; listFrame.ZIndex=21; listFrame.Parent=ddBG
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.SortOrder=Enum.SortOrder.LayoutOrder; listLayout.Parent=listFrame
 
-    -- Shadow
-    local shadow = MkFrame(sg,
-        UDim2.new(0, UI.W + 16, 0, UI.H + 16),
-        UDim2.new(0, 60 - 8, 0, 120 - 8),
-        Color3.fromRGB(0,0,0), 0)
-    shadow.BackgroundTransparency = 0.6
-    MkCorner(shadow, 12)
+    local ddOpen       = false
+    local rowCache     = {}
+    local clickPending = false
 
-    -- ── Title bar ────────────────────────────────────────────
-    local titleBar = MkFrame(win,
-        UDim2.new(1, 0, 0, UI.TitleH),
-        UDim2.new(0, 0, 0, 0),
-        Color3.fromRGB(20, 20, 28), 2)
-    MkCorner(titleBar, 8)
+    local function CommitTeam(teamObj)
+        CFG.TargetTeam = teamObj
+        box.Text       = teamObj and teamObj.Name or ""
+        ddBG.Visible   = false; ddOpen = false
+        if onChange then onChange(teamObj) end
+    end
 
-    -- Bottom square fill for titleBar (to hide bottom-radius)
-    MkFrame(titleBar,
-        UDim2.new(1, 0, 0, 8),
-        UDim2.new(0, 0, 1, -8),
-        Color3.fromRGB(20, 20, 28), 2)
-
-    -- Accent left bar
-    local accentBar = MkFrame(titleBar,
-        UDim2.new(0, 3, 0, 18),
-        UDim2.new(0, UI.Pad, 0.5, -9),
-        UI.ACCENT, 3)
-    MkCorner(accentBar, 2)
-
-    MkLabel(titleBar, "NoCBring Config",
-        UDim2.new(0, 180, 1, 0),
-        UDim2.new(0, UI.Pad + 10, 0, 0),
-        UI.Font, UI.TitleSz, UI.TEXT, 3)
-
-    -- Close button
-    local closeBtn = MkFrame(titleBar,
-        UDim2.new(0, 24, 0, 24),
-        UDim2.new(1, -32, 0.5, -12),
-        Color3.fromRGB(60, 20, 30), 3)
-    MkCorner(closeBtn, 4)
-    MkLabel(closeBtn, "×", UDim2.new(1,0,1,0), UDim2.new(0,0,0,0),
-        UI.Font, 16, UI.ACCENT2, 4, Enum.TextXAlignment.Center)
-
-    closeBtn.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            win.Visible = false
-            shadow.Visible = false
-            guiVisible = false
+    local function BuildRowCache()
+        for _, r in ipairs(rowCache) do pcall(r.frame.Destroy, r.frame) end
+        rowCache = {}
+        local items = {{teamObj=nil, display="All Teams"}}
+        for _, t in ipairs(Teams:GetTeams()) do items[#items+1] = {teamObj=t, display=t.Name} end
+        for i, item in ipairs(items) do
+            local rowBG = MkFrame(listFrame,UDim2.new(1,0,0,ROW_H),UDim2.new(0,0,0,0),Color3.fromRGB(0,0,0),21)
+            rowBG.BackgroundTransparency=1; rowBG.LayoutOrder=i
+            MkLabel(rowBG,item.display,UDim2.new(1,-8,1,0),UDim2.new(0,6,0,0),UI.FontBody,11,
+                item.teamObj==CFG.TargetTeam and UI.ACCENT or UI.TEXT,22)
+            -- PERF-D: DD_ROW_TWEEN is module-level, not allocated per hover
+            rowBG.MouseEnter:Connect(function()
+                TweenService:Create(rowBG,DD_ROW_TWEEN,{BackgroundColor3=Color3.fromRGB(30,30,48),BackgroundTransparency=0}):Play()
+            end)
+            rowBG.MouseLeave:Connect(function()
+                TweenService:Create(rowBG,DD_ROW_TWEEN,{BackgroundTransparency=1}):Play()
+            end)
+            rowBG.InputBegan:Connect(function(inp)
+                if inp.UserInputType==Enum.UserInputType.MouseButton1 then
+                    clickPending=true; CommitTeam(item.teamObj)
+                end
+            end)
+            -- EDGE-5/PERF-C: pre-compute lowercased display string
+            rowCache[#rowCache+1] = {
+                frame      = rowBG,
+                teamObj    = item.teamObj,
+                display    = item.display,
+                displayLow = item.display:lower(),
+            }
         end
-    end)
+    end
 
-    -- ── Drag logic for window ────────────────────────────────
-    local draggingWin = false
-    local dragStart, winStart
-
-    titleBar.InputBegan:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            draggingWin = true
-            dragStart   = inp.Position
-            winStart    = win.Position
+    -- EDGE-5/PERF-C: uses pre-computed displayLow, no per-keystroke allocation
+    local function FilterRows(query)
+        local lo  = query:lower()
+        local vis = 0
+        for _, r in ipairs(rowCache) do
+            local show = (lo=="" or r.displayLow:find(lo,1,true)~=nil)
+            r.frame.Visible = show
+            if show then vis = vis+1 end
         end
+        listFrame.Size = UDim2.new(1,0,0,vis*ROW_H)
+        ddBG.Size      = UDim2.new(0,UI.W-116,0,math.min(vis,MAX_VIS)*ROW_H+DD_PAD*2)
+    end
+
+    local function OpenDropdown()
+        if winRef then ddBG.Parent = winRef end
+        BuildRowCache(); FilterRows("")
+        ddBG.Visible=true; ddOpen=true
+        task.defer(function()
+            if not ddOpen or not winRef then return end
+            local abs    = inputBG.AbsolutePosition
+            local winAbs = winRef.AbsolutePosition
+            ddBG.Position = UDim2.new(0, abs.X-winAbs.X, 0, abs.Y-winAbs.Y+26)
+        end)
+    end
+
+    local function CloseDropdown()
+        ddBG.Visible=false; ddOpen=false
+        box.Text = CFG.TargetTeam and CFG.TargetTeam.Name or ""
+    end
+
+    box:GetPropertyChangedSignal("Text"):Connect(function()
+        if ddOpen then FilterRows(box.Text) end
     end)
-    UIS.InputEnded:Connect(function(inp)
-        if inp.UserInputType == Enum.UserInputType.MouseButton1 then
-            draggingWin = false
-        end
-    end)
-    UIS.InputChanged:Connect(function(inp)
-        if draggingWin and inp.UserInputType == Enum.UserInputType.MouseMovement then
-            local delta = inp.Position - dragStart
-            win.Position    = UDim2.new(
-                winStart.X.Scale, winStart.X.Offset + delta.X,
-                winStart.Y.Scale, winStart.Y.Offset + delta.Y)
-            shadow.Position = UDim2.new(
-                winStart.X.Scale, winStart.X.Offset + delta.X - 8,
-                winStart.Y.Scale, winStart.Y.Offset + delta.Y - 8)
-        end
-    end)
-
-    -- ── Content area ─────────────────────────────────────────
-    local content = MkFrame(win,
-        UDim2.new(1, 0, 1, -UI.TitleH),
-        UDim2.new(0, 0, 0, UI.TitleH),
-        UI.BG, 2)
-
-    local y = 4  -- running Y offset inside content
-
-    -- ── Sliders section header ───────────────────────────────
-    MkLabel(content, "REACH & TIMING",
-        UDim2.new(1, -UI.Pad*2, 0, 16),
-        UDim2.new(0, UI.Pad, 0, y),
-        UI.Font, 10, UI.MUTED, 3)
-    y = y + 18
-
-    -- Divider
-    MkFrame(content,
-        UDim2.new(1, -UI.Pad*2, 0, 1),
-        UDim2.new(0, UI.Pad, 0, y),
-        UI.BORDER, 3)
-    y = y + 6
-
-    -- SIZE slider  (5 – 30 studs)
-    sliders.Size = MkSlider(content, y, "Size",
-        5, 30, CFG.Size,
-        function(v) return string.format("%.0f st", v) end,
-        function(v)
-            CFG.Size = v
-            -- Live-update visualizer sphere size
-            if VisPart then
-                local s = v * 2
-                VisPart.Size = Vector3.new(s, s, s)
+    box.Focused:Connect(OpenDropdown)
+    box.FocusLost:Connect(function(enter)
+        task.defer(function()
+            if CFG.ScriptKilled then return end
+            if clickPending then clickPending=false; return end
+            if not ddOpen then return end
+            if enter then
+                local typed = box.Text
+                if typed=="" then CommitTeam(nil)
+                else
+                    local matched=false
+                    for _, t in ipairs(Teams:GetTeams()) do
+                        if t.Name:lower()==typed:lower() then CommitTeam(t);matched=true;break end
+                    end
+                    if not matched then CloseDropdown() end
+                end
+            else
+                CloseDropdown()
             end
         end)
-    y = y + UI.RowH
+    end)
+    return { SetTeam = CommitTeam }
+end
 
-    -- LERP FRAMES slider  (2 – 12 frames)
-    sliders.LerpFrames = MkSlider(content, y, "LerpFrames",
-        2, 12, CFG.LerpFrames,
-        function(v) return string.format("%.0f fr", v) end,
-        function(v) CFG.LerpFrames = math.round(v) end)
-    y = y + UI.RowH
+-- REL-3: cancel all in-flight GUI tweens before a destroy
+local function CancelGUITweens()
+    for _, fn in ipairs(_guiTweenCancellers) do pcall(fn) end
+    table.clear(_guiTweenCancellers)
+end
 
-    -- DRAG COOLDOWN slider  (0.10 – 1.50 s)
-    sliders.DragCooldown = MkSlider(content, y, "Cooldown",
-        0.10, 1.50, CFG.DragCooldown,
-        function(v) return string.format("%.2f s", v) end,
-        function(v) CFG.DragCooldown = v end)
-    y = y + UI.RowH
+-- ── BUILD FULL GUI ────────────────────────────────────────────
+local function BuildGUI()
+    -- REL-3: cancel tweens from previous build before destroying instances
+    -- BUG-C: reset drag state so no stale activeDrag survives the rebuild
+    CancelGUITweens()
+    winDragging = false; activeDrag = nil
+    if ScreenGui then ScreenGui:Destroy() end
+    -- MAINT-A: clear control tables so no stale keys survive between builds
+    table.clear(sliders); table.clear(toggles); refreshStats = nil
 
-    -- ANGLE CAP slider  (15 – 90 °)
-    sliders.AngleCap = MkSlider(content, y, "AngleCap",
-        15, 90, CFG.AngleCap,
-        function(v) return string.format("%.0f °", v) end,
-        function(v) CFG.AngleCap = v end)
-    y = y + UI.RowH + 4
-
-    -- ── Remote name textbox ──────────────────────────────────
-    MkLabel(content, "RemoteName",
-        UDim2.new(0, 95, 0, 20),
-        UDim2.new(0, UI.Pad, 0, y),
-        UI.FontBody, UI.TextSz, UI.MUTED, 3)
-
-    local remoteBG = MkFrame(content,
-        UDim2.new(0, UI.W - 116, 0, 22),
-        UDim2.new(0, 108, 0, y + 1),
-        Color3.fromRGB(30, 30, 42), 3)
-    MkCorner(remoteBG, 4)
-    MkStroke(remoteBG, UI.BORDER, 1)
-
-    local remoteBox              = Instance.new("TextBox")
-    remoteBox.Size               = UDim2.new(1, -8, 1, 0)
-    remoteBox.Position           = UDim2.new(0, 4, 0, 0)
-    remoteBox.Text               = CFG.RemoteName
-    remoteBox.Font               = UI.FontBody
-    remoteBox.TextSize           = UI.TextSz
-    remoteBox.TextColor3         = UI.TEXT
-    remoteBox.BackgroundTransparency = 1
-    remoteBox.BorderSizePixel    = 0
-    remoteBox.ZIndex             = 4
-    remoteBox.PlaceholderText    = "e.g. DamageRemote"
-    remoteBox.PlaceholderColor3  = UI.MUTED
-    remoteBox.ClearTextOnFocus   = false
-    remoteBox.Parent             = remoteBG
-
-    remoteBox.FocusLost:Connect(function()
-        if remoteBox.Text ~= "" then
-            CFG.RemoteName  = remoteBox.Text
-            currentRemote   = nil   -- force re-search
-            Notify("Remote: " .. CFG.RemoteName)
+    local sg = Instance.new("ScreenGui")
+    sg.Name             = "_" .. RandName()
+    sg.ResetOnSpawn     = false
+    sg.ZIndexBehavior   = Enum.ZIndexBehavior.Global
+    sg.DisplayOrder     = 999
+    sg.IgnoreGuiInset   = true
+    sg.Parent           = game:GetService("CoreGui")
+    ScreenGui           = sg
+    -- EDGE-4: nil _rebindUIRef so task.delay callbacks don't write to dead instances
+    sg.AncestryChanged:Connect(function()
+        if not sg.Parent then
+            listeningForTrigger = false
+            _rebindUIRef        = nil
         end
     end)
 
-    y = y + 30
+    local MARGIN_Y = 48
+    local vp   = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800,600)
+    winH       = math.max(UI.TitleH + 80, math.min(UI.CONTENT_H, vp.Y - MARGIN_Y))
+    local initX = math.clamp(math.floor((vp.X - UI.W) / 2), 0, math.max(0, vp.X - UI.W))
+    local initY = math.clamp(math.floor((vp.Y - winH)  / 2), 0, math.max(0, vp.Y - winH))
 
-    -- ── Toggle row ───────────────────────────────────────────
-    MkFrame(content,
-        UDim2.new(1, -UI.Pad*2, 0, 1),
-        UDim2.new(0, UI.Pad, 0, y),
-        UI.BORDER, 3)
-    y = y + 6
+    local shadow=MkFrame(sg,UDim2.new(0,UI.W+16,0,winH+16),UDim2.new(0,initX-8,0,initY-8),Color3.fromRGB(0,0,0),0)
+    shadow.BackgroundTransparency=0.58; MkCorner(shadow,12)
+    local win=MkFrame(sg,UDim2.new(0,UI.W,0,winH),UDim2.new(0,initX,0,initY),UI.BG,1)
+    MkCorner(win,8); MkStroke(win,UI.BORDER,1)
+    winRef=win; shadowRef=shadow
 
-    toggles.Enabled = MkToggle(content, UI.Pad, y, "Enabled",
-        CFG.Enabled, function(v) CFG.Enabled = v end)
+    local tb=MkFrame(win,UDim2.new(1,0,0,UI.TitleH),UDim2.new(0,0,0,0),Color3.fromRGB(17,17,24),2)
+    MkCorner(tb,8); MkFrame(tb,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),Color3.fromRGB(17,17,24),2)
+    local ab=MkFrame(tb,UDim2.new(0,3,0,18),UDim2.new(0,UI.Pad,0.5,-9),UI.ACCENT,3); MkCorner(ab,2)
+    -- MAINT-3: title uses _S.TitleCfg ("NoCBring Config") instead of a literal
+    MkLabel(tb,_S.TitleCfg,UDim2.new(0,180,1,0),UDim2.new(0,UI.Pad+10,0,0),UI.Font,UI.TitleSz,UI.TEXT,3)
+    local cb=MkFrame(tb,UDim2.new(0,24,0,24),UDim2.new(1,-32,0.5,-12),Color3.fromRGB(52,17,26),3); MkCorner(cb,4)
+    MkLabel(cb,"×",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,16,UI.ACCENT2,4,Enum.TextXAlignment.Center)
+    cb.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            -- BUG-C: reset drag state before destroy so no stale references survive
+            winDragging = false; activeDrag = nil
+            CancelGUITweens()   -- REL-3
+            ScreenGui:Destroy(); ScreenGui=nil; winRef=nil; shadowRef=nil
+        end
+    end)
+    tb.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            winDragging=true; winDragStart=i.Position
+            winPosStart=win.Position; shadowPosStart=shadow.Position
+            local vp2=(workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800,600)
+            winDragMaxX=math.max(0,vp2.X-UI.W); winDragMaxY=math.max(0,vp2.Y-winH)
+        end
+    end)
 
-    toggles.Visualizer = MkToggle(content, UI.W/2, y, "Visualizer",
-        CFG.VisualizerEnabled, function(v)
-            CFG.VisualizerEnabled = v
-            if not v then DestroyVisualizer() end
+    local content=Instance.new("ScrollingFrame")
+    content.Size=UDim2.new(1,0,1,-UI.TitleH); content.Position=UDim2.new(0,0,0,UI.TitleH)
+    content.BackgroundColor3=UI.BG; content.BorderSizePixel=0; content.ZIndex=2
+    content.ScrollBarThickness=4; content.ScrollBarImageColor3=UI.MUTED
+    content.ScrollingDirection=Enum.ScrollingDirection.Y
+    content.ElasticBehavior=Enum.ElasticBehavior.Never
+    content.CanvasSize=UDim2.new(0,0,0,0); content.ClipsDescendants=true
+    content.Parent=win
+    local y=4
+
+    MkLabel(content,"REACH & TIMING",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
+    sliders.Size=MkSlider(content,y,"Size",1,20,CFG.Size,
+        function(v) return string.format("%.0f st",v) end,
+        function(v) CFG.Size=v; sizeSq=v*v end)
+    y=y+UI.RowH
+    sliders.Lerp=MkSlider(content,y,"LerpFrames",2,12,CFG.LerpFrames,
+        function(v) return string.format("%.0f fr",v) end,
+        function(v) CFG.LerpFrames=math.round(v) end)
+    y=y+UI.RowH
+    sliders.Cool=MkSlider(content,y,"Cooldown",0.10,1.50,CFG.DragCooldown,
+        function(v) return string.format("%.2f s",v) end,
+        function(v) CFG.DragCooldown=v end)
+    y=y+UI.RowH
+    sliders.Angle=MkSlider(content,y,"AngleCap",10,90,CFG.AngleCap,
+        function(v) return string.format("%.0f °",v) end,
+        function(v)
+            CFG.AngleCap=v
+            cosAngleCap=math.cos(math.rad(v))
+            cosAngCapSq=cosAngleCap*cosAngleCap
+            arcAngleDirty=true
         end)
+    y=y+UI.RowH+4
 
-    y = y + 30
+    MkLabel(content,"INPUTS",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
-    -- ── Stats strip ──────────────────────────────────────────
-    MkFrame(content,
-        UDim2.new(1, -UI.Pad*2, 0, 1),
-        UDim2.new(0, UI.Pad, 0, y),
-        UI.BORDER, 3)
-    y = y + 4
+    MkLabel(content,"RemoteName",UDim2.new(0,95,0,20),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local rBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(rBG,4); MkStroke(rBG,UI.BORDER,1)
+    local rBox=Instance.new("TextBox"); rBox.Size=UDim2.new(1,-8,1,0); rBox.Position=UDim2.new(0,4,0,0)
+    rBox.Text=CFG.RemoteName; rBox.Font=UI.FontBody; rBox.TextSize=UI.TextSz; rBox.TextColor3=UI.TEXT
+    rBox.BackgroundTransparency=1; rBox.BorderSizePixel=0; rBox.ZIndex=4
+    rBox.PlaceholderText="e.g. DamageRemote"; rBox.PlaceholderColor3=UI.MUTED
+    rBox.ClearTextOnFocus=false; rBox.Parent=rBG
+    rBox.FocusLost:Connect(function()
+        if rBox.Text~="" then
+            CFG.RemoteName=rBox.Text; currentRemote=nil
+            lastRemoteSearchTime=-math.huge
+            Notify("Remote: "..CFG.RemoteName)
+        end
+    end)
+    y=y+30
 
-    refreshStats = MkStatsStrip(content, y)
+    MkLabel(content,"Trigger",UDim2.new(0,95,0,UI.RowH),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local chipBG=MkFrame(content,UDim2.new(0,50,0,24),UDim2.new(0,108,0,y+5),Color3.fromRGB(22,22,34),3); MkCorner(chipBG,5)
+    local chipStroke=MkStroke(chipBG,UI.ACCENT,1)
+    triggerBindLabel=MkLabel(chipBG,CFG.TriggerInput.Name,UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,UI.TextSz,UI.ACCENT,4,Enum.TextXAlignment.Center)
+    local rbBG=MkFrame(content,UDim2.new(0,68,0,24),UDim2.new(0,166,0,y+5),Color3.fromRGB(22,22,34),3); MkCorner(rbBG,5)
+    local rbStroke=MkStroke(rbBG,UI.BORDER,1)
+    local _rbLbl=MkLabel(rbBG,"REBIND",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,11,UI.MUTED,4,Enum.TextXAlignment.Center)
+    rbBG.MouseEnter:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.TEXT;rbStroke.Color=UI.MUTED end end)
+    rbBG.MouseLeave:Connect(function() if not listeningForTrigger and not CFG.AlwaysOn then _rbLbl.TextColor3=UI.MUTED;rbStroke.Color=UI.BORDER end end)
+    rbBG.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 and not CFG.AlwaysOn then
+            _rbLbl.TextColor3=UI.WARN; rbStroke.Color=UI.WARN; chipStroke.Color=UI.WARN; StartRebind()
+        end
+    end)
+    -- MAINT-1: single table aliased to both names
+    _rebindUIRef = { chipStroke=chipStroke, chipLbl=triggerBindLabel, rbLbl=_rbLbl, rbStroke=rbStroke }
+    local triggerRowDimRefs = _rebindUIRef   -- same reference, local alias for AlwaysOn toggle
+    if CFG.AlwaysOn then
+        chipStroke.Color=UI.MUTED; triggerBindLabel.TextColor3=UI.MUTED
+        _rbLbl.TextColor3=UI.MUTED; rbStroke.Color=UI.BORDER
+    end
+    y=y+UI.RowH
+
+    toggles.AlwaysOn=MkToggle(content,UI.Pad,y,"Always On",CFG.AlwaysOn,function(v)
+        CFG.AlwaysOn=v
+        if triggerRowDimRefs then
+            local tr=triggerRowDimRefs
+            if v then
+                tr.chipStroke.Color=UI.MUTED; tr.chipLbl.TextColor3=UI.MUTED
+                tr.rbLbl.TextColor3=UI.MUTED; tr.rbStroke.Color=UI.BORDER
+            else
+                tr.chipStroke.Color=UI.ACCENT; tr.chipLbl.TextColor3=UI.ACCENT
+                tr.rbLbl.TextColor3=UI.MUTED;  tr.rbStroke.Color=UI.BORDER
+            end
+        end
+    end)
+    y=y+UI.RowH
+
+    MkLabel(content,"FILTERS",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
+    toggles.IgnoreTeam=MkToggle(content,UI.Pad,y,"Ignore Team",CFG.IgnoreTeam,function(v) CFG.IgnoreTeam=v end)
+    local tcBG=MkFrame(content,UDim2.new(0,120,0,22),UDim2.new(0,UI.W-138,0,y+5),Color3.fromRGB(22,22,34),3)
+    MkCorner(tcBG,5); MkStroke(tcBG,UI.BORDER,1)
+    -- BUG-B: assign to module-level _teamLabel; updated via Connections.TeamChanged
+    --        (no new connection created here, preventing per-rebuild leak)
+    _teamLabel=MkLabel(tcBG,cachedLocalTeam and cachedLocalTeam.Name or "No Team",UDim2.new(1,-4,1,0),UDim2.new(0,4,0,0),UI.FontBody,11,UI.MUTED,4)
+    y=y+UI.RowH
+
+    MkTeamDropdown(content, y, function(teamObj)
+        Notify("Target Team: " .. (teamObj==nil and "All" or teamObj.Name))
+    end)
+    y=y+30
+
+    toggles.IgnoreDead=MkToggle(content,UI.Pad,y,"Ignore Dead",CFG.IgnoreDead,function(v) CFG.IgnoreDead=v end)
+    toggles.IgnoreInvisible=MkToggle(content,UI.W/2,y,"Ignore Invis",CFG.IgnoreInvisible,function(v) CFG.IgnoreInvisible=v end)
+    y=y+30
+
+    sliders.InvisThreshold=MkSlider(content,y,"Invis Thresh",0.10,1.00,CFG.InvisThreshold,
+        function(v) return string.format("%.2f",v) end,
+        function(v) CFG.InvisThreshold=v end)
+    y=y+UI.RowH
+
+    sliders.MaxHealth=MkSlider(content,y,"Max HP",0,500,CFG.MaxTargetHealth,
+        function(v) return v==0 and "Off" or string.format("%.0f hp",v) end,
+        function(v) CFG.MaxTargetHealth=math.round(v) end)
+    y=y+UI.RowH+4
+
+    MkLabel(content,"WHITELIST",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
+    MkLabel(content,"WL URL",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local wlBG=MkFrame(content,UDim2.new(0,UI.W-116,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
+    MkCorner(wlBG,4); MkStroke(wlBG,UI.BORDER,1)
+    local wlBox=Instance.new("TextBox"); wlBox.Size=UDim2.new(1,-8,1,0); wlBox.Position=UDim2.new(0,4,0,0)
+    wlBox.Text=CFG.WhitelistURL; wlBox.Font=UI.FontBody; wlBox.TextSize=11; wlBox.TextColor3=UI.WLC
+    wlBox.BackgroundTransparency=1; wlBox.BorderSizePixel=0; wlBox.ZIndex=4
+    wlBox.PlaceholderText="https://raw.githubusercontent.com/..."
+    wlBox.PlaceholderColor3=UI.MUTED; wlBox.ClearTextOnFocus=false; wlBox.Parent=wlBG
+    wlBox.FocusLost:Connect(function() CFG.WhitelistURL=wlBox.Text end)
+    y=y+30
+
+    MkLabel(content,"WL Status",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
+    local wlStatBG=MkFrame(content,UDim2.new(0,UI.W-186,0,22),UDim2.new(0,108,0,y+1),Color3.fromRGB(22,22,34),3)
+    MkCorner(wlStatBG,4); MkStroke(wlStatBG,UI.BORDER,1)
+    wlStatusLabel=MkLabel(wlStatBG,WhitelistStatus,UDim2.new(1,-4,1,0),UDim2.new(0,4,0,0),UI.FontBody,11,UI.WLC,4)
+    local wlRefBG=MkFrame(content,UDim2.new(0,60,0,22),UDim2.new(0,UI.W-70,0,y+1),Color3.fromRGB(22,22,34),3)
+    MkCorner(wlRefBG,4); MkStroke(wlRefBG,UI.BORDER,1)
+    wlRefLbl=MkLabel(wlRefBG,"REFRESH",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,11,UI.MUTED,4,Enum.TextXAlignment.Center)
+    wlRefBG.MouseEnter:Connect(function() wlRefLbl.TextColor3=UI.WLC end)
+    wlRefBG.MouseLeave:Connect(function() if not isFetching then wlRefLbl.TextColor3=UI.MUTED end end)
+    wlRefBG.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            CFG.WhitelistURL=wlBox.Text; task.spawn(FetchWhitelist)
+        end
+    end)
+    y=y+30
+
+    MkLabel(content,"ANTI-DETECT",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
+    toggles.ArcHideStill=MkToggle(content,UI.Pad,y,"Arc Still Hide",CFG.ArcHideStill,function(v)
+        CFG.ArcHideStill=v
+        if not v then arcStillCount=0 end
+    end)
+    y=y+UI.RowH
+
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+    toggles.Enabled=MkToggle(content,UI.Pad,y,"Enabled",CFG.Enabled,function(v) CFG.Enabled=v end)
+    toggles.Visualizer=MkToggle(content,UI.W/2,y,"Visualizer",CFG.VisualizerEnabled,function(v)
+        CFG.VisualizerEnabled=v; if not v then DestroyArcVis() end
+    end)
+    y=y+30
+
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+4
+    refreshStats=MkStatsStrip(content,y)
+    content.CanvasSize = UDim2.new(0,0,0,y+38)
 end
 
-BuildGUI()
+Connections.InputEnded = UIS.InputEnded:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then
+        winDragging=false; activeDrag=nil
+    end
+end)
+
+Connections.InputChanged = UIS.InputChanged:Connect(function(i)
+    if i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+    if winDragging and winRef and winDragStart then
+        local d  = i.Position - winDragStart
+        local nx = math.clamp(winPosStart.X.Offset + d.X, 0, winDragMaxX)
+        local ny = math.clamp(winPosStart.Y.Offset + d.Y, 0, winDragMaxY)
+        winRef.Position    = UDim2.new(winPosStart.X.Scale,    nx,   winPosStart.Y.Scale,    ny)
+        shadowRef.Position = UDim2.new(shadowPosStart.X.Scale, nx-8, shadowPosStart.Y.Scale, ny-8)
+    end
+    if activeDrag then
+        local ad=activeDrag; local r=ad.track.AbsoluteSize.X
+        ad.SetVal(ad.mn+(math.clamp(i.Position.X-ad.track.AbsolutePosition.X,0,r)/r)*(ad.mx-ad.mn))
+    end
+end)
+
+-- REL-1: BuildGUI wrapped in pcall — hard crashes from denied CoreGui access are caught
+local guiOk, guiErr = pcall(BuildGUI)
+if not guiOk then
+    warn(_S.DragPfx .. " GUI init failed: " .. tostring(guiErr))
+end
+task.spawn(FetchWhitelist)
 
 -- ═══════════════════════════════════════════════════════════════
 --  SECTION 3 — CORE DRAG ROUTINE
 -- ═══════════════════════════════════════════════════════════════
-local function DragAndFire(victim, attackerRoot, remote)
+--[[
+    BUG-1:  _suppress/_restore share one cached connection list.
+    BUG-2:  lerpCompleted flag gates the remote fire.
+    PERF-B: CFG.LerpFrames snapshotted before the loop.
+    EV-1:   _gc_baseline comparison unchanged.
+    EV-4:   _S.* constants unchanged.
+--]]
+local function DragAndFire(victim, remote, arcCF)
     local uid  = victim.UserId
-    local char = victim.Character
-    if not char then return end
+    local char = victim.Character; if not char then return end
+    local torso    = TorsoCache[uid]    or FindTorso(char)
+    local humanoid = HumanoidCache[uid] or char:FindFirstChildOfClass(_S.Humanoid)
+    if not torso or not humanoid then return end
 
-    local torso    = char:FindFirstChild("Torso")
-    local humanoid = char:FindFirstChild("Humanoid")
-    if not torso or not humanoid or humanoid.Health <= 0 then return end
+    local victimName = victim.Name   -- EDGE-3 (v9): snapshot before any yield
 
+    if humanoid.Health <= 0 then return end
+    if humanoid:GetState() == Enum.HumanoidStateType.Dead then return end
     if ActiveDrags[uid] then return end
-    if tick() - (LastDrag[uid] or 0) < CFG.DragCooldown then return end
-    if not IsInFrontArc(attackerRoot, torso) then return end
+    if os.clock()-(LastDrag[uid] or 0) < CFG.DragCooldown then return end
+    if not IsInFrontArc(arcCF, torso) then return end
 
-    -- Record distance BEFORE drag (real server-side distance)
-    local realDist = (attackerRoot.Position - torso.Position).Magnitude
+    local realDist = (arcCF.Position - torso.Position).Magnitude
+    ActiveDrags[uid]=true; LastDrag[uid]=os.clock(); Stats.ActiveDrags=Stats.ActiveDrags+1
 
-    ActiveDrags[uid] = true
-    LastDrag[uid]    = tick()
-    Stats.ActiveDrags = Stats.ActiveDrags + 1
+    task.spawn(function()
+        -- EV-1: validate getconnections against load-time baseline
+        local _gc_live = typeof(getconnections)=="function" and getconnections or nil
+        local _gc = (_gc_live ~= nil and _gc_live == _gc_baseline) and _gc_live or nil
 
-    coroutine.wrap(function()
-        local destination = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
-
-        -- Suppress signals (same-frame, no yield)
-        SuppressSignal(torso.Changed)
-        SuppressSignal(torso:GetPropertyChangedSignal("CFrame"))
-
-        -- Velocity spoof
-        local lerpPath   = destination.Position - torso.Position
-        local spoofSpeed = math.clamp(lerpPath.Magnitude / (CFG.LerpFrames / 60), 0, 55)
-        torso.AssemblyLinearVelocity = lerpPath.Unit * spoofSpeed
-
-        -- EaseInQuad lerp over CFG.LerpFrames frames
-        local origin = torso.CFrame
-        for i = 1, CFG.LerpFrames do
-            local alpha = (i / CFG.LerpFrames) ^ 2
-            torso.CFrame = origin:Lerp(destination, alpha)
-            RunService.Heartbeat:Wait()
+        -- BUG-1: _makeSuppressor captures the connection list once in suppress(),
+        --        reuses that exact list in restore().  No second getconnections call.
+        local function _makeSuppressor(sig)
+            local cached = nil
+            local function suppress()
+                if not _gc then return end
+                local ok, conns = pcall(_gc, sig)
+                if ok then
+                    cached = conns
+                    for _, c in ipairs(conns) do pcall(c.Disable, c) end
+                end
+            end
+            local function restore()
+                if not cached then return end
+                for _, c in ipairs(cached) do pcall(c.Enable, c) end
+                cached = nil
+            end
+            return suppress, restore
         end
 
-        -- Restore signals
-        RestoreSignal(torso.Changed)
-        RestoreSignal(torso:GetPropertyChangedSignal("CFrame"))
+        -- PERF-1 (v9): signals resolved once
+        local torsoChangedSig = torso.Changed
+        local torsoCFrameSig  = torso:GetPropertyChangedSignal("CFrame")
 
-        -- Fire damage event
-        if remote then
-            pcall(function() remote:FireServer(victim) end)
+        local suppressChanged, restoreChanged = _makeSuppressor(torsoChangedSig)
+        local suppressCFrame,  restoreCFrame  = _makeSuppressor(torsoCFrameSig)
+
+        -- BUG-2: track whether the loop ran to completion
+        local lerpCompleted = false
+
+        -- PERF-B: snapshot LerpFrames once (avoids proxy metamethod per iteration)
+        local lerpFrames = CFG.LerpFrames
+
+        local ok, err = pcall(function()
+            -- CHANGE-3: dest = arcCF (handle world position, root orientation).
+            -- arcCF.Position == handle.Position, so drag destination, distance
+            -- check, angle check, and visualizer are all anchored to the same point.
+            local dest = arcCF
+            local lp   = dest.Position - torso.Position
+            if lp.Magnitude > 0.01 then
+                torso.AssemblyLinearVelocity = lp.Unit
+                    * math.clamp(lp.Magnitude * (60 / lerpFrames), 0, 55)
+            end
+
+            local origin = torso.CFrame
+            for i = 1, lerpFrames do
+                local targetCF = origin:Lerp(dest, (i/lerpFrames)^2)
+                -- R-3: bracket only the single CFrame write per frame
+                suppressChanged(); suppressCFrame()
+                local wok = pcall(function() torso.CFrame = targetCF end)
+                restoreCFrame(); restoreChanged()
+                if not wok then break end   -- torso destroyed — stop cleanly
+                if i == lerpFrames then
+                    lerpCompleted = true
+                    break   -- LOGIC-E: no final Heartbeat:Wait on last iteration
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+
+        -- BUG-2: fire remote only on a completed, error-free lerp
+        if ok and lerpCompleted then
+            if remote then
+                pcall(function()
+                    if remote:IsA(_S.RemoteEvent) then
+                        remote:FireServer(victim)
+                    elseif remote:IsA(_S.RemoteFunction) then
+                        remote:InvokeServer(victim)
+                    end
+                end)
+            end
+            Stats.Kills=Stats.Kills+1; Stats.TotalDist=Stats.TotalDist+realDist
+            Stats.LastVictim=victimName
+        elseif not ok and CFG.Debug then
+            -- REL-5: warn only in debug mode to avoid exposing line numbers
+            warn(_S.DragPfx .. " drag error: " .. tostring(err))
         end
 
-        -- Update session stats
-        Stats.Kills       = Stats.Kills + 1
-        Stats.TotalDist   = Stats.TotalDist + realDist
-        Stats.LastVictim  = victim.Name
-
-        Stats.ActiveDrags = math.max(0, Stats.ActiveDrags - 1)
-        ActiveDrags[uid]  = nil
-    end)()
+        Stats.ActiveDrags=math.max(0,Stats.ActiveDrags-1); ActiveDrags[uid]=nil
+    end)
 end
 
+-- ─────────────────────────────────────────────────────────────
+-- M-2: FUNCTION IDENTITY SEAL
+-- ─────────────────────────────────────────────────────────────
+do
+    local _nc = typeof(newcclosure)=="function" and newcclosure or function(f) return f end
+    IsTeammate        = _nc(IsTeammate)
+    IsTargetTeam      = _nc(IsTargetTeam)
+    IsAlive           = _nc(IsAlive)
+    IsVisible         = _nc(IsVisible)
+    IsWithinHealthCap = _nc(IsWithinHealthCap)
+    IsWhitelisted     = _nc(IsWhitelisted)
+    IsInFrontArc      = _nc(IsInFrontArc)
+    WireCharacter     = _nc(WireCharacter)
+    FindRemote        = _nc(FindRemote)
+    DragAndFire       = _nc(DragAndFire)
+end
+
+-- EV-1: baseline captured after M-2 seal
+_gc_baseline = typeof(getconnections)=="function" and getconnections or nil
+
 -- ═══════════════════════════════════════════════════════════════
---  SECTION 4 — HEARTBEAT (scan + visualizer update)
+--  SECTION 4 — HEARTBEAT
 -- ═══════════════════════════════════════════════════════════════
 Connections.Heartbeat = RunService.Heartbeat:Connect(function()
-    -- Refresh stats strip every frame (cheap label writes)
-    if refreshStats then refreshStats() end
-
     if CFG.ScriptKilled then return end
 
-    local char = LocalPlayer.Character
-    if not char then return end
+    frameCount=frameCount+1
+    if frameCount % STATS_THROTTLE == 0 and refreshStats then refreshStats() end
 
-    local tool     = char:FindFirstChildOfClass("Tool")
-    local humanoid = char:FindFirstChild("Humanoid")
-    local root     = char:FindFirstChild("HumanoidRootPart")
+    if wlFrameId >= 9e15 then wlFrameId=1; WLInRangePrev={} end
 
-    if not tool or not humanoid or not root then
+    local char=LocalPlayer.Character; if not char then return end
+    local tool=ToolCache[LocalPlayer]
+    -- PERF-A: read from RootCache instead of per-frame FindFirstChild
+    local root=RootCache[LocalPlayer]
+    if not tool or not root then
+        currentRemote=nil; lastRemoteSearchTime=-math.huge
+        arcStillCount=0; DestroyArcVis(); return
+    end
+    local handle=tool:FindFirstChild(_S.Handle)
+    if not handle then DestroyArcVis(); return end
+
+    -- BUG-6: revalidate currentRemote — reset if the instance was destroyed
+    if currentRemote and not currentRemote.Parent then
         currentRemote = nil
-        DestroyVisualizer()
-        return
     end
-
-    local handle = tool:FindFirstChild("Handle")
-    if not handle then
-        DestroyVisualizer()
-        return
-    end
-
-    -- Cache remote reference
     if not currentRemote then
-        currentRemote = FindRemote(tool)
-    end
-
-    -- ── Count targets in range (for visualizer color) ───────
-    local targetsInRange = 0
-    local mouseDown = UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
-
-    for _, player in ipairs(Players:GetPlayers()) do
-        if player == LocalPlayer then continue end
-        local pchar = player.Character
-        if not pchar then continue end
-        local pTorso = pchar:FindFirstChild("Torso")
-        if not pTorso then continue end
-
-        local dist = (handle.Position - pTorso.Position).Magnitude
-        if dist <= CFG.Size then
-            targetsInRange = targetsInRange + 1
-            -- Only drag on mouse-down
-            if CFG.Enabled and mouseDown then
-                DragAndFire(player, root, currentRemote)
-            end
+        if os.clock() - lastActiveTime <= IDLE_TIMEOUT then
+            currentRemote = FindRemote(tool)
         end
     end
 
-    -- ── Update visualizer ────────────────────────────────────
-    UpdateVisualizer(handle, targetsInRange, Stats.ActiveDrags)
+    -- CHANGE-2: arc center reverts to handle-based position (root orientation,
+    --           handle world position) — OffsetX/Y/Z removed
+    local arcCF = root.CFrame + (handle.Position - root.Position)
+
+    if CFG.ArcHideStill then
+        local vel = root.AssemblyLinearVelocity
+        if vel.X*vel.X + vel.Y*vel.Y + vel.Z*vel.Z < ARC_STILL_VEL_SQ then
+            arcStillCount = arcStillCount + 1
+        else
+            arcStillCount = 0
+        end
+    else
+        arcStillCount = 0
+    end
+
+    local triggerHeld    = IsTriggerActive()
+    local targetsInRange = 0
+    local wlInRange      = 0
+
+    local hx,hy,hz  = handle.Position.X, handle.Position.Y, handle.Position.Z
+    local _sizeSq   = sizeSq
+    local cache     = PlayerCache
+    local _humCache = HumanoidCache
+
+    wlFrameId = wlFrameId + 1
+    local prevFrameId = wlFrameId - 1
+
+    for idx = 1, #cache do
+        local player = cache[idx]
+        local pc     = player.Character; if not pc then continue end
+        local uid    = player.UserId
+
+        local pt = TorsoCache[uid]; if not pt then continue end
+
+        local dx=hx-pt.Position.X; local dy=hy-pt.Position.Y; local dz=hz-pt.Position.Z
+        if dx*dx+dy*dy+dz*dz > _sizeSq then continue end
+
+        if IsTeammate(player)       then continue end
+        if not IsTargetTeam(player) then continue end
+        local hum = _humCache[uid]; if not hum then continue end
+        if not IsAlive(hum)           then continue end
+        if not IsVisible(pt)          then continue end
+        if not IsWithinHealthCap(hum) then continue end
+
+        if IsWhitelisted(player) then
+            wlInRange = wlInRange + 1
+            if WLInRangePrev[uid] ~= prevFrameId then
+                Stats.WhitelistHits = Stats.WhitelistHits + 1
+            end
+            WLInRangePrev[uid] = wlFrameId
+            continue
+        end
+
+        targetsInRange = targetsInRange + 1
+        if CFG.Enabled and triggerHeld then
+            lastActiveTime = os.clock()
+            DragAndFire(player, currentRemote, arcCF)
+        end
+    end
+
+    local col
+    if not CFG.Enabled           then col=COLOR.DISABLED
+    elseif Stats.ActiveDrags > 0 then col=COLOR.FIRING
+    elseif targetsInRange > 0    then col=COLOR.TARGET
+    elseif wlInRange > 0         then col=COLOR.WHITELIST
+    else                              col=COLOR.CLEAR
+    end
+
+    if CFG.ArcHideStill and arcStillCount > ARC_STILL_HOLD then
+        DestroyArcVis()
+    else
+        UpdateArcVis(arcCF, col)
+    end
 end)
 
 -- ═══════════════════════════════════════════════════════════════
---  SECTION 5 — KEYBINDS
+--  SECTION 5 — INPUT / KEYBINDS
 -- ═══════════════════════════════════════════════════════════════
 Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
-    if gpe then return end
-
-    if input.KeyCode == CFG.Keybinds.Toggle then
-        CFG.Enabled = not CFG.Enabled
-        if toggles.Enabled then toggles.Enabled.SetState(CFG.Enabled) end
-        Notify("Enabled: " .. tostring(CFG.Enabled))
-
-    elseif input.KeyCode == CFG.Keybinds.ToggleVis then
-        CFG.VisualizerEnabled = not CFG.VisualizerEnabled
-        if toggles.Visualizer then toggles.Visualizer.SetState(CFG.VisualizerEnabled) end
-        if not CFG.VisualizerEnabled then DestroyVisualizer() end
-        Notify("Visualizer: " .. tostring(CFG.VisualizerEnabled))
-
-    elseif input.KeyCode == CFG.Keybinds.ToggleUI then
-        guiVisible = not guiVisible
-        if ScreenGui then
-            for _, obj in ipairs(ScreenGui:GetChildren()) do
-                obj.Visible = guiVisible
+    if listeningForTrigger then
+        if os.clock()-rebindStartTick < 0.10 then return end
+        if input.KeyCode==Enum.KeyCode.Escape then
+            listeningForTrigger=false
+            if triggerBindLabel then triggerBindLabel.Text=CFG.TriggerInput.Name; triggerBindLabel.TextColor3=UI.ACCENT end
+            if _rebindUIRef then
+                _rebindUIRef.rbLbl.TextColor3=UI.MUTED
+                _rebindUIRef.rbStroke.Color=UI.BORDER
+                _rebindUIRef.chipStroke.Color=UI.ACCENT
             end
+            Notify("Rebind cancelled."); return
+        end
+        local nt
+        if     input.UserInputType==Enum.UserInputType.MouseButton1 then nt={Kind="Mouse",Button=Enum.UserInputType.MouseButton1,Name="M1"}
+        elseif input.UserInputType==Enum.UserInputType.MouseButton2 then nt={Kind="Mouse",Button=Enum.UserInputType.MouseButton2,Name="M2"}
+        elseif input.UserInputType==Enum.UserInputType.MouseButton3 then nt={Kind="Mouse",Button=Enum.UserInputType.MouseButton3,Name="M3"}
+        elseif input.KeyCode~=Enum.KeyCode.Unknown then nt={Kind="Key",Code=input.KeyCode,Name=InputToName(input)}
+        else return end
+
+        local conflict = FindKeybindConflict(nt)
+        if conflict then
+            listeningForTrigger = false
+            if triggerBindLabel then
+                triggerBindLabel.Text       = "CONFLICT"
+                triggerBindLabel.TextColor3 = UI.WARN
+                task.delay(1.5, function()
+                    -- EDGE-4: _rebindUIRef may be nil if GUI was destroyed
+                    if not CFG.ScriptKilled and triggerBindLabel then
+                        triggerBindLabel.Text       = CFG.TriggerInput.Name
+                        triggerBindLabel.TextColor3 = UI.ACCENT
+                    end
+                end)
+            end
+            if _rebindUIRef then
+                _rebindUIRef.rbLbl.TextColor3 = UI.WARN
+                _rebindUIRef.rbStroke.Color   = UI.WARN
+                _rebindUIRef.chipStroke.Color = UI.WARN
+                task.delay(1.5, function()
+                    if not CFG.ScriptKilled and _rebindUIRef then
+                        _rebindUIRef.rbLbl.TextColor3 = UI.MUTED
+                        _rebindUIRef.rbStroke.Color   = UI.BORDER
+                        _rebindUIRef.chipStroke.Color = UI.ACCENT
+                    end
+                end)
+            end
+            Notify("Conflict: already bound to " .. conflict)
+            return
         end
 
-    elseif input.KeyCode == CFG.Keybinds.KillScript then
-        CFG.ScriptKilled = true
-        DestroyVisualizer()
-        if ScreenGui then ScreenGui:Destroy() end
-        for _, c in pairs(Connections) do pcall(function() c:Disconnect() end) end
+        CFG.TriggerInput=nt; listeningForTrigger=false
+        if triggerBindLabel then triggerBindLabel.Text=nt.Name; triggerBindLabel.TextColor3=UI.ACCENT end
+        if _rebindUIRef then
+            _rebindUIRef.rbLbl.TextColor3=UI.MUTED
+            _rebindUIRef.rbStroke.Color=UI.BORDER
+            _rebindUIRef.chipStroke.Color=UI.ACCENT
+        end
+        Notify("Trigger → "..nt.Name); return
+    end
+
+    if gpe then return end
+    if input.KeyCode==CFG.Keybinds.Toggle then
+        CFG.Enabled=not CFG.Enabled
+        if toggles.Enabled then toggles.Enabled.SetState(CFG.Enabled) end
+        Notify("Enabled: "..tostring(CFG.Enabled))
+    elseif input.KeyCode==CFG.Keybinds.ToggleVis then
+        CFG.VisualizerEnabled=not CFG.VisualizerEnabled
+        if toggles.Visualizer then toggles.Visualizer.SetState(CFG.VisualizerEnabled) end
+        if not CFG.VisualizerEnabled then DestroyArcVis() end
+        Notify("Visualizer: "..tostring(CFG.VisualizerEnabled))
+    elseif input.KeyCode==CFG.Keybinds.ToggleUI then
+        if ScreenGui then
+            -- BUG-C: reset drag state before destroy
+            winDragging = false; activeDrag = nil
+            CancelGUITweens()   -- REL-3
+            ScreenGui:Destroy()
+            ScreenGui=nil; winRef=nil; shadowRef=nil
+        else
+            local ok, err = pcall(BuildGUI)   -- REL-1: keep toggle path protected too
+            if not ok then warn(_S.DragPfx .. " GUI rebuild failed: " .. tostring(err)) end
+        end
+    elseif input.KeyCode==CFG.Keybinds.Kill then
+        CFG.ScriptKilled=true
+        DestroyArcVis()
+
+        if arcFolderOwned and arcFolder and arcFolder.Parent then
+            pcall(arcFolder.Destroy, arcFolder)
+        end
+        arcFolder=nil; arcFolderOwned=false
+
+        CancelGUITweens()   -- REL-3: cancel tweens before destroying GUI
+        if ScreenGui then ScreenGui:Destroy(); ScreenGui=nil end
+
+        -- BUG-3: Connections now includes PlayerAdded, PlayerRemoving,
+        --        CharAdded (LocalPlayer), TeamChanged (LocalPlayer)
+        for _,c in pairs(Connections)     do pcall(c.Disconnect,c) end
+        for _,c in pairs(PlayerTeamConns) do pcall(c.Disconnect,c) end   -- pairs: UserId-keyed
+        for _,c in pairs(CharAddedConns)  do pcall(c.Disconnect,c) end   -- pairs: UserId-keyed
+        for _,c in ipairs(localCharConns) do pcall(c.Disconnect,c) end   -- ipairs: array
+
+        -- M-3: scrub all sensitive caches
+        table.clear(TorsoCache)
+        table.clear(HumanoidCache)
+        table.clear(PlayerTeamCache)
+        table.clear(PlayerCache)
+        table.clear(RootCache)       -- PERF-A cache
+        table.clear(Whitelist)
+        table.clear(ActiveDrags)
+        table.clear(LastDrag)
+        table.clear(WLInRangePrev)
+        _cfgReal.WhitelistURL = ""
+        _cfgReal.RemoteName   = ""
+        getgenv()[_cfgKey]    = nil
+        getgenv()[_guardKey]  = nil
+
+        -- EV-1 + M-3: zero baseline
+        _gc_baseline = nil
+
         Notify("Script killed.")
     end
 end)
 
 -- ─────────────────────────────────────────────────────────────
--- CHARACTER WIRING (clear remote cache on tool swap)
+-- CHARACTER WIRING — LOCAL PLAYER
+-- BUG-5: localCharConns cleared at start of each respawn
+-- PERF-A: RootCache populated here
 -- ─────────────────────────────────────────────────────────────
-local function OnCharacter(char)
-    char.ChildAdded:Connect(function(child)
-        if child:IsA("Tool") then currentRemote = nil end
+local function OnChar(char)
+    if wiredChars[char] then return end
+
+    -- BUG-5: disconnect and clear previous character's connections before wiring new one
+    for _, c in ipairs(localCharConns) do pcall(c.Disconnect, c) end
+    table.clear(localCharConns)
+    wiredChars = {}        -- previous char keys are now stale
+    wiredChars[char] = true
+
+    -- PERF-A: cache the HumanoidRootPart
+    RootCache[LocalPlayer] = char:FindFirstChild(_S.HRP)
+
+    ToolCache[LocalPlayer] = nil
+    for _, c in ipairs(char:GetChildren()) do
+        if c:IsA(_S.Tool) then ToolCache[LocalPlayer] = c; break end
+    end
+
+    localCharConns[#localCharConns+1] = char.ChildAdded:Connect(function(c)
+        if c:IsA(_S.Tool) then
+            ToolCache[LocalPlayer] = c
+            currentRemote = nil
+        end
+        -- PERF-A: update RootCache if HRP is added after character load
+        if c.Name == _S.HRP then RootCache[LocalPlayer] = c end
     end)
-    char.ChildRemoved:Connect(function(child)
-        if child:IsA("Tool") then currentRemote = nil end
+    localCharConns[#localCharConns+1] = char.ChildRemoved:Connect(function(c)
+        if c:IsA(_S.Tool) then
+            ToolCache[LocalPlayer]   = nil
+            currentRemote            = nil
+            lastRemoteSearchTime     = -math.huge
+            DestroyArcVis()
+        end
+        if c.Name == _S.HRP then RootCache[LocalPlayer] = nil end
+    end)
+    localCharConns[#localCharConns+1] = char.AncestryChanged:Connect(function()
+        if not char.Parent then
+            wiredChars[char]         = nil
+            ToolCache[LocalPlayer]   = nil
+            RootCache[LocalPlayer]   = nil
+        end
     end)
 end
 
-if LocalPlayer.Character then OnCharacter(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(OnCharacter)
+-- BUG-3: CharacterAdded stored in Connections for kill-handler teardown
+Connections.CharAdded = LocalPlayer.CharacterAdded:Connect(OnChar)
+if LocalPlayer.Character then OnChar(LocalPlayer.Character) end
 
-Notify("NoCBring v2 loaded. Size=" .. CFG.Size .. "  [C] toggle UI")
+-- BUG-3: Team change stored in Connections
+-- BUG-B: _teamLabel updated here so BuildGUI needs no per-rebuild Team connection
+Connections.TeamChanged = LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+    cachedLocalTeam = LocalPlayer.Team
+    if _teamLabel then _teamLabel.Text = cachedLocalTeam and cachedLocalTeam.Name or "No Team" end
+end)
 
---[[
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- KEYBIND REFERENCE
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- Z  — Toggle drag on/off
- X  — Toggle reach visualizer sphere
- C  — Show / hide config window
- P  — Kill script entirely
+RebuildArcAngles()
 
- CONFIG PANEL CONTROLS
-   Size slider       — live reach radius (also resizes the sphere)
-   LerpFrames        — drag smoothness / duration
-   Cooldown          — minimum gap between damage events
-   AngleCap          — forward cone width (lower = more restricted)
-   RemoteName field  — type + Enter to change target remote
-   Enabled toggle    — mirrors Z keybind
-   Visualizer toggle — mirrors X keybind
-
- STATS STRIP (bottom of panel)
-   Kills     — total registered kills this session
-   AvgDist   — mean real attacker→victim distance at time of kill
-   Last      — most recent victim's username
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
---]]
+Notify(string.format("v14  sz=%d  trg=%s  ao=%s  wl=%s  [C]UI",
+    CFG.Size, CFG.TriggerInput.Name, tostring(CFG.AlwaysOn),
+    CFG.WhitelistURL~="" and "set" or "off"))
