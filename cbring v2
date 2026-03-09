@@ -1454,7 +1454,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
         end
     end
 
-    local arcCF = root.CFrame + (handle.Position - root.Position)
+    local arcCF = root.CFrame * CFrame.new(CFG.OffsetX, CFG.OffsetY, CFG.OffsetZ)
 
     if CFG.ArcHideStill then
         local vel = root.AssemblyLinearVelocity
