@@ -181,10 +181,13 @@ local _S = {
 -- M-1: LIVE CONFIG
 -- ─────────────────────────────────────────────────────────────
 getgenv()[_cfgKey] = getgenv()[_cfgKey] or {
-    Size            = math.random(9, 14),
+    Size            = math.min(math.random(9, 14), 20),
     LerpFrames      = 6,
     DragCooldown    = 0.40,
     AngleCap        = 50,
+    OffsetX         =  1.2,   -- drag destination offset (right of attacker)
+    OffsetY         =  0.0,   -- drag destination offset (vertical)
+    OffsetZ         = -2.8,   -- drag destination offset (forward, negative = in front)
     RemoteName      = _S.DmgRemDef,
     IgnoreTeam      = true,
     TargetTeam      = nil,
@@ -1084,7 +1087,7 @@ local function BuildGUI()
     MkLabel(content,"REACH & TIMING",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
-    sliders.Size=MkSlider(content,y,"Size",5,30,CFG.Size,
+    sliders.Size=MkSlider(content,y,"Size",1,20,CFG.Size,
         function(v) return string.format("%.0f st",v) end,
         function(v) CFG.Size=v; sizeSq=v*v end)
     y=y+UI.RowH
@@ -1104,6 +1107,22 @@ local function BuildGUI()
             cosAngCapSq=cosAngleCap*cosAngleCap
             arcAngleDirty=true
         end)
+    y=y+UI.RowH+4
+
+    MkLabel(content,"DRAG OFFSET",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
+    MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
+
+    sliders.OffX=MkSlider(content,y,"Offset X",-5,5,CFG.OffsetX,
+        function(v) return string.format("%+.1f",v) end,
+        function(v) CFG.OffsetX=v end)
+    y=y+UI.RowH
+    sliders.OffY=MkSlider(content,y,"Offset Y",-5,5,CFG.OffsetY,
+        function(v) return string.format("%+.1f",v) end,
+        function(v) CFG.OffsetY=v end)
+    y=y+UI.RowH
+    sliders.OffZ=MkSlider(content,y,"Offset Z",-5,5,CFG.OffsetZ,
+        function(v) return string.format("%+.1f",v) end,
+        function(v) CFG.OffsetZ=v end)
     y=y+UI.RowH+4
 
     MkLabel(content,"INPUTS",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
@@ -1341,7 +1360,7 @@ local function DragAndFire(victim, attackerRoot, remote, arcCF)
         local lerpFrames = CFG.LerpFrames
 
         local ok, err = pcall(function()
-            local dest = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
+            local dest = attackerRoot.CFrame * CFrame.new(CFG.OffsetX, CFG.OffsetY, CFG.OffsetZ)
             local lp   = dest.Position - torso.Position
             if lp.Magnitude > 0.01 then
                 torso.AssemblyLinearVelocity = lp.Unit
