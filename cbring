@@ -2,211 +2,6 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║  NO-BREAKJOINTS CBRING v14                                                  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
-
- New in v14:
-
-   CHANGE-3  Drag destination = tool Handle world position
-             Victims are now pulled to exactly where arcCF is — the
-             Handle's world position, with the attacker root's
-             orientation.  arcCF is already computed as:
-               root.CFrame + (handle.Position − root.Position)
-             so arcCF.Position == handle.Position precisely.
-             Using arcCF as dest means the lerp destination, the
-             distance check, the arc-angle check, and the visualizer
-             are all anchored to the same point.  attackerRoot was
-             only used to compute the old hardcoded dest and is
-             removed from DragAndFire's parameter list.
-
- New in v13:
-
-   CHANGE-1  Size range 1–20
-             Slider min changed from 5 to 1.  Config default kept at
-             math.random(8,12) which stays within the new range.
-
-   CHANGE-2  Offset feature reverted
-             OffsetX/Y/Z config keys removed.  Drag destination is
-             hardcoded to (1.2, 0.0, -2.8) relative to the attacker
-             root, matching v10 behavior.  Arc-visualizer center reverts
-             to the handle-based formula:
-               root.CFrame + (handle.Position − root.Position)
-
-   BUG-A     FetchWhitelist double ParseWhitelist call fixed
-             The previous code called ParseWhitelist(result) twice.
-             The first return value was stored in 'Whitelist' then
-             immediately shadowed; 'count' from the first call was
-             silently discarded.  Now parsed once into (newWL, count).
-
-   BUG-B     Team label connection leak in BuildGUI fixed
-             Each BuildGUI rebuild created a new, untracked
-             LocalPlayer:GetPropertyChangedSignal("Team"):Connect that
-             was never disconnected.  '_teamLabel' is now a module-level
-             reference updated from the already-tracked Connections.
-             TeamChanged handler.  Zero new connections per rebuild.
-
-   BUG-C     winDragging / activeDrag reset on GUI destroy
-             Closing the GUI (× button or C-key) while dragging the
-             title bar left activeDrag non-nil.  The next mouse-move
-             event would attempt AbsoluteSize on a destroyed Frame and
-             error.  Both winDragging and activeDrag are now explicitly
-             reset before any ScreenGui:Destroy call.
-
-   EDGE-A    Arc pool rebuild backoff after quota failure
-             UpdateArcVis called BuildArcVis every Heartbeat when
-             ArcPool was empty, hammering the instance-quota check at
-             60 Hz on failure.  A _arcBuildFailTick counter now
-             enforces a 60-frame cooldown between rebuild attempts.
-
-   LOGIC-E   Unnecessary final Heartbeat:Wait on lerp completion
-             The lerp loop waited an extra frame after marking
-             lerpCompleted = true on the last iteration.  The wait is
-             now gated on i < lerpFrames, removing one frame of latency
-             from every successful drag.
-
-   MAINT-A   sliders / toggles / refreshStats cleared at BuildGUI start
-             Stale keys (e.g. sliders.OffX after offset removal)
-             persisted between rebuilds.  All three tables are cleared
-             before constructing new controls.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- INHERITED FROM v12 (29 findings) and v11 (EV-1, EV-4) and
- v10 (M-1…M-5, R-3, D-3, D-4, N-4, QoL-7)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WHITELIST FORMAT
-   # comment
-   123456789
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
- New in v12 (all findings from v11 code review):
-
-   BUG-1  _suppress/_restore cached-list pair
-          getconnections was called twice per signal per frame.  Each pair
-          now shares one connection list captured at suppress-time and
-          reused verbatim at restore-time.  Eliminates double-query race
-          and halves the number of getconnections calls per drag.
-
-   BUG-2  lerpCompleted flag gates FireServer
-          The remote no longer fires when the lerp loop was broken early
-          (torso destroyed mid-drag).  A boolean set only on clean loop
-          completion guards the FireServer/InvokeServer branch.
-
-   BUG-3  Kill handler disconnects all 4 persistent signals
-          Players.PlayerAdded, Players.PlayerRemoving,
-          LocalPlayer.CharacterAdded, and LocalPlayer.Team are now stored
-          in the Connections table and torn down by the kill handler.
-
-   BUG-4  WireCharacter disconnects stale CharacterAdded connection
-          Before overwriting CharAddedConns[uid], the existing connection
-          is disconnected.  Prevents doubled OnChar invocations from a
-          race between the initial GetPlayers loop and PlayerAdded.
-
-   BUG-5  localCharConns cleared on each respawn
-          OnChar now disconnects and clears the previous character's
-          connections before wiring the new one.  Prevents unbounded
-          growth across many respawns.
-
-   BUG-6  Stale currentRemote revalidated each frame
-          The Heartbeat checks currentRemote.Parent before the FindRemote
-          branch.  A destroyed remote resets currentRemote to nil and
-          triggers a fresh search.
-
-   EDGE-1 BuildArcVis commits pool only after full build
-          ArcPool = nxt is written only when all 2+ARC_SEGS parts are
-          confirmed.  UpdateArcVis also guards against a partial pool.
-
-   EDGE-2 FetchWhitelist retry loop respects ScriptKilled
-          Each iteration checks CFG.ScriptKilled before the wait and
-          before the HttpGet, preventing a woken coroutine from
-          overwriting a post-kill scrubbed Whitelist.
-
-   EDGE-3 GetArcFolder validates Parent == workspace
-          Previously accepted a folder re-parented to any service.  Now
-          requires Parent == workspace.
-
-   EDGE-4 AncestryChanged nils _rebindUIRef
-          Prevents task.delay callbacks from writing .TextColor3/.Color
-          to dead UI instances after an external CoreGui sweep.
-
-   EDGE-5 Dropdown pre-computes display:lower()
-          displayLow is cached per row in BuildRowCache.  FilterRows no
-          longer allocates a lowercased string per row per keystroke.
-
-   EDGE-6 FetchWhitelist validates URL format
-          Rejects non-http(s) URLs before calling HttpGet.
-
-   EDGE-7 RebuildArcAngles guards AngleCap == 0
-          Clamps the half-angle to a minimum of 1° to prevent a
-          degenerate single-line arc.
-
-   PERF-A RootCache eliminates per-frame HRP child search
-          OnChar caches HumanoidRootPart in RootCache[LocalPlayer].
-          The Heartbeat reads from the cache instead of FindFirstChild.
-
-   PERF-B LerpFrames snapshotted before lerp loop
-          CFG.LerpFrames is read once through the proxy metamethod
-          before the loop rather than on every iteration.
-
-   PERF-C display:lower() pre-computed — covered by EDGE-5.
-
-   PERF-D DD_ROW_TWEEN module-level constant
-          TweenInfo.new(0.08) is no longer allocated per hover event.
-
-   PERF-E SetBeam skips redundant Size write
-          A weak per-part cache stores last len+thick.  The Size
-          property is only written when the value changes by > 0.005.
-          CFrame.lookAt Vector3 midpoint allocation also eliminated by
-          computing all six components inline.
-
-   PERF-F ARC_TOTAL constant
-          2 + ARC_SEGS is precomputed as ARC_TOTAL.
-
-   PERF-G _randBuf reuses a module-level table
-          RandName no longer allocates a table.create(6) on every call.
-
-   REL-1  BuildGUI wrapped in pcall
-          Hard crashes from denied CoreGui access are caught and logged;
-          the combat logic and keybind connections are registered
-          regardless of GUI availability.
-
-   REL-2  Kill handler pair/ipairs audit (documented, correct as-is)
-          PlayerTeamConns and CharAddedConns are UserId-keyed hash
-          tables → pairs correct.  localCharConns is an integer array
-          → ipairs correct.
-
-   REL-3  GUI tweens cancelled before ScreenGui:Destroy
-          MkToggle registers a canceller callback in _guiTweenCancellers.
-          BuildGUI and the kill handler call CancelGUITweens() before
-          destroying the ScreenGui, preventing tween callbacks from
-          firing on destroyed instances.
-
-   REL-4  WireCharacter retry cache writes wrapped in pcall
-          Defensive against a mid-stream character reset that destroys
-          the char reference between the 0.5 s delay and the write.
-
-   REL-5  DragAndFire drag-error warn removed in non-debug builds
-          The warn that exposed internal line numbers is now guarded by
-          CFG.Debug (default false).
-
-   MAINT-1 triggerRowDimRefs unified with _rebindUIRef
-           Both variables now reference the same table.
-
-   MAINT-2 guiVisible removed
-           Dead flag that was never read.
-
-   MAINT-3 "NoCBring Config" label uses _S.Title
-           Consistent with the EV-4 policy.
-
-   MAINT-4 FetchWhitelist retry restructured for clarity
-           Kill-guard extracted to top of each iteration; wait moved to
-           a cleaner position.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- INHERITED FROM v11 (EV-1, EV-4) and v10 (M-1…M-5, R-3, D-3,
- D-4, N-4, QoL-7) and v9 (all 22 code-review findings)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WHITELIST FORMAT
-   # comment
-   123456789
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
 -- ─────────────────────────────────────────────────────────────
@@ -584,11 +379,15 @@ local lastRemoteSearchTime = -math.huge
 local function FindRemote(tool)
     local now = os.clock()
     if now - lastRemoteSearchTime < 1 then return nil end
+    -- Stamp the time before any search so that both a hit and a miss apply
+    -- the 1-second cooldown equally.  The previous code only updated the
+    -- timestamp on a miss, meaning a destroyed-then-nil'd remote (BUG-6 path)
+    -- would cause a per-frame recursive deep-search until a remote was found.
+    lastRemoteSearchTime = now
     local r = tool:FindFirstChild(CFG.RemoteName, true)
     if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
     r = ReplicatedStorage:FindFirstChild(CFG.RemoteName, true)
     if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
-    lastRemoteSearchTime = now
     return nil
 end
 
@@ -893,7 +692,9 @@ local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
     local knob=MkFrame(track,UDim2.new(0,KS,0,KS),UDim2.new(0,-KS/2,0.5,-KS/2),Color3.fromRGB(255,255,255),5)
     MkCorner(knob,KS); MkStroke(knob,UI.ACCENT,2)
     local valLbl=MkLabel(row,fmt(def),UDim2.new(0,58,1,0),UDim2.new(0,108+UI.SliderW+6,0,0),UI.Font,UI.TextSz,UI.ACCENT,3)
-    local isInt=math.floor(mn)==mn and math.floor(mx)==mx and math.floor(def)==def
+    -- isInt should reflect the slider's *range*, not its initial value.
+    -- Including def caused a float slider when bounds were integers but def wasn't.
+    local isInt=math.floor(mn)==mn and math.floor(mx)==mx
     local range=mx-mn
     local function SetVal(v)
         v=math.clamp(v,mn,mx)
@@ -1110,7 +911,8 @@ local function BuildGUI()
     -- BUG-C: reset drag state so no stale activeDrag survives the rebuild
     CancelGUITweens()
     winDragging = false; activeDrag = nil
-    if ScreenGui then ScreenGui:Destroy() end
+    if ScreenGui then ScreenGui:Destroy(); ScreenGui = nil end  -- nil immediately; if BuildGUI throws
+    -- after this point ScreenGui is guaranteed nil until sg is committed below
     -- MAINT-A: clear control tables so no stale keys survive between builds
     table.clear(sliders); table.clear(toggles); refreshStats = nil
 
@@ -1348,7 +1150,7 @@ end)
 
 Connections.InputChanged = UIS.InputChanged:Connect(function(i)
     if i.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-    if winDragging and winRef and winDragStart then
+    if winDragging and winRef and shadowRef and winDragStart then
         local d  = i.Position - winDragStart
         local nx = math.clamp(winPosStart.X.Offset + d.X, 0, winDragMaxX)
         local ny = math.clamp(winPosStart.Y.Offset + d.Y, 0, winDragMaxY)
@@ -1439,10 +1241,11 @@ local function DragAndFire(victim, remote, arcCF)
             -- arcCF.Position == handle.Position, so drag destination, distance
             -- check, angle check, and visualizer are all anchored to the same point.
             local dest = arcCF
-            local lp   = dest.Position - torso.Position
-            if lp.Magnitude > 0.01 then
-                torso.AssemblyLinearVelocity = lp.Unit
-                    * math.clamp(lp.Magnitude * (60 / lerpFrames), 0, 55)
+            local lp    = dest.Position - torso.Position
+            local lpMag = lp.Magnitude  -- cache once; .Unit would recompute sqrt
+            if lpMag > 0.01 then
+                torso.AssemblyLinearVelocity = (lp / lpMag)
+                    * math.clamp(lpMag * (60 / lerpFrames), 0, 55)
             end
 
             local origin = torso.CFrame
@@ -1512,7 +1315,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     frameCount=frameCount+1
     if frameCount % STATS_THROTTLE == 0 and refreshStats then refreshStats() end
 
-    if wlFrameId >= 9e15 then wlFrameId=1; WLInRangePrev={} end
+    if wlFrameId >= 9e15 then wlFrameId=1; table.clear(WLInRangePrev) end
 
     local char=LocalPlayer.Character; if not char then return end
     local tool=ToolCache[LocalPlayer]
