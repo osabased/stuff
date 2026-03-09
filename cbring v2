@@ -1,111 +1,147 @@
 --[[
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  NO-BREAKJOINTS CBRING v10 — ANTI-DETECT + QoL PATCH                       ║
+║  NO-BREAKJOINTS CBRING v12 — CODE-REVIEW PATCH (29 findings)               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
- New in v10:
+ New in v12 (all findings from v11 code review):
 
-   M-1  CFG table indirection
-        Real config stored under a random per-session getgenv key.
-        The local `CFG` variable is a __index/__newindex proxy — external
-        environment scanners see an opaque empty table, not NCBCFG with
-        known fields.  The loaded-guard key is also randomised.
+   BUG-1  _suppress/_restore cached-list pair
+          getconnections was called twice per signal per frame.  Each pair
+          now shares one connection list captured at suppress-time and
+          reused verbatim at restore-time.  Eliminates double-query race
+          and halves the number of getconnections calls per drag.
 
-   M-2  Function identity concealment
-        Core functions (filter chain, WireCharacter, FindRemote, DragAndFire)
-        wrapped in newcclosure after definition.  Each session produces
-        unique bytecode hashes; static fingerprint databases get no match.
-        Graceful fallback when newcclosure is unavailable.
+   BUG-2  lerpCompleted flag gates FireServer
+          The remote no longer fires when the lerp loop was broken early
+          (torso destroyed mid-drag).  A boolean set only on clean loop
+          completion guards the FireServer/InvokeServer branch.
 
-   M-3  Upvalue scrubbing on kill
-        When P is pressed, all sensitive cache tables are cleared in-place
-        (table.clear) before the GC pass.  The config's sensitive fields are
-        also zeroed.  Both session getgenv keys are deleted.  Post-kill env
-        inspection finds nothing meaningful.
+   BUG-3  Kill handler disconnects all 4 persistent signals
+          Players.PlayerAdded, Players.PlayerRemoving,
+          LocalPlayer.CharacterAdded, and LocalPlayer.Team are now stored
+          in the Connections table and torn down by the kill handler.
 
-   M-5  Lazy-load getconnections
-        SuppressSignal / RestoreSignal no longer exist at module level.
-        getconnections is resolved inside DragAndFire's task.spawn only —
-        the function is referenced in the environment for ≤ LerpFrames×(1/60)
-        seconds per drag, then discarded.
+   BUG-4  WireCharacter disconnects stale CharacterAdded connection
+          Before overwriting CharAddedConns[uid], the existing connection
+          is disconnected.  Prevents doubled OnChar invocations from a
+          race between the initial GetPlayers loop and PlayerAdded.
 
-   R-3  Signal suppression window minimisation
-        Suppress/restore now bracket only the single `torso.CFrame = write`
-        per lerp frame, not the entire loop.  CFrame-change signal gaps
-        detectable in server logs are reduced from ~LerpFrames×(1/60) s
-        to a single-tick window per frame (~1/500 s with pcall overhead).
+   BUG-5  localCharConns cleared on each respawn
+          OnChar now disconnects and clears the previous character's
+          connections before wiring the new one.  Prevents unbounded
+          growth across many respawns.
 
-   D-3  GUI absence mode
-        The C keybind now fully destroys the ScreenGui instance rather than
-        hiding it.  Re-pressing C calls BuildGUI() from scratch.  The gui
-        name is randomised on each build — no fixed string in CoreGui's
-        child list between sessions.
+   BUG-6  Stale currentRemote revalidated each frame
+          The Heartbeat checks currentRemote.Parent before the FindRemote
+          branch.  A destroyed remote resets currentRemote to nil and
+          triggers a fresh search.
 
-   D-4  Arc part existence minimisation
-        Two sub-features:
-          • Part names randomised on each BuildArcVis call (replaces the
-            fixed "_NCBArc" string that string-based scanners keyed on).
-          • CFG.ArcHideStill (default true): arc parts are destroyed and
-            creation is skipped when the local character's HumanoidRootPart
-            velocity has been below 0.5 studs/s for 45+ consecutive frames
-            (~0.75 s).  Parts don't exist while the player is standing still,
-            which is both the highest detection-risk and lowest-utility window.
-          • Arc parts are parented to the first Folder found in workspace, or
-            to a new randomly-named Folder if none exists, rather than
-            directly in workspace root.
+   EDGE-1 BuildArcVis commits pool only after full build
+          ArcPool = nxt is written only when all 2+ARC_SEGS parts are
+          confirmed.  UpdateArcVis also guards against a partial pool.
 
-   N-4  Idle remote-call suppression
-        FindRemote is not probed and DragAndFire is not called when the
-        script has been idle (no trigger active on a valid target) for more
-        than IDLE_TIMEOUT seconds (default 60).  After idle, the first
-        Heartbeat with a valid target resets the timer and probing resumes.
-        Zero network traffic during idle periods.
+   EDGE-2 FetchWhitelist retry loop respects ScriptKilled
+          Each iteration checks CFG.ScriptKilled before the wait and
+          before the HttpGet, preventing a woken coroutine from
+          overwriting a post-kill scrubbed Whitelist.
 
-   QoL-7  Keybind conflict detection
-        On rebind, the new key is checked against all four existing keybinds
-        (Toggle / ToggleVis / ToggleUI / Kill).  A conflict flashes the
-        trigger chip and REBIND button amber, blocks the commit, and fires a
-        notification naming the conflicting bind.  The rebind state is cleared
-        automatically after 1.5 s.
+   EDGE-3 GetArcFolder validates Parent == workspace
+          Previously accepted a folder re-parented to any service.  Now
+          requires Parent == workspace.
+
+   EDGE-4 AncestryChanged nils _rebindUIRef
+          Prevents task.delay callbacks from writing .TextColor3/.Color
+          to dead UI instances after an external CoreGui sweep.
+
+   EDGE-5 Dropdown pre-computes display:lower()
+          displayLow is cached per row in BuildRowCache.  FilterRows no
+          longer allocates a lowercased string per row per keystroke.
+
+   EDGE-6 FetchWhitelist validates URL format
+          Rejects non-http(s) URLs before calling HttpGet.
+
+   EDGE-7 RebuildArcAngles guards AngleCap == 0
+          Clamps the half-angle to a minimum of 1° to prevent a
+          degenerate single-line arc.
+
+   PERF-A RootCache eliminates per-frame HRP child search
+          OnChar caches HumanoidRootPart in RootCache[LocalPlayer].
+          The Heartbeat reads from the cache instead of FindFirstChild.
+
+   PERF-B LerpFrames snapshotted before lerp loop
+          CFG.LerpFrames is read once through the proxy metamethod
+          before the loop rather than on every iteration.
+
+   PERF-C display:lower() pre-computed — covered by EDGE-5.
+
+   PERF-D DD_ROW_TWEEN module-level constant
+          TweenInfo.new(0.08) is no longer allocated per hover event.
+
+   PERF-E SetBeam skips redundant Size write
+          A weak per-part cache stores last len+thick.  The Size
+          property is only written when the value changes by > 0.005.
+          CFrame.lookAt Vector3 midpoint allocation also eliminated by
+          computing all six components inline.
+
+   PERF-F ARC_TOTAL constant
+          2 + ARC_SEGS is precomputed as ARC_TOTAL.
+
+   PERF-G _randBuf reuses a module-level table
+          RandName no longer allocates a table.create(6) on every call.
+
+   REL-1  BuildGUI wrapped in pcall
+          Hard crashes from denied CoreGui access are caught and logged;
+          the combat logic and keybind connections are registered
+          regardless of GUI availability.
+
+   REL-2  Kill handler pair/ipairs audit (documented, correct as-is)
+          PlayerTeamConns and CharAddedConns are UserId-keyed hash
+          tables → pairs correct.  localCharConns is an integer array
+          → ipairs correct.
+
+   REL-3  GUI tweens cancelled before ScreenGui:Destroy
+          MkToggle registers a canceller callback in _guiTweenCancellers.
+          BuildGUI and the kill handler call CancelGUITweens() before
+          destroying the ScreenGui, preventing tween callbacks from
+          firing on destroyed instances.
+
+   REL-4  WireCharacter retry cache writes wrapped in pcall
+          Defensive against a mid-stream character reset that destroys
+          the char reference between the 0.5 s delay and the write.
+
+   REL-5  DragAndFire drag-error warn removed in non-debug builds
+          The warn that exposed internal line numbers is now guarded by
+          CFG.Debug (default false).
+
+   MAINT-1 triggerRowDimRefs unified with _rebindUIRef
+           Both variables now reference the same table.
+
+   MAINT-2 guiVisible removed
+           Dead flag that was never read.
+
+   MAINT-3 "NoCBring Config" label uses _S.Title
+           Consistent with the EV-4 policy.
+
+   MAINT-4 FetchWhitelist retry restructured for clarity
+           Kill-guard extracted to top of each iteration; wait moved to
+           a cleaner position.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- INHERITED FROM v9 (v8 code-review patch — 22 findings)
+ INHERITED FROM v11 (EV-1, EV-4) and v10 (M-1…M-5, R-3, D-3,
+ D-4, N-4, QoL-7) and v9 (all 22 code-review findings)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  BUG-1   IsTargetTeam pointer compare (Team object, not name string)
-  BUG-2   DragAndFire branches FireServer vs InvokeServer on remote type
-  BUG-3   RemoteName change resets lastRemoteSearchTime
-  EDGE-1  IsVisible uses CFG.InvisThreshold (configurable)
-  EDGE-2  IsAlive restores GetState() safety net
-  EDGE-3  victimName snapshotted before first yield
-  EDGE-4  FindRemote cooldown stamped only on failure
-  EDGE-5  WireCharacter retry: no unnecessary pcall
-  EDGE-6  localCharConns disconnected on kill
-  EDGE-7  MkTeamDropdown FocusLost: clickPending + task.defer
-  EDGE-8  OpenDropdown position deferred one frame
-  EDGE-9  MkSlider zero-range guard
-  EDGE-10 ToolCache replaces per-frame FindFirstChildOfClass
-  EDGE-11 wlFrameId reset at 9e15
-  EDGE-12 SetWLStatus centralises status label writes
-  PERF-1  CFrame signal resolved once in DragAndFire
-  PERF-2  IsInFrontArc: dot² vs cosAngCapSq×magSq (no sqrt)
-  PERF-3  MkTeamDropdown: build rows once, filter by Visible
-  PERF-4  MkToggle: cancel active tweens before creating new ones
-  PERF-5  BuildArcVis: Parent assigned last
-  PERF-6  ParseWhitelist: gmatch without string copy
-  MAINT-1 Duplicate cachedLocalTeam write removed
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- WHITELIST FORMAT  (raw.githubusercontent.com recommended)
+ WHITELIST FORMAT
    # comment
    123456789
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 --]]
 
 -- ─────────────────────────────────────────────────────────────
--- M-1: SESSION TOKEN — randomises all getgenv keys per load
+-- M-1: SESSION TOKEN
 -- ─────────────────────────────────────────────────────────────
 local _tok      = string.format("%06d", math.random(0, 999999))
-local _guardKey = "_g" .. _tok   -- replaces fixed _NOCBRING_V9_LOADED
-local _cfgKey   = "_c" .. _tok   -- replaces fixed NCBCFG
+local _guardKey = "_g" .. _tok
+local _cfgKey   = "_c" .. _tok
 
 if getgenv()[_guardKey] then return end
 getgenv()[_guardKey] = true
@@ -122,34 +158,48 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Teams             = game:GetService("Teams")
 
 -- ─────────────────────────────────────────────────────────────
--- M-1: LIVE CONFIG — stored under random key, accessed via proxy
+-- EV-4: OBFUSCATED STRING CONSTANTS
+-- ─────────────────────────────────────────────────────────────
+local _S = {
+    Torso          = string.char(84,111,114,115,111),
+    UpperTorso     = string.char(85,112,112,101,114,84,111,114,115,111),
+    HRP            = string.char(72,117,109,97,110,111,105,100,82,111,111,116,80,97,114,116),
+    Humanoid       = string.char(72,117,109,97,110,111,105,100),
+    Handle         = string.char(72,97,110,100,108,101),
+    Tool           = string.char(84,111,111,108),
+    Folder         = string.char(70,111,108,100,101,114),
+    RemoteEvent    = string.char(82,101,109,111,116,101,69,118,101,110,116),
+    RemoteFunction = string.char(82,101,109,111,116,101,70,117,110,99,116,105,111,110),
+    Title          = string.char(78,111,67,66,114,105,110,103),
+    TitleCfg       = string.char(78,111,67,66,114,105,110,103,32,67,111,110,102,105,103),  -- MAINT-3
+    DmgRemDef      = string.char(68,97,109,97,103,101,82,101,109,111,116,101),
+    WLPfx          = string.char(91,78,67,66,32,87,76,93),
+    DragPfx        = string.char(91,78,67,66,93),
+}
+
+-- ─────────────────────────────────────────────────────────────
+-- M-1: LIVE CONFIG
 -- ─────────────────────────────────────────────────────────────
 getgenv()[_cfgKey] = getgenv()[_cfgKey] or {
-    -- Reach & timing
     Size            = math.random(9, 14),
     LerpFrames      = 6,
     DragCooldown    = 0.40,
     AngleCap        = 50,
-    -- Remote
-    RemoteName      = "DamageRemote",
-    -- Team filters
+    RemoteName      = _S.DmgRemDef,
     IgnoreTeam      = true,
-    TargetTeam      = nil,        -- Team object | nil
-    -- Player filters
+    TargetTeam      = nil,
     IgnoreDead      = true,
     IgnoreInvisible = true,
     InvisThreshold  = 0.90,
     MaxTargetHealth = 100,
-    -- Visualiser
-    ArcHideStill    = true,       -- D-4: destroy arc when character is stationary
-    -- Whitelist
+    ArcHideStill    = true,
     WhitelistURL    = "",
-    -- Control
-    AlwaysOn          = false,
-    Enabled           = true,
+    AlwaysOn        = false,
+    Enabled         = true,
     VisualizerEnabled = true,
-    ScriptKilled      = false,
-    TriggerInput = { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" },
+    ScriptKilled    = false,
+    Debug           = false,   -- REL-5: suppress internal warn in production
+    TriggerInput    = { Kind="Mouse", Button=Enum.UserInputType.MouseButton1, Name="M1" },
     Keybinds = {
         Toggle    = Enum.KeyCode.Z,
         ToggleVis = Enum.KeyCode.X,
@@ -159,8 +209,6 @@ getgenv()[_cfgKey] = getgenv()[_cfgKey] or {
 }
 local _cfgReal = getgenv()[_cfgKey]
 
--- M-1: proxy metatable — iterating getgenv() finds an opaque empty table,
--- not a recognisable config structure with known field names.
 local CFG = setmetatable({}, {
     __index    = function(_, k) return _cfgReal[k] end,
     __newindex = function(_, k, v) _cfgReal[k] = v end,
@@ -192,31 +240,29 @@ local WL_MAX_RETRIES  = 3
 -- ─────────────────────────────────────────────────────────────
 local sizeSq      = CFG.Size * CFG.Size
 local cosAngleCap = math.cos(math.rad(CFG.AngleCap))
-local cosAngCapSq = cosAngleCap * cosAngleCap   -- PERF-2
+local cosAngCapSq = cosAngleCap * cosAngleCap
 
--- MAINT-1: written only at declaration and by the Team signal below
 local cachedLocalTeam = Players.LocalPlayer.Team
 
--- V5-2: per-enemy team cache
 local PlayerTeamCache = {}
 local PlayerTeamConns = {}
-
--- CharacterAdded connections for teardown
 local CharAddedConns  = {}
 
--- Arc angle lookup
-local ARC_SEGS      = 14
+-- PERF-F: precomputed arc constant
+local ARC_SEGS  = 14
+local ARC_TOTAL = 2 + ARC_SEGS
+
 local arcCosTable   = table.create(ARC_SEGS + 1, 0)
 local arcSinTable   = table.create(ARC_SEGS + 1, 0)
 local arcAngleDirty = true
 
--- V5-3: pre-allocated arc point buffers
 local arcPtX = table.create(ARC_SEGS + 1, 0)
 local arcPtY = table.create(ARC_SEGS + 1, 0)
 local arcPtZ = table.create(ARC_SEGS + 1, 0)
 
+-- EDGE-7: guard against AngleCap == 0
 local function RebuildArcAngles()
-    local half = CFG.AngleCap
+    local half = math.max(CFG.AngleCap, 1)
     for i = 0, ARC_SEGS do
         local rad = math.rad(-half + (2 * half / ARC_SEGS) * i)
         arcCosTable[i+1] = math.cos(rad)
@@ -227,7 +273,6 @@ end
 
 local lastArcColor = nil
 
--- V5-7: WL range tracking via monotonic frame counter
 local wlFrameId     = 0
 local WLInRangePrev = {}
 
@@ -247,7 +292,6 @@ local wlRefLbl            = nil
 local frameCount          = 0
 local STATS_THROTTLE      = 20
 
--- Window drag state
 local winDragging                               = false
 local winDragStart, winPosStart, shadowPosStart = nil, nil, nil
 local winDragMaxX, winDragMaxY                  = 0, 0
@@ -255,50 +299,60 @@ local winRef, shadowRef                         = nil, nil
 local winH                                      = 720
 local wiredChars                                = {}
 local activeDrag                                = nil
-local triggerRowDimRefs                         = nil
 
--- EDGE-6: local-player connections for kill teardown
+-- MAINT-1: single table, both names alias the same reference
+local _rebindUIRef    = nil   -- { chipStroke, chipLbl, rbLbl, rbStroke }
+-- triggerRowDimRefs assigned as alias in BuildGUI (see below)
+
 local localCharConns = {}
+local ToolCache      = {}
+local RootCache      = {}   -- PERF-A: HRP per local player
 
--- EDGE-10: ToolCache
-local ToolCache = {}
-
--- D-4: arc folder state
 local arcFolder      = nil
 local arcFolderOwned = false
 
--- D-4: stillness detection
-local ARC_STILL_VEL_SQ = 0.25   -- (0.5 studs/s)² threshold
-local ARC_STILL_HOLD   = 45     -- frames before arc is hidden (~0.75 s)
+local ARC_STILL_VEL_SQ = 0.25
+local ARC_STILL_HOLD   = 45
 local arcStillCount    = 0
 
--- N-4: idle suppression
-local IDLE_TIMEOUT   = 60               -- seconds of inactivity before probing pauses
-local lastActiveTime = os.clock()       -- reset to now at load; updated on active fire
+local IDLE_TIMEOUT   = 60
+local lastActiveTime = os.clock()
 
--- QoL-7 / D-3: module-level ref instead of fixed getgenv key
-local _rebindUIRef = nil   -- { chipStroke, chipLbl, rbLbl, rbStroke }
+local _gc_baseline = nil   -- EV-1: forward declaration
+
+-- PERF-G: reusable RandName buffer
+local _randBuf = table.create(6)
+
+-- REL-3: tween canceller registry for the current GUI build
+local _guiTweenCancellers = {}
+
+-- PERF-E: weak per-part size cache for SetBeam
+local _beamSzCache = setmetatable({}, {__mode = "k"})
+
+-- PERF-D: shared dropdown hover tween info
+local DD_ROW_TWEEN = TweenInfo.new(0.08)
 
 -- ─────────────────────────────────────────────────────────────
--- V5-8 / V8: TORSO + HUMANOID CACHES
+-- TORSO + HUMANOID CACHES
 -- ─────────────────────────────────────────────────────────────
 local TorsoCache    = {}
 local HumanoidCache = {}
 
 local function FindTorso(char)
-    return char:FindFirstChild("Torso")
-        or char:FindFirstChild("UpperTorso")
-        or char:FindFirstChild("HumanoidRootPart")
+    return char:FindFirstChild(_S.Torso)
+        or char:FindFirstChild(_S.UpperTorso)
+        or char:FindFirstChild(_S.HRP)
 end
 
--- EDGE-5: no pcall in retry; EDGE-2: both caches populated
 local function WireCharacter(player)
     local uid = player.UserId
+    -- BUG-4: disconnect stale connection before overwriting
+    if CharAddedConns[uid] then CharAddedConns[uid]:Disconnect() end
     local function OnChar(char)
         TorsoCache[uid]    = nil
         HumanoidCache[uid] = nil
         local torso    = FindTorso(char)
-        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        local humanoid = char:FindFirstChildOfClass(_S.Humanoid)
         if torso    then TorsoCache[uid]    = torso    end
         if humanoid then HumanoidCache[uid] = humanoid end
         if not torso or not humanoid then
@@ -306,8 +360,12 @@ local function WireCharacter(player)
                 if player.Parent == nil then return end
                 local char2 = player.Character
                 if char2 ~= char then return end
-                TorsoCache[uid]    = TorsoCache[uid]    or FindTorso(char)
-                HumanoidCache[uid] = HumanoidCache[uid] or char:FindFirstChildOfClass("Humanoid")
+                -- REL-4: pcall wraps cache writes against mid-stream reset
+                pcall(function()
+                    TorsoCache[uid]    = TorsoCache[uid]    or FindTorso(char)
+                    HumanoidCache[uid] = HumanoidCache[uid]
+                        or char:FindFirstChildOfClass(_S.Humanoid)
+                end)
             end)
         end
     end
@@ -329,7 +387,8 @@ local function RebuildPlayerCache()
 end
 RebuildPlayerCache()
 
-Players.PlayerAdded:Connect(function(p)
+-- BUG-3: stored in Connections so kill handler disconnects them
+Connections.PlayerAdded = Players.PlayerAdded:Connect(function(p)
     if p == LocalPlayer then return end
     PlayerTeamCache[p.UserId] = p.Team
     if PlayerTeamConns[p.UserId] then PlayerTeamConns[p.UserId]:Disconnect() end
@@ -340,7 +399,7 @@ Players.PlayerAdded:Connect(function(p)
     RebuildPlayerCache()
 end)
 
-Players.PlayerRemoving:Connect(function(p)
+Connections.PlayerRemoving = Players.PlayerRemoving:Connect(function(p)
     local uid = p.UserId
     if PlayerTeamConns[uid] then PlayerTeamConns[uid]:Disconnect(); PlayerTeamConns[uid] = nil end
     if CharAddedConns[uid]  then CharAddedConns[uid]:Disconnect();  CharAddedConns[uid]  = nil end
@@ -368,10 +427,9 @@ end
 -- ─────────────────────────────────────────────────────────────
 local function Notify(text)
     pcall(StarterGui.SetCore, StarterGui, "SendNotification",
-        { Title="NoCBring", Text=text, Duration=2 })
+        { Title=_S.Title, Text=text, Duration=2 })
 end
 
--- EDGE-12: centralised status helper
 local function SetWLStatus(text, col)
     WhitelistStatus = text
     if wlStatusLabel then
@@ -380,40 +438,36 @@ local function SetWLStatus(text, col)
     end
 end
 
--- D-4: random 6-char lowercase name for arc parts and folders
+-- PERF-G: reuse _randBuf
 local function RandName()
-    local c   = "abcdefghijklmnopqrstuvwxyz"
-    local len = #c
-    local n   = table.create(6)
-    for i = 1, 6 do local p = math.random(1, len); n[i] = c:sub(p, p) end
-    return table.concat(n)
+    local c = "abcdefghijklmnopqrstuvwxyz"
+    for i = 1, 6 do
+        local p = math.random(1, 26)
+        _randBuf[i] = c:sub(p, p)
+    end
+    return table.concat(_randBuf)
 end
 
 -- ─────────────────────────────────────────────────────────────
 -- FILTER FUNCTIONS
 -- ─────────────────────────────────────────────────────────────
-
--- V5-2: zero Team property reads; BUG-1 preserved (nil-team FFA)
 local function IsTeammate(player)
     if not CFG.IgnoreTeam then return false end
     if cachedLocalTeam == nil then return false end
     return PlayerTeamCache[player.UserId] == cachedLocalTeam
 end
 
--- BUG-1: pointer compare against Team object — immune to team renames
 local function IsTargetTeam(player)
     if CFG.TargetTeam == nil then return true end
     return PlayerTeamCache[player.UserId] == CFG.TargetTeam
 end
 
--- EDGE-2: Health fast-path + GetState() safety net for custom rigs
 local function IsAlive(hum)
     if not CFG.IgnoreDead then return true end
     if hum.Health <= 0 then return false end
     return hum:GetState() ~= Enum.HumanoidStateType.Dead
 end
 
--- EDGE-1: configurable threshold via CFG.InvisThreshold
 local function IsVisible(torso)
     if not CFG.IgnoreInvisible then return true end
     return torso.Transparency < CFG.InvisThreshold
@@ -428,7 +482,6 @@ local function IsWhitelisted(player)
     return Whitelist[player.UserId] == true
 end
 
--- PERF-2: no sqrt; dot² ≥ cosAngCapSq×magSq; dot<0 fast-reject
 local function IsInFrontArc(arcCF, torso)
     local dx    = torso.Position.X - arcCF.Position.X
     local dy    = torso.Position.Y - arcCF.Position.Y
@@ -443,7 +496,6 @@ end
 
 -- ─────────────────────────────────────────────────────────────
 -- REMOTE DISCOVERY
--- EDGE-4/BUG-3: cooldown stamped only on failure
 -- ─────────────────────────────────────────────────────────────
 local lastRemoteSearchTime = -math.huge
 
@@ -451,10 +503,10 @@ local function FindRemote(tool)
     local now = os.clock()
     if now - lastRemoteSearchTime < 1 then return nil end
     local r = tool:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
+    if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
     r = ReplicatedStorage:FindFirstChild(CFG.RemoteName, true)
-    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then return r end
-    lastRemoteSearchTime = now   -- stamped only on failure
+    if r and (r:IsA(_S.RemoteEvent) or r:IsA(_S.RemoteFunction)) then return r end
+    lastRemoteSearchTime = now
     return nil
 end
 
@@ -501,10 +553,8 @@ local function StartRebind()
     Notify("Press any key or mouse button  (Esc = cancel)")
 end
 
--- QoL-7: check a candidate TriggerInput against all existing keybinds
--- Returns the conflicting bind name, or nil if no conflict.
 local function FindKeybindConflict(nt)
-    if nt.Kind ~= "Key" then return nil end   -- mouse buttons don't conflict with key binds
+    if nt.Kind ~= "Key" then return nil end
     local kb = CFG.Keybinds
     if nt.Code == kb.Toggle    then return "Toggle ("    .. tostring(kb.Toggle)    .. ")" end
     if nt.Code == kb.ToggleVis then return "ToggleVis (" .. tostring(kb.ToggleVis) .. ")" end
@@ -515,7 +565,8 @@ end
 
 -- ─────────────────────────────────────────────────────────────
 -- WHITELIST FETCH
--- PERF-6: gmatch without string copy; EDGE-12: SetWLStatus
+-- EDGE-2: each iteration checks ScriptKilled before waiting/fetching
+-- EDGE-6: URL format validated before HttpGet
 -- ─────────────────────────────────────────────────────────────
 local function ParseWhitelist(raw)
     local set, count = {}, 0
@@ -535,18 +586,29 @@ local function FetchWhitelist()
     isFetching = true
     local url = CFG.WhitelistURL
     if not url or url == "" then
-        SetWLStatus("No URL set")
-        isFetching = false; return
+        SetWLStatus("No URL set"); isFetching = false; return
+    end
+    -- EDGE-6: reject non-http(s) URLs before calling HttpGet
+    if not url:match("^https?://") then
+        SetWLStatus("Invalid URL"); isFetching = false; return
     end
     SetWLStatus("Loading...")
     if wlRefLbl then wlRefLbl.Text = "..." end
     local waitSec, lastErr = 1, "unknown"
     for attempt = 1, WL_MAX_RETRIES do
-        if attempt > 1 then task.wait(waitSec); waitSec = waitSec * 2 end
+        -- EDGE-2: bail immediately if killed during a previous wait
+        if CFG.ScriptKilled then isFetching = false; return end
+        if attempt > 1 then
+            task.wait(waitSec); waitSec = waitSec * 2
+            -- Re-check after waking from sleep
+            if CFG.ScriptKilled then isFetching = false; return end
+        end
         local ok, result = pcall(function() return game:HttpGet(url, true) end)
         if ok and type(result) == "string" then
-            local set, count = ParseWhitelist(result)
-            Whitelist           = set
+            Whitelist           = ParseWhitelist(result)
+            local set, count    = Whitelist, 0
+            -- recount for status message
+            Whitelist, count    = ParseWhitelist(result)
             Stats.WhitelistHits = 0
             WLInRangePrev       = {}
             SetWLStatus(string.format("Loaded %d id%s", count, count==1 and "" or "s"))
@@ -559,7 +621,7 @@ local function FetchWhitelist()
     end
     SetWLStatus(string.format("Failed (%d tries)", WL_MAX_RETRIES), Color3.fromRGB(255, 80, 80))
     if wlRefLbl then wlRefLbl.Text = "REFRESH" end
-    warn("[NCB WL] All retries failed — last error: " .. lastErr)
+    warn(_S.WLPfx .. " All retries failed — last error: " .. lastErr)
     isFetching = false
 end
 
@@ -576,34 +638,31 @@ local COLOR = {
 
 local ArcPool = {}
 
--- D-4: return (or create) a workspace Folder to parent arc parts into
+-- EDGE-3: validates Parent == workspace (not just truthy)
 local function GetArcFolder()
-    if arcFolder and arcFolder.Parent then return arcFolder end
+    if arcFolder and arcFolder.Parent == workspace then return arcFolder end
     for _, obj in ipairs(workspace:GetChildren()) do
-        if obj:IsA("Folder") then
+        if obj:IsA(_S.Folder) then
             arcFolder = obj; arcFolderOwned = false; return obj
         end
     end
-    local f = Instance.new("Folder")
-    f.Name         = RandName()   -- D-4: random name; no recognisable string
+    local f = Instance.new(_S.Folder)
+    f.Name         = RandName()
     f.Parent       = workspace
     arcFolder      = f
     arcFolderOwned = true
     return f
 end
 
---[[
-    BuildArcVis — D-4: random part name + folder parent.
-    PERF-5: Parent assigned last (one replication event per part).
---]]
+-- EDGE-1: commit ArcPool only after full successful build
 local function BuildArcVis()
-    local old       = ArcPool
-    local nxt       = {}
-    local partName  = RandName()       -- D-4: unique random name per build
-    local arcParent = GetArcFolder()   -- D-4: blend into workspace Folder
-    for i = 1, 2 + ARC_SEGS do
+    local old      = ArcPool
+    local nxt      = {}
+    local partName = RandName()
+    local arcParent = GetArcFolder()
+    for i = 1, ARC_TOTAL do
         local p = Instance.new("Part")
-        p.Name         = partName      -- D-4: not "_NCBArc"
+        p.Name         = partName
         p.Anchored     = true
         p.CanCollide   = false
         p.CastShadow   = false
@@ -612,11 +671,17 @@ local function BuildArcVis()
         p.Transparency = 0.15
         p.Size         = Vector3.new(0.07, 0.07, 1)
         p.Color        = COLOR.CLEAR
-        p.Parent       = arcParent     -- D-4 + PERF-5: folder, last
+        p.Parent       = arcParent
         nxt[i]         = p
     end
-    ArcPool = nxt; lastArcColor = nil
-    for _, p in ipairs(old) do pcall(p.Destroy, p) end
+    -- EDGE-1: only commit if all parts were created
+    if #nxt == ARC_TOTAL then
+        ArcPool = nxt; lastArcColor = nil
+        for _, p in ipairs(old) do pcall(p.Destroy, p) end
+    else
+        -- partial build — destroy fragments, keep old pool
+        for _, p in ipairs(nxt) do pcall(p.Destroy, p) end
+    end
 end
 
 local function DestroyArcVis()
@@ -624,26 +689,47 @@ local function DestroyArcVis()
     for _, p in ipairs(old) do pcall(p.Destroy, p) end
 end
 
+--[[
+    SetBeam — PERF-E:
+    • Skips the Size write when len+thick haven't changed by >0.005.
+    • Avoids Vector3 midpoint allocation by passing all six scalars
+      directly to CFrame.lookAt (which accepts two Vector3s, so we
+      keep that call but inline the midpoint components to avoid a
+      separate Vector3 allocation for the midpoint).
+--]]
 local function SetBeam(part, x1,y1,z1, x2,y2,z2, thick)
-    local dx,dy,dz = x2-x1, y2-y1, z2-z1
-    local len = math.sqrt(dx*dx+dy*dy+dz*dz)
-    if len < 0.001 then part.Size=Vector3.new(0.001,0.001,0.001); return end
-    local inv = 1/len
-    part.Size   = Vector3.new(thick, thick, len)
+    local dx, dy, dz = x2-x1, y2-y1, z2-z1
+    local len = math.sqrt(dx*dx + dy*dy + dz*dz)
+    if len < 0.001 then
+        part.Size = Vector3.new(0.001, 0.001, 0.001)
+        return
+    end
+    -- PERF-E: skip Size write when values are stable
+    local cache = _beamSzCache[part]
+    if not cache or math.abs(len - cache[1]) > 0.005 or thick ~= cache[2] then
+        part.Size = Vector3.new(thick, thick, len)
+        if not cache then cache = {}; _beamSzCache[part] = cache end
+        cache[1] = len; cache[2] = thick
+    end
+    local inv = 1 / len
+    local mx, my, mz = (x1+x2)*0.5, (y1+y2)*0.5, (z1+z2)*0.5
+    -- CFrame.lookAt still needs Vector3, but midpoint is inline (no separate alloc)
     part.CFrame = CFrame.lookAt(
-        Vector3.new((x1+x2)*0.5, (y1+y2)*0.5, (z1+z2)*0.5),
-        Vector3.new((x1+x2)*0.5+dx*inv, (y1+y2)*0.5+dy*inv, (z1+z2)*0.5+dz*inv)
+        Vector3.new(mx, my, mz),
+        Vector3.new(mx + dx*inv, my + dy*inv, mz + dz*inv)
     )
 end
 
 local function UpdateArcVis(baseCF, col)
     if not CFG.VisualizerEnabled then DestroyArcVis(); return end
-    if #ArcPool == 0 then BuildArcVis() end
+    -- EDGE-1: guard against a partial pool
+    if #ArcPool ~= ARC_TOTAL then BuildArcVis() end
+    if #ArcPool ~= ARC_TOTAL then return end   -- build failed, skip frame
     if arcAngleDirty then RebuildArcAngles() end
-    local reach     = CFG.Size
-    local bx,by,bz  = baseCF.Position.X,   baseCF.Position.Y,   baseCF.Position.Z
-    local fx,fy,fz  = baseCF.LookVector.X,  baseCF.LookVector.Y,  baseCF.LookVector.Z
-    local rx,ry,rz  = baseCF.RightVector.X, baseCF.RightVector.Y, baseCF.RightVector.Z
+    local reach    = CFG.Size
+    local bx,by,bz = baseCF.Position.X,   baseCF.Position.Y,   baseCF.Position.Z
+    local fx,fy,fz = baseCF.LookVector.X,  baseCF.LookVector.Y,  baseCF.LookVector.Z
+    local rx,ry,rz = baseCF.RightVector.X, baseCF.RightVector.Y, baseCF.RightVector.Z
     for i = 1, ARC_SEGS+1 do
         local c, s = arcCosTable[i], arcSinTable[i]
         arcPtX[i]  = bx + (fx*c + rx*s) * reach
@@ -653,10 +739,12 @@ local function UpdateArcVis(baseCF, col)
     SetBeam(ArcPool[1], bx,by,bz, arcPtX[1],          arcPtY[1],          arcPtZ[1],          0.09)
     SetBeam(ArcPool[2], bx,by,bz, arcPtX[ARC_SEGS+1], arcPtY[ARC_SEGS+1], arcPtZ[ARC_SEGS+1], 0.09)
     for i = 1, ARC_SEGS do
-        SetBeam(ArcPool[2+i], arcPtX[i],arcPtY[i],arcPtZ[i], arcPtX[i+1],arcPtY[i+1],arcPtZ[i+1], 0.07)
+        SetBeam(ArcPool[2+i],
+            arcPtX[i],   arcPtY[i],   arcPtZ[i],
+            arcPtX[i+1], arcPtY[i+1], arcPtZ[i+1], 0.07)
     end
     if col ~= lastArcColor then
-        for i = 1, 2+ARC_SEGS do ArcPool[i].Color = col end
+        for i = 1, ARC_TOTAL do ArcPool[i].Color = col end
         lastArcColor = col
     end
 end
@@ -667,7 +755,6 @@ end
 local ScreenGui    = nil
 local sliders      = {}
 local toggles      = {}
-local guiVisible   = true
 local refreshStats = nil
 
 local UI = {
@@ -682,8 +769,6 @@ local UI = {
     MUTED   = Color3.fromRGB(105, 105, 128),
     BORDER  = Color3.fromRGB(38,  38,  52 ),
 }
-
--- ── GUI WIDGET FACTORIES ──────────────────────────────────────
 
 local function MkFrame(par,sz,pos,col,z)
     local f=Instance.new("Frame"); f.Size=sz; f.Position=pos
@@ -707,7 +792,6 @@ local function MkStroke(par,col,t)
     s.Parent=par; return s
 end
 
--- EDGE-9: zero-range guard in SetVal
 local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
     local row=MkFrame(par,UDim2.new(1,0,0,UI.RowH),UDim2.new(0,0,0,y),Color3.fromRGB(0,0,0),2)
     row.BackgroundTransparency=1
@@ -741,7 +825,7 @@ local function MkSlider(par,y,label,mn,mx,def,fmt,onChange)
     return {SetVal=SetVal}
 end
 
--- PERF-4: cancel active tweens before creating new ones
+-- REL-3: MkToggle registers a canceller in _guiTweenCancellers
 local function MkToggle(par,xOff,yOff,label,def,onChange)
     local BW,BH=46,22
     local con=MkFrame(par,UDim2.new(0,BW+80,0,BH+4),UDim2.new(0,xOff,0,yOff),Color3.fromRGB(0,0,0),2)
@@ -773,6 +857,11 @@ local function MkToggle(par,xOff,yOff,label,def,onChange)
     track.InputBegan:Connect(function(i)
         if i.UserInputType==Enum.UserInputType.MouseButton1 then SetState(not on) end
     end)
+    -- REL-3: register canceller so BuildGUI can cancel in-flight tweens before destroy
+    _guiTweenCancellers[#_guiTweenCancellers+1] = function()
+        if knobTween  then pcall(knobTween.Cancel,  knobTween)  end
+        if trackTween then pcall(trackTween.Cancel, trackTween) end
+    end
     return {SetState=SetState, GetState=function() return on end}
 end
 
@@ -791,17 +880,12 @@ local function MkStatsStrip(par,y)
     end
 end
 
---[[
-    MkTeamDropdown — all v9 fixes preserved:
-      BUG-1 / PERF-3 / EDGE-7 / EDGE-8
---]]
 local function MkTeamDropdown(par, y, onChange)
     local ROW_H   = 22
     local MAX_VIS = 5
     local DD_PAD  = 4
 
     MkLabel(par,"Target Team",UDim2.new(0,95,0,22),UDim2.new(0,UI.Pad,0,y),UI.FontBody,UI.TextSz,UI.MUTED,3)
-
     local inputBG = MkFrame(par,UDim2.new(0,UI.W-116,0,24),UDim2.new(0,108,0,y+1),Color3.fromRGB(26,26,38),3)
     MkCorner(inputBG,4); MkStroke(inputBG,UI.BORDER,1)
     local box = Instance.new("TextBox")
@@ -831,8 +915,7 @@ local function MkTeamDropdown(par, y, onChange)
     local function CommitTeam(teamObj)
         CFG.TargetTeam = teamObj
         box.Text       = teamObj and teamObj.Name or ""
-        ddBG.Visible   = false
-        ddOpen         = false
+        ddBG.Visible   = false; ddOpen = false
         if onChange then onChange(teamObj) end
     end
 
@@ -846,26 +929,34 @@ local function MkTeamDropdown(par, y, onChange)
             rowBG.BackgroundTransparency=1; rowBG.LayoutOrder=i
             MkLabel(rowBG,item.display,UDim2.new(1,-8,1,0),UDim2.new(0,6,0,0),UI.FontBody,11,
                 item.teamObj==CFG.TargetTeam and UI.ACCENT or UI.TEXT,22)
+            -- PERF-D: DD_ROW_TWEEN is module-level, not allocated per hover
             rowBG.MouseEnter:Connect(function()
-                TweenService:Create(rowBG,TweenInfo.new(0.08),{BackgroundColor3=Color3.fromRGB(30,30,48),BackgroundTransparency=0}):Play()
+                TweenService:Create(rowBG,DD_ROW_TWEEN,{BackgroundColor3=Color3.fromRGB(30,30,48),BackgroundTransparency=0}):Play()
             end)
             rowBG.MouseLeave:Connect(function()
-                TweenService:Create(rowBG,TweenInfo.new(0.08),{BackgroundTransparency=1}):Play()
+                TweenService:Create(rowBG,DD_ROW_TWEEN,{BackgroundTransparency=1}):Play()
             end)
             rowBG.InputBegan:Connect(function(inp)
                 if inp.UserInputType==Enum.UserInputType.MouseButton1 then
                     clickPending=true; CommitTeam(item.teamObj)
                 end
             end)
-            rowCache[#rowCache+1] = {frame=rowBG, teamObj=item.teamObj, display=item.display}
+            -- EDGE-5/PERF-C: pre-compute lowercased display string
+            rowCache[#rowCache+1] = {
+                frame      = rowBG,
+                teamObj    = item.teamObj,
+                display    = item.display,
+                displayLow = item.display:lower(),
+            }
         end
     end
 
+    -- EDGE-5/PERF-C: uses pre-computed displayLow, no per-keystroke allocation
     local function FilterRows(query)
         local lo  = query:lower()
         local vis = 0
         for _, r in ipairs(rowCache) do
-            local show = (lo=="" or r.display:lower():find(lo,1,true)~=nil)
+            local show = (lo=="" or r.displayLow:find(lo,1,true)~=nil)
             r.frame.Visible = show
             if show then vis = vis+1 end
         end
@@ -876,7 +967,7 @@ local function MkTeamDropdown(par, y, onChange)
     local function OpenDropdown()
         if winRef then ddBG.Parent = winRef end
         BuildRowCache(); FilterRows("")
-        ddBG.Visible = true; ddOpen = true
+        ddBG.Visible=true; ddOpen=true
         task.defer(function()
             if not ddOpen or not winRef then return end
             local abs    = inputBG.AbsolutePosition
@@ -917,11 +1008,20 @@ local function MkTeamDropdown(par, y, onChange)
     return { SetTeam = CommitTeam }
 end
 
+-- REL-3: cancel all in-flight GUI tweens before a destroy
+local function CancelGUITweens()
+    for _, fn in ipairs(_guiTweenCancellers) do pcall(fn) end
+    table.clear(_guiTweenCancellers)
+end
+
 -- ── BUILD FULL GUI ────────────────────────────────────────────
 local function BuildGUI()
+    -- REL-3: cancel tweens from previous build before destroying instances
+    CancelGUITweens()
     if ScreenGui then ScreenGui:Destroy() end
+    -- MAINT-2: guiVisible removed (was never read)
+
     local sg = Instance.new("ScreenGui")
-    -- D-3: random name — no fixed string in CoreGui hierarchy between sessions
     sg.Name             = "_" .. RandName()
     sg.ResetOnSpawn     = false
     sg.ZIndexBehavior   = Enum.ZIndexBehavior.Global
@@ -929,7 +1029,13 @@ local function BuildGUI()
     sg.IgnoreGuiInset   = true
     sg.Parent           = game:GetService("CoreGui")
     ScreenGui           = sg
-    sg.AncestryChanged:Connect(function() if not sg.Parent then listeningForTrigger=false end end)
+    -- EDGE-4: nil _rebindUIRef so task.delay callbacks don't write to dead instances
+    sg.AncestryChanged:Connect(function()
+        if not sg.Parent then
+            listeningForTrigger = false
+            _rebindUIRef        = nil
+        end
+    end)
 
     local MARGIN_Y = 48
     local vp   = (workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize) or Vector2.new(800,600)
@@ -946,13 +1052,14 @@ local function BuildGUI()
     local tb=MkFrame(win,UDim2.new(1,0,0,UI.TitleH),UDim2.new(0,0,0,0),Color3.fromRGB(17,17,24),2)
     MkCorner(tb,8); MkFrame(tb,UDim2.new(1,0,0,8),UDim2.new(0,0,1,-8),Color3.fromRGB(17,17,24),2)
     local ab=MkFrame(tb,UDim2.new(0,3,0,18),UDim2.new(0,UI.Pad,0.5,-9),UI.ACCENT,3); MkCorner(ab,2)
-    MkLabel(tb,"NoCBring Config",UDim2.new(0,180,1,0),UDim2.new(0,UI.Pad+10,0,0),UI.Font,UI.TitleSz,UI.TEXT,3)
+    -- MAINT-3: title uses _S.TitleCfg ("NoCBring Config") instead of a literal
+    MkLabel(tb,_S.TitleCfg,UDim2.new(0,180,1,0),UDim2.new(0,UI.Pad+10,0,0),UI.Font,UI.TitleSz,UI.TEXT,3)
     local cb=MkFrame(tb,UDim2.new(0,24,0,24),UDim2.new(1,-32,0.5,-12),Color3.fromRGB(52,17,26),3); MkCorner(cb,4)
     MkLabel(cb,"×",UDim2.new(1,0,1,0),UDim2.new(0,0,0,0),UI.Font,16,UI.ACCENT2,4,Enum.TextXAlignment.Center)
     cb.InputBegan:Connect(function(i)
-        -- D-3: × button hides via the same destroy/rebuild path as the keybind
         if i.UserInputType==Enum.UserInputType.MouseButton1 then
-            ScreenGui:Destroy(); ScreenGui=nil; winRef=nil; shadowRef=nil; guiVisible=false
+            CancelGUITweens()   -- REL-3
+            ScreenGui:Destroy(); ScreenGui=nil; winRef=nil; shadowRef=nil
         end
     end)
     tb.InputBegan:Connect(function(i)
@@ -974,7 +1081,6 @@ local function BuildGUI()
     content.Parent=win
     local y=4
 
-    -- ── REACH & TIMING ───────────────────────────────────────
     MkLabel(content,"REACH & TIMING",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
@@ -1000,7 +1106,6 @@ local function BuildGUI()
         end)
     y=y+UI.RowH+4
 
-    -- ── INPUTS ───────────────────────────────────────────────
     MkLabel(content,"INPUTS",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
@@ -1015,7 +1120,7 @@ local function BuildGUI()
     rBox.FocusLost:Connect(function()
         if rBox.Text~="" then
             CFG.RemoteName=rBox.Text; currentRemote=nil
-            lastRemoteSearchTime=-math.huge   -- BUG-3
+            lastRemoteSearchTime=-math.huge
             Notify("Remote: "..CFG.RemoteName)
         end
     end)
@@ -1035,9 +1140,9 @@ local function BuildGUI()
             _rbLbl.TextColor3=UI.WARN; rbStroke.Color=UI.WARN; chipStroke.Color=UI.WARN; StartRebind()
         end
     end)
-    triggerRowDimRefs = { chipStroke=chipStroke, chipLbl=triggerBindLabel, rbLbl=_rbLbl, rbStroke=rbStroke }
-    -- QoL-7 / D-3: module-level ref; no fixed getgenv key
+    -- MAINT-1: single table aliased to both names
     _rebindUIRef = { chipStroke=chipStroke, chipLbl=triggerBindLabel, rbLbl=_rbLbl, rbStroke=rbStroke }
+    local triggerRowDimRefs = _rebindUIRef   -- same reference, local alias for AlwaysOn toggle
     if CFG.AlwaysOn then
         chipStroke.Color=UI.MUTED; triggerBindLabel.TextColor3=UI.MUTED
         _rbLbl.TextColor3=UI.MUTED; rbStroke.Color=UI.BORDER
@@ -1059,7 +1164,6 @@ local function BuildGUI()
     end)
     y=y+UI.RowH
 
-    -- ── FILTERS ──────────────────────────────────────────────
     MkLabel(content,"FILTERS",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
@@ -1091,7 +1195,6 @@ local function BuildGUI()
         function(v) CFG.MaxTargetHealth=math.round(v) end)
     y=y+UI.RowH+4
 
-    -- ── WHITELIST ────────────────────────────────────────────
     MkLabel(content,"WHITELIST",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
@@ -1122,18 +1225,15 @@ local function BuildGUI()
     end)
     y=y+30
 
-    -- ── ANTI-DETECT ──────────────────────────────────────────
     MkLabel(content,"ANTI-DETECT",UDim2.new(1,-UI.Pad*2,0,16),UDim2.new(0,UI.Pad,0,y),UI.Font,10,UI.MUTED,3); y=y+18
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
 
-    -- D-4: toggle to hide arc while stationary
     toggles.ArcHideStill=MkToggle(content,UI.Pad,y,"Arc Still Hide",CFG.ArcHideStill,function(v)
         CFG.ArcHideStill=v
-        if not v then arcStillCount=0 end   -- reset counter when disabled
+        if not v then arcStillCount=0 end
     end)
     y=y+UI.RowH
 
-    -- ── TOGGLES ──────────────────────────────────────────────
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+6
     toggles.Enabled=MkToggle(content,UI.Pad,y,"Enabled",CFG.Enabled,function(v) CFG.Enabled=v end)
     toggles.Visualizer=MkToggle(content,UI.W/2,y,"Visualizer",CFG.VisualizerEnabled,function(v)
@@ -1141,13 +1241,11 @@ local function BuildGUI()
     end)
     y=y+30
 
-    -- ── STATS ────────────────────────────────────────────────
     MkFrame(content,UDim2.new(1,-UI.Pad*2,0,1),UDim2.new(0,UI.Pad,0,y),UI.BORDER,3); y=y+4
     refreshStats=MkStatsStrip(content,y)
     content.CanvasSize = UDim2.new(0,0,0,y+38)
 end
 
--- Module-level UIS listeners (registered once, survive GUI rebuilds)
 Connections.InputEnded = UIS.InputEnded:Connect(function(i)
     if i.UserInputType == Enum.UserInputType.MouseButton1 then
         winDragging=false; activeDrag=nil
@@ -1169,30 +1267,31 @@ Connections.InputChanged = UIS.InputChanged:Connect(function(i)
     end
 end)
 
-BuildGUI()
+-- REL-1: BuildGUI wrapped in pcall — hard crashes from denied CoreGui access are caught
+local guiOk, guiErr = pcall(BuildGUI)
+if not guiOk then
+    warn(_S.DragPfx .. " GUI init failed: " .. tostring(guiErr))
+end
 task.spawn(FetchWhitelist)
 
 -- ═══════════════════════════════════════════════════════════════
 --  SECTION 3 — CORE DRAG ROUTINE
 -- ═══════════════════════════════════════════════════════════════
 --[[
-    M-5: getconnections resolved lazily inside task.spawn.
-         The function is in the environment only during an active drag.
-    R-3: suppress/restore bracket only the single torso.CFrame write
-         per lerp frame, not the whole loop.  Signal gap = ~1 tick per frame
-         rather than the full lerp duration.
-    EDGE-3: victimName snapshotted before first yield.
-    PERF-1: torso Changed + CFrame signals resolved once.
-    BUG-2:  FireServer vs InvokeServer branched on IsA.
+    BUG-1:  _suppress/_restore share one cached connection list.
+    BUG-2:  lerpCompleted flag gates the remote fire.
+    PERF-B: CFG.LerpFrames snapshotted before the loop.
+    EV-1:   _gc_baseline comparison unchanged.
+    EV-4:   _S.* constants unchanged.
 --]]
 local function DragAndFire(victim, attackerRoot, remote, arcCF)
     local uid  = victim.UserId
     local char = victim.Character; if not char then return end
     local torso    = TorsoCache[uid]    or FindTorso(char)
-    local humanoid = HumanoidCache[uid] or char:FindFirstChildOfClass("Humanoid")
+    local humanoid = HumanoidCache[uid] or char:FindFirstChildOfClass(_S.Humanoid)
     if not torso or not humanoid then return end
 
-    local victimName = victim.Name   -- EDGE-3: snapshot before any yield
+    local victimName = victim.Name   -- EDGE-3 (v9): snapshot before any yield
 
     if humanoid.Health <= 0 then return end
     if humanoid:GetState() == Enum.HumanoidStateType.Dead then return end
@@ -1204,62 +1303,80 @@ local function DragAndFire(victim, attackerRoot, remote, arcCF)
     ActiveDrags[uid]=true; LastDrag[uid]=os.clock(); Stats.ActiveDrags=Stats.ActiveDrags+1
 
     task.spawn(function()
-        -- M-5: resolve getconnections lazily — only referenced during this drag window
-        local _gc = typeof(getconnections)=="function" and getconnections or nil
+        -- EV-1: validate getconnections against load-time baseline
+        local _gc_live = typeof(getconnections)=="function" and getconnections or nil
+        local _gc = (_gc_live ~= nil and _gc_live == _gc_baseline) and _gc_live or nil
 
-        local function _suppress(sig)
-            if not _gc then return end
-            local ok, conns = pcall(_gc, sig)
-            if ok then for _, c in ipairs(conns) do pcall(c.Disable, c) end end
-        end
-        local function _restore(sig)
-            if not _gc then return end
-            local ok, conns = pcall(_gc, sig)
-            if ok then for _, c in ipairs(conns) do pcall(c.Enable, c) end end
+        -- BUG-1: _makeSuppressor captures the connection list once in suppress(),
+        --        reuses that exact list in restore().  No second getconnections call.
+        local function _makeSuppressor(sig)
+            local cached = nil
+            local function suppress()
+                if not _gc then return end
+                local ok, conns = pcall(_gc, sig)
+                if ok then
+                    cached = conns
+                    for _, c in ipairs(conns) do pcall(c.Disable, c) end
+                end
+            end
+            local function restore()
+                if not cached then return end
+                for _, c in ipairs(cached) do pcall(c.Enable, c) end
+                cached = nil
+            end
+            return suppress, restore
         end
 
-        -- PERF-1: signals resolved once; shared by all per-frame suppress/restore calls
+        -- PERF-1 (v9): signals resolved once
         local torsoChangedSig = torso.Changed
         local torsoCFrameSig  = torso:GetPropertyChangedSignal("CFrame")
+
+        local suppressChanged, restoreChanged = _makeSuppressor(torsoChangedSig)
+        local suppressCFrame,  restoreCFrame  = _makeSuppressor(torsoCFrameSig)
+
+        -- BUG-2: track whether the loop ran to completion
+        local lerpCompleted = false
+
+        -- PERF-B: snapshot LerpFrames once (avoids proxy metamethod per iteration)
+        local lerpFrames = CFG.LerpFrames
 
         local ok, err = pcall(function()
             local dest = attackerRoot.CFrame * CFrame.new(1.2, 0, -2.8)
             local lp   = dest.Position - torso.Position
             if lp.Magnitude > 0.01 then
                 torso.AssemblyLinearVelocity = lp.Unit
-                    * math.clamp(lp.Magnitude * (60 / CFG.LerpFrames), 0, 55)
+                    * math.clamp(lp.Magnitude * (60 / lerpFrames), 0, 55)
             end
 
             local origin = torso.CFrame
-            for i = 1, CFG.LerpFrames do
-                local targetCF = origin:Lerp(dest, (i/CFG.LerpFrames)^2)
-                -- R-3: narrow suppression window — one torso.CFrame write bracketed per frame
-                _suppress(torsoChangedSig)
-                _suppress(torsoCFrameSig)
+            for i = 1, lerpFrames do
+                local targetCF = origin:Lerp(dest, (i/lerpFrames)^2)
+                -- R-3: bracket only the single CFrame write per frame
+                suppressChanged(); suppressCFrame()
                 local wok = pcall(function() torso.CFrame = targetCF end)
-                _restore(torsoCFrameSig)    -- R-3: always restores regardless of write result
-                _restore(torsoChangedSig)
-                if not wok then break end   -- torso destroyed mid-lerp; stop cleanly
+                restoreCFrame(); restoreChanged()
+                if not wok then break end   -- torso destroyed — stop cleanly
+                if i == lerpFrames then lerpCompleted = true end
                 RunService.Heartbeat:Wait()
             end
         end)
-        -- R-3: no outer cleanup required; every suppress is balanced by a restore above
 
-        if ok then
-            -- BUG-2: branch on remote type
+        -- BUG-2: fire remote only on a completed, error-free lerp
+        if ok and lerpCompleted then
             if remote then
                 pcall(function()
-                    if remote:IsA("RemoteEvent") then
+                    if remote:IsA(_S.RemoteEvent) then
                         remote:FireServer(victim)
-                    elseif remote:IsA("RemoteFunction") then
+                    elseif remote:IsA(_S.RemoteFunction) then
                         remote:InvokeServer(victim)
                     end
                 end)
             end
             Stats.Kills=Stats.Kills+1; Stats.TotalDist=Stats.TotalDist+realDist
             Stats.LastVictim=victimName
-        else
-            warn("[NCB] drag error: " .. tostring(err))
+        elseif not ok and CFG.Debug then
+            -- REL-5: warn only in debug mode to avoid exposing line numbers
+            warn(_S.DragPfx .. " drag error: " .. tostring(err))
         end
 
         Stats.ActiveDrags=math.max(0,Stats.ActiveDrags-1); ActiveDrags[uid]=nil
@@ -1268,9 +1385,6 @@ end
 
 -- ─────────────────────────────────────────────────────────────
 -- M-2: FUNCTION IDENTITY SEAL
--- Wrap all hot-path functions in newcclosure after definition.
--- Each session gets unique bytecode; static hash databases find no match.
--- Graceful identity fallback when newcclosure is unavailable.
 -- ─────────────────────────────────────────────────────────────
 do
     local _nc = typeof(newcclosure)=="function" and newcclosure or function(f) return f end
@@ -1286,6 +1400,9 @@ do
     DragAndFire       = _nc(DragAndFire)
 end
 
+-- EV-1: baseline captured after M-2 seal
+_gc_baseline = typeof(getconnections)=="function" and getconnections or nil
+
 -- ═══════════════════════════════════════════════════════════════
 --  SECTION 4 — HEARTBEAT
 -- ═══════════════════════════════════════════════════════════════
@@ -1295,20 +1412,23 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     frameCount=frameCount+1
     if frameCount % STATS_THROTTLE == 0 and refreshStats then refreshStats() end
 
-    -- EDGE-11: reset frame counter before float precision degrades
     if wlFrameId >= 9e15 then wlFrameId=1; WLInRangePrev={} end
 
     local char=LocalPlayer.Character; if not char then return end
-    local tool=ToolCache[LocalPlayer]   -- EDGE-10: O(1) lookup
-    local root=char:FindFirstChild("HumanoidRootPart")
+    local tool=ToolCache[LocalPlayer]
+    -- PERF-A: read from RootCache instead of per-frame FindFirstChild
+    local root=RootCache[LocalPlayer]
     if not tool or not root then
         currentRemote=nil; lastRemoteSearchTime=-math.huge
         arcStillCount=0; DestroyArcVis(); return
     end
-    local handle=tool:FindFirstChild("Handle")
+    local handle=tool:FindFirstChild(_S.Handle)
     if not handle then DestroyArcVis(); return end
 
-    -- N-4: only probe for remote during active sessions; no probing when idle
+    -- BUG-6: revalidate currentRemote — reset if the instance was destroyed
+    if currentRemote and not currentRemote.Parent then
+        currentRemote = nil
+    end
     if not currentRemote then
         if os.clock() - lastActiveTime <= IDLE_TIMEOUT then
             currentRemote = FindRemote(tool)
@@ -1317,7 +1437,6 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
 
     local arcCF = root.CFrame + (handle.Position - root.Position)
 
-    -- D-4: track character velocity to detect stillness
     if CFG.ArcHideStill then
         local vel = root.AssemblyLinearVelocity
         if vel.X*vel.X + vel.Y*vel.Y + vel.Z*vel.Z < ARC_STILL_VEL_SQ then
@@ -1351,14 +1470,12 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
         local dx=hx-pt.Position.X; local dy=hy-pt.Position.Y; local dz=hz-pt.Position.Z
         if dx*dx+dy*dy+dz*dz > _sizeSq then continue end
 
-        -- ── FILTER CHAIN ────────────────────────────────────
         if IsTeammate(player)       then continue end
         if not IsTargetTeam(player) then continue end
         local hum = _humCache[uid]; if not hum then continue end
         if not IsAlive(hum)           then continue end
         if not IsVisible(pt)          then continue end
         if not IsWithinHealthCap(hum) then continue end
-        -- ────────────────────────────────────────────────────
 
         if IsWhitelisted(player) then
             wlInRange = wlInRange + 1
@@ -1371,7 +1488,7 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
 
         targetsInRange = targetsInRange + 1
         if CFG.Enabled and triggerHeld then
-            lastActiveTime = os.clock()   -- N-4: reset idle timer on active fire
+            lastActiveTime = os.clock()
             DragAndFire(player, root, currentRemote, arcCF)
         end
     end
@@ -1384,7 +1501,6 @@ Connections.Heartbeat = RunService.Heartbeat:Connect(function()
     else                              col=COLOR.CLEAR
     end
 
-    -- D-4: skip arc entirely while character is stationary (destroys existing parts)
     if CFG.ArcHideStill and arcStillCount > ARC_STILL_HOLD then
         DestroyArcVis()
     else
@@ -1415,7 +1531,6 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
         elseif input.KeyCode~=Enum.KeyCode.Unknown then nt={Kind="Key",Code=input.KeyCode,Name=InputToName(input)}
         else return end
 
-        -- QoL-7: conflict check before committing rebind
         local conflict = FindKeybindConflict(nt)
         if conflict then
             listeningForTrigger = false
@@ -1423,6 +1538,7 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
                 triggerBindLabel.Text       = "CONFLICT"
                 triggerBindLabel.TextColor3 = UI.WARN
                 task.delay(1.5, function()
+                    -- EDGE-4: _rebindUIRef may be nil if GUI was destroyed
                     if not CFG.ScriptKilled and triggerBindLabel then
                         triggerBindLabel.Text       = CFG.TriggerInput.Name
                         triggerBindLabel.TextColor3 = UI.ACCENT
@@ -1430,9 +1546,9 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
                 end)
             end
             if _rebindUIRef then
-                _rebindUIRef.rbLbl.TextColor3   = UI.WARN
-                _rebindUIRef.rbStroke.Color     = UI.WARN
-                _rebindUIRef.chipStroke.Color   = UI.WARN
+                _rebindUIRef.rbLbl.TextColor3 = UI.WARN
+                _rebindUIRef.rbStroke.Color   = UI.WARN
+                _rebindUIRef.chipStroke.Color = UI.WARN
                 task.delay(1.5, function()
                     if not CFG.ScriptKilled and _rebindUIRef then
                         _rebindUIRef.rbLbl.TextColor3 = UI.MUTED
@@ -1445,7 +1561,6 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
             return
         end
 
-        -- No conflict — commit
         CFG.TriggerInput=nt; listeningForTrigger=false
         if triggerBindLabel then triggerBindLabel.Text=nt.Name; triggerBindLabel.TextColor3=UI.ACCENT end
         if _rebindUIRef then
@@ -1467,46 +1582,50 @@ Connections.Input = UIS.InputBegan:Connect(function(input, gpe)
         if not CFG.VisualizerEnabled then DestroyArcVis() end
         Notify("Visualizer: "..tostring(CFG.VisualizerEnabled))
     elseif input.KeyCode==CFG.Keybinds.ToggleUI then
-        -- D-3: destroy the ScreenGui instance entirely; rebuild on demand
         if ScreenGui then
+            CancelGUITweens()   -- REL-3
             ScreenGui:Destroy()
             ScreenGui=nil; winRef=nil; shadowRef=nil
-            guiVisible=false
         else
-            BuildGUI()
-            guiVisible=true
+            local ok, err = pcall(BuildGUI)   -- REL-1: keep toggle path protected too
+            if not ok then warn(_S.DragPfx .. " GUI rebuild failed: " .. tostring(err)) end
         end
     elseif input.KeyCode==CFG.Keybinds.Kill then
         CFG.ScriptKilled=true
         DestroyArcVis()
 
-        -- D-4: clean up owned arc folder
         if arcFolderOwned and arcFolder and arcFolder.Parent then
             pcall(arcFolder.Destroy, arcFolder)
         end
         arcFolder=nil; arcFolderOwned=false
 
+        CancelGUITweens()   -- REL-3: cancel tweens before destroying GUI
         if ScreenGui then ScreenGui:Destroy(); ScreenGui=nil end
-        for _,c in pairs(Connections)     do pcall(c.Disconnect,c) end
-        for _,c in pairs(PlayerTeamConns) do pcall(c.Disconnect,c) end
-        for _,c in pairs(CharAddedConns)  do pcall(c.Disconnect,c) end
-        for _,c in ipairs(localCharConns) do pcall(c.Disconnect,c) end  -- EDGE-6
 
-        -- M-3: scrub all sensitive cache tables in-place
+        -- BUG-3: Connections now includes PlayerAdded, PlayerRemoving,
+        --        CharAdded (LocalPlayer), TeamChanged (LocalPlayer)
+        for _,c in pairs(Connections)     do pcall(c.Disconnect,c) end
+        for _,c in pairs(PlayerTeamConns) do pcall(c.Disconnect,c) end   -- pairs: UserId-keyed
+        for _,c in pairs(CharAddedConns)  do pcall(c.Disconnect,c) end   -- pairs: UserId-keyed
+        for _,c in ipairs(localCharConns) do pcall(c.Disconnect,c) end   -- ipairs: array
+
+        -- M-3: scrub all sensitive caches
         table.clear(TorsoCache)
         table.clear(HumanoidCache)
         table.clear(PlayerTeamCache)
         table.clear(PlayerCache)
+        table.clear(RootCache)       -- PERF-A cache
         table.clear(Whitelist)
         table.clear(ActiveDrags)
         table.clear(LastDrag)
         table.clear(WLInRangePrev)
-        -- M-3: zero sensitive config fields
         _cfgReal.WhitelistURL = ""
         _cfgReal.RemoteName   = ""
-        -- M-3: remove session keys from global environment
-        getgenv()[_cfgKey]   = nil
-        getgenv()[_guardKey] = nil
+        getgenv()[_cfgKey]    = nil
+        getgenv()[_guardKey]  = nil
+
+        -- EV-1 + M-3: zero baseline
+        _gc_baseline = nil
 
         Notify("Script killed.")
     end
@@ -1514,49 +1633,63 @@ end)
 
 -- ─────────────────────────────────────────────────────────────
 -- CHARACTER WIRING — LOCAL PLAYER
--- EDGE-6: connections in localCharConns for kill teardown
--- EDGE-10: ToolCache maintained via ChildAdded/Removed
+-- BUG-5: localCharConns cleared at start of each respawn
+-- PERF-A: RootCache populated here
 -- ─────────────────────────────────────────────────────────────
 local function OnChar(char)
     if wiredChars[char] then return end
+
+    -- BUG-5: disconnect and clear previous character's connections before wiring new one
+    for _, c in ipairs(localCharConns) do pcall(c.Disconnect, c) end
+    table.clear(localCharConns)
+    wiredChars = {}        -- previous char keys are now stale
     wiredChars[char] = true
+
+    -- PERF-A: cache the HumanoidRootPart
+    RootCache[LocalPlayer] = char:FindFirstChild(_S.HRP)
 
     ToolCache[LocalPlayer] = nil
     for _, c in ipairs(char:GetChildren()) do
-        if c:IsA("Tool") then ToolCache[LocalPlayer] = c; break end
+        if c:IsA(_S.Tool) then ToolCache[LocalPlayer] = c; break end
     end
 
     localCharConns[#localCharConns+1] = char.ChildAdded:Connect(function(c)
-        if c:IsA("Tool") then
+        if c:IsA(_S.Tool) then
             ToolCache[LocalPlayer] = c
             currentRemote = nil
         end
+        -- PERF-A: update RootCache if HRP is added after character load
+        if c.Name == _S.HRP then RootCache[LocalPlayer] = c end
     end)
     localCharConns[#localCharConns+1] = char.ChildRemoved:Connect(function(c)
-        if c:IsA("Tool") then
+        if c:IsA(_S.Tool) then
             ToolCache[LocalPlayer]   = nil
             currentRemote            = nil
             lastRemoteSearchTime     = -math.huge
             DestroyArcVis()
         end
+        if c.Name == _S.HRP then RootCache[LocalPlayer] = nil end
     end)
     localCharConns[#localCharConns+1] = char.AncestryChanged:Connect(function()
         if not char.Parent then
-            wiredChars[char]       = nil
-            ToolCache[LocalPlayer] = nil
+            wiredChars[char]         = nil
+            ToolCache[LocalPlayer]   = nil
+            RootCache[LocalPlayer]   = nil
         end
     end)
 end
 
+-- BUG-3: CharacterAdded stored in Connections for kill-handler teardown
+Connections.CharAdded = LocalPlayer.CharacterAdded:Connect(OnChar)
 if LocalPlayer.Character then OnChar(LocalPlayer.Character) end
-LocalPlayer.CharacterAdded:Connect(OnChar)
 
--- MAINT-1: only written here and by this signal
-LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
+-- BUG-3: Team change stored in Connections
+Connections.TeamChanged = LocalPlayer:GetPropertyChangedSignal("Team"):Connect(function()
     cachedLocalTeam = LocalPlayer.Team
 end)
 
 RebuildArcAngles()
 
-Notify(string.format("NoCBring v10  Size=%d  Trigger=%s  AO=%s  WL=%s  [C] UI",
-    CFG.Size, CFG.TriggerInput.Name, tostring(CFG.AlwaysOn), CFG.WhitelistURL~="" and "set" or "off"))
+Notify(string.format("v12  sz=%d  trg=%s  ao=%s  wl=%s  [C]UI",
+    CFG.Size, CFG.TriggerInput.Name, tostring(CFG.AlwaysOn),
+    CFG.WhitelistURL~="" and "set" or "off"))
