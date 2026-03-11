@@ -1,1 +1,630 @@
 
+-- ============================================================
+--  AC Recon — Human-Readable Report Printer
+--  Run this AFTER ac_recon_v1.lua has completed.
+--  Reads getgenv().__ac_recon and prints a structured,
+--  plain-English report with remediation advice.
+-- ============================================================
+
+local report = getgenv().__ac_recon
+if not report then
+    warn("No report found. Run ac_recon_v1.lua first, then run this printer.")
+    return
+end
+
+-- ── Helpers ──────────────────────────────────────────────────────────────────
+
+local function lookup(section, key)
+    for _, e in ipairs(report.entries) do
+        if e.section == section and e.key == key then
+            return e.value, e.severity
+        end
+    end
+    return nil, nil
+end
+
+local function find_all(section_pattern, key_pattern)
+    local results = {}
+    for _, e in ipairs(report.entries) do
+        local sec_match = (not section_pattern) or e.section:find(section_pattern, 1, true)
+        local key_match = (not key_pattern)     or e.key:find(key_pattern,     1, true)
+        if sec_match and key_match then
+            table.insert(results, e)
+        end
+    end
+    return results
+end
+
+local SEP_MAJOR = "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+local SEP_MINOR = "────────────────────────────────────────────────────────────────"
+
+local function header(title)
+    print("\n" .. SEP_MAJOR)
+    print("  " .. title)
+    print(SEP_MAJOR)
+end
+
+local function subheader(title)
+    print("\n  " .. title)
+    print("  " .. SEP_MINOR:sub(1, #title + 2))
+end
+
+local function finding(icon, label, detail, fix)
+    print(string.format("\n  %s  %s", icon, label))
+    if detail then
+        for line in (detail .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then print("      " .. line) end
+        end
+    end
+    if fix then
+        print("      ╔ FIX ▶")
+        for line in (fix .. "\n"):gmatch("([^\n]*)\n") do
+            if line ~= "" then print("      ║  " .. line) end
+        end
+        print("      ╚")
+    end
+end
+
+local function stat(label, value)
+    print(string.format("      %-38s %s", label .. ":", tostring(value)))
+end
+
+-- ── Header ───────────────────────────────────────────────────────────────────
+
+print("\n\n")
+print("  ╔══════════════════════════════════════════════════════════╗")
+print("  ║     AC RECON — DEVELOPER REPORT                         ║")
+print("  ║     Plain-English findings + remediation guide          ║")
+print("  ╚══════════════════════════════════════════════════════════╝")
+print(string.format("\n  Executor : %s", report.meta.executor_fingerprint))
+print(string.format("  Run time : %.2fs", report.meta.run_duration_sec))
+print(string.format("  Findings : %d total   %d significant   %d gaps",
+    report.summary.finding_count,
+    report.summary.significant_count,
+    #report.gaps))
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 1 — EXECUTOR ENVIRONMENT
+-- ══════════════════════════════════════════════════════════════════════════════
+header("1 · EXECUTOR ENVIRONMENT")
+print("  What APIs does the attacker's executor have available?")
+print("  This determines which of your defenses can actually be bypassed.")
+
+local api_count = lookup("bootstrap", "api_present_count")
+local api_list  = lookup("bootstrap", "api_present_list")
+local baseline  = lookup("bootstrap", "baseline_captured")
+
+subheader("API Surface")
+stat("APIs available to attacker", tostring(api_count) .. " / ~50 known")
+stat("Real-env baseline captured", tostring(baseline))
+
+-- Key dangerous APIs
+local danger_apis = {
+    { "hookfunction",    "Can silently replace any engine function" },
+    { "getconnections",  "Can enumerate and disconnect your signal listeners" },
+    { "getreg",          "Can read your internal tables from the Lua registry" },
+    { "getsenv",         "Can read your script's local variables directly" },
+    { "getconstants",    "Can extract string constants from your bytecode" },
+    { "getupvalues",     "Can read your closure's upvalue state" },
+    { "debug.sethook",   "Can attach a hook to every Lua instruction you execute" },
+    { "newcclosure",     "Can wrap functions to evade your closure-type checks" },
+    { "getrunningscripts","Can enumerate all running scripts and find yours" },
+}
+
+print("\n  Dangerous APIs present on this executor:")
+if type(api_list) == "table" then
+    local found_any = false
+    for _, d in ipairs(danger_apis) do
+        for _, present in ipairs(api_list) do
+            if present == d[1] then
+                found_any = true
+                print(string.format("    ⚠  %-25s — %s", d[1], d[2]))
+                break
+            end
+        end
+    end
+    if not found_any then
+        print("    ✓  None of the high-risk APIs detected on this executor")
+    end
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 2 — YOUR AC'S SIGNAL COVERAGE
+-- ══════════════════════════════════════════════════════════════════════════════
+header("2 · YOUR AC'S SIGNAL COVERAGE")
+print("  Which events is your AC actually listening to,")
+print("  and can an attacker see or disconnect those listeners?")
+
+local signal_entries = find_all("signals", "pre_count")
+local active, inactive = {}, {}
+for _, e in ipairs(signal_entries) do
+    local label = e.key:gsub("pre_count_", "")
+    if tonumber(e.value) and tonumber(e.value) > 0 then
+        table.insert(active, { label = label, count = e.value })
+    else
+        table.insert(inactive, { label = label })
+    end
+end
+
+subheader("Active Listeners")
+if #active == 0 then
+    finding("✗", "NO SIGNAL LISTENERS DETECTED",
+        "Your AC has no observable listeners on any monitored signal.\nEither it hasn't initialized yet, or it failed to connect.",
+        "Verify your AC scripts are running before this tool.\nAdd a print() to your AC's :Connect() calls to confirm they fire.")
+else
+    for _, s in ipairs(active) do
+        print(string.format("    ✓  %-45s %d listener(s)", s.label, s.count))
+    end
+end
+
+subheader("Unmonitored Signals (Attack Surface)")
+if #inactive > 0 then
+    for _, s in ipairs(inactive) do
+        print(string.format("    ○  %-45s not monitored", s.label))
+    end
+    finding("⚠", "GAPS IN SIGNAL COVERAGE",
+        "Signals with no listeners are blind spots.\nAn attacker can exploit the corresponding player action without triggering any detection.",
+        "Review whether each unmonitored signal is intentionally ignored\nor a missing connection. Speed hacks need Heartbeat.\nAimbots need RenderStepped + Camera.CFrame.\nStat injection needs Humanoid property signals.")
+else
+    print("    ✓  All target signals have at least one listener")
+end
+
+-- Getconnections replaced?
+local gc_replaced = lookup("hooks", "getconnections_replaced")
+if gc_replaced == true then
+    finding("✗", "GETCONNECTIONS IS REPLACED",
+        "An attacker has hooked getconnections().\nThe signal listener counts above may be falsified —\nthe AC could be hiding or showing phantom listeners.",
+        "Don't rely on getconnections() for AC integrity checks.\nUse server-side validation as the authoritative source.")
+end
+
+-- BindableEvent listeners
+local bindables = find_all("signals", "bindable_")
+if #bindables > 0 then
+    subheader("Internal BindableEvent Communication")
+    for _, b in ipairs(bindables) do
+        print(string.format("    ⚠  %s — %d listener(s)", b.key:gsub("bindable_", ""), b.value))
+    end
+    finding("⚠", "AC USES BINDABLE EVENTS FOR INTERNAL MESSAGING",
+        "Attackers can enumerate these and monitor inter-module communication.\nThey can see when your AC modules signal each other (e.g. 'player flagged').",
+        "Move critical internal signals server-side.\nFor client-side coordination, use direct function calls or shared upvalues\nrather than BindableEvents which are globally visible.")
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 3 — HOOKED & REPLACED FUNCTIONS
+-- ══════════════════════════════════════════════════════════════════════════════
+header("3 · HOOKED & REPLACED FUNCTIONS")
+print("  Functions that differ from the real-env baseline have been wrapped.")
+print("  This tells you exactly where an attacker intercepts your calls.")
+
+local hooked = report.summary.hooked_fns or {}
+local namecall_us = lookup("hooks", "namecall_overhead_us")
+local genv_ni     = lookup("hooks", "genv_newindex_intercept")
+local islc_rep    = lookup("hooks", "islclosure_replaced")
+
+if #hooked == 0 then
+    finding("✓", "NO HOOKED ENGINE FUNCTIONS DETECTED",
+        "No core runtime functions have been replaced on this executor run.\nYour AC's calls to pcall, task.*, and remote methods reach the engine unmodified.")
+else
+    for _, fn in ipairs(hooked) do
+        local advice = {
+            ["FireServer"]    = "Your outbound remote calls pass through attacker code.\nArguments can be read, modified, or blocked before reaching the server.",
+            ["InvokeServer"]  = "Same as FireServer — return values can also be spoofed.",
+            ["pcall"]         = "Error handling is intercepted. Your AC's pcall-wrapped detection\ncode can be made to silently swallow errors or return false results.",
+            ["math.random"]   = "RNG is observed or seeded. Anti-tamper checks using random tokens\ncan be predicted or replayed.",
+            ["task.spawn"]    = "Spawned coroutines are observable. Your AC's async detection\nloops can be monitored for timing patterns.",
+            ["task.defer"]    = "Deferred tasks are intercepted. Resume order manipulation is possible.",
+            ["task.wait"]     = "Wait durations are observable. Your AC's polling interval is exposed.",
+        }
+        local detail = advice[fn] or "This function is wrapped. All calls pass through attacker-controlled code."
+        finding("✗", fn .. " IS HOOKED",
+            detail,
+            "Add server-side validation for anything this function touches.\nClient-side checks through a hooked function cannot be trusted.")
+    end
+end
+
+-- __namecall overhead
+if namecall_us then
+    local us = tonumber(namecall_us) or 0
+    if us > 1.5 then
+        finding("✗", string.format("__NAMECALL HOOK DETECTED (%.2fμs overhead)", us),
+            "Every Instance method call (e.g. Part:IsA(), Remote:FireServer())\npasses through an attacker-controlled metamethod.\nThis is a comprehensive call interception layer.",
+            "Assume all Instance method calls are observable.\nUse rawget/rawset for sensitive property access.\nMove detection logic server-side where __namecall can't reach.")
+    else
+        finding("✓", string.format("No __namecall hook detected (%.2fμs overhead, within normal range)", us))
+    end
+end
+
+-- getgenv __newindex
+if genv_ni == true then
+    finding("⚠", "GLOBAL ENVIRONMENT IS MONITORED FOR WRITES",
+        "Your AC's global variable assignments are visible to the attacker\nat the exact moment they're written.",
+        "Don't store detection state or thresholds in getgenv()/_G.\nUse module-local upvalues or server DataStore instead.")
+end
+
+-- islclosure replaced
+if islc_rep == true then
+    finding("✗", "ISLCLOSURE ITSELF IS REPLACED",
+        "The attacker has hooked the function your AC uses to identify closure types.\nAny check like 'is this a C closure?' returns attacker-controlled results.\nAll Phase 2/3 closure-type observations may be falsified.",
+        "Do not use islclosure as a trust signal.\nUse identity comparison against a baseline snapshot instead:\n  local real_fn = getrenv().islclosure\n  if islclosure ~= real_fn then -- hooked end")
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 4 — YOUR AC'S INTERNAL STATE EXPOSURE
+-- ══════════════════════════════════════════════════════════════════════════════
+header("4 · INTERNAL STATE EXPOSURE")
+print("  Can an attacker read your strike counts, thresholds,")
+print("  and detection flags? If so, they know exactly how much")
+print("  they can do before being kicked.")
+
+local player_tables  = lookup("environment", "player_tracking_tables") or 0
+local movement_tables= lookup("environment", "movement_history_tables") or 0
+local ac_strings     = lookup("environment", "ac_vocab_strings")
+local ac_env_entries = find_all("instances", "ac_env_")
+local weak_tables    = lookup("environment", "weak_tables") or 0
+
+if tonumber(player_tables) and player_tables > 0 then
+    finding("✗", string.format("%d PLAYER TRACKING TABLE(S) READABLE FROM REGISTRY", player_tables),
+        "Your per-player data (UserId → strike data) is in the Lua registry\nand accessible via getreg(). An attacker can monitor their own\nstrike count in real time.",
+        "Move the authoritative strike counter to the server.\nThe client should never hold the number that decides kicks.\nIf you need client-side state, don't key it by UserId.")
+else
+    finding("✓", "No player tracking tables found in registry")
+end
+
+if tonumber(movement_tables) and movement_tables > 0 then
+    finding("⚠", string.format("%d MOVEMENT HISTORY TABLE(S) READABLE FROM REGISTRY", movement_tables),
+        "Your position/velocity history buffers are visible in the registry.\nAn attacker can see exactly what data your speed-check compares against\nand craft movement that stays just below the threshold.",
+        "Store movement history server-side.\nIf you must buffer client-side, randomize field names each session\nso the structure is harder to identify.")
+end
+
+if type(ac_strings) == "table" and #ac_strings > 0 then
+    finding("⚠", string.format("%d AC-VOCABULARY STRINGS FOUND IN MEMORY", #ac_strings),
+        "These string constants from your AC's bytecode are readable:\n" ..
+        table.concat(ac_strings, ", "):sub(1, 200),
+        "Obfuscate or encode detection category names and ban reason strings.\nUse numeric codes internally; translate to strings server-side only.")
+end
+
+if #ac_env_entries > 0 then
+    finding("✗", "AC SCRIPT ENVIRONMENT KEYS ARE READABLE",
+        "These internal variables in your AC script(s) are directly accessible:",
+        "Use module-scoped locals (not script-level globals) for all\ndetection state. Local variables in a ModuleScript's closure\nare not exposed via getsenv().")
+    for _, e in ipairs(ac_env_entries) do
+        if type(e.value) == "table" then
+            print("      ⚠  " .. e.key:gsub("ac_env_", "") .. ": " .. table.concat(e.value, ", "))
+        else
+            print("      ⚠  " .. e.key:gsub("ac_env_", "") .. ": " .. tostring(e.value))
+        end
+    end
+end
+
+-- Debug hook
+local hook_present = lookup("environment", "debug_hook_present")
+if hook_present == true then
+    local hook_mask = lookup("environment", "debug_hook_mask")
+    finding("✗", "ACTIVE DEBUG HOOK DETECTED (mask=" .. tostring(hook_mask) .. ")",
+        "The attacker's executor has a debug hook running.\nThis fires on every Lua function call or instruction.\nEvery line of your AC's code is observable.",
+        "This is the most invasive observation mechanism available.\nAssume your entire client-side detection logic is transparent.\nThe only trustworthy layer is the server.")
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 5 — BYTECODE & UPVALUE EXPOSURE
+-- ══════════════════════════════════════════════════════════════════════════════
+header("5 · BYTECODE & UPVALUE EXPOSURE")
+print("  Can an attacker read your detection thresholds, property names,")
+print("  and internal variable references directly from compiled bytecode?")
+
+local upvalue_entries  = find_all("environment", "heartbeat_upvalues_")
+local constant_entries = find_all("environment", "bytecode_constants_")
+
+if #upvalue_entries > 0 then
+    finding("⚠", string.format("%d HEARTBEAT CALLBACK(S) HAVE READABLE UPVALUES", #upvalue_entries),
+        "An attacker can walk your Heartbeat callback's upvalue tree.\nThis exposes shared state tables, threshold values, and module references.",
+        "Minimize upvalue exposure in your main detection loop.\nPass only what's needed. Don't hold a reference to your entire\nstate table as a single upvalue — split it into smaller scoped locals.")
+else
+    finding("✓", "Upvalue walk found no exposed Heartbeat callbacks")
+end
+
+if #constant_entries > 0 then
+    finding("⚠", string.format("%d CALLBACK(S) HAVE READABLE BYTECODE CONSTANTS", #constant_entries),
+        "String literals compiled into your detection functions are readable.\nThreshold names, property strings, and category labels are all visible.",
+        "Obfuscate sensitive string constants.\nConsider using a simple XOR or reverse-string encoding for\ndetection category names and property key strings.")
+else
+    finding("✓", "Bytecode constant extraction found no exposed strings")
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 6 — TIMING & SCAN WINDOWS
+-- ══════════════════════════════════════════════════════════════════════════════
+header("6 · TIMING & SCAN WINDOWS")
+print("  How predictable is your AC's scan pattern?")
+print("  A predictable interval means an attacker can cheat")
+print("  between scans and be clean when checked.")
+
+local base_ms    = lookup("timing", "baseline_mean_ms")
+local delta_ms   = lookup("timing", "obs_delta_ms")
+local interval   = lookup("timing", "scan_interval_frames")
+local fifo       = lookup("timing", "scheduler_fifo")
+local clock_drift= lookup("timing", "clock_drift_delta_s")
+
+if base_ms then
+    subheader("Frame Budget")
+    stat("Baseline frame time",   string.format("%.3fms", tonumber(base_ms) or 0))
+    stat("Overhead under observation", string.format("%.3fms", tonumber(delta_ms) or 0))
+    local overhead = tonumber(delta_ms) or 0
+    if overhead > 1.0 then
+        finding("⚠", string.format("YOUR AC CONSUMES %.3fms OVERHEAD PER FRAME", overhead),
+            "This is measurable. An attacker can fingerprint your AC's presence\nby comparing frame times with and without it.",
+            "Profile your Heartbeat callback. Spread expensive checks across\nmultiple frames. Cache results that don't need to be computed every frame.")
+    else
+        finding("✓", string.format("Frame overhead within normal range (%.3fms delta)", overhead))
+    end
+end
+
+if interval and interval ~= "none" then
+    local n = tonumber(interval)
+    if n then
+        finding("✗", string.format("PREDICTABLE SCAN INTERVAL: every ~%d frames (%.0fms at 60fps)", math.round(n), n * 16.67),
+            string.format(
+                "Your AC performs a detectable check pass every %d frames.\n" ..
+                "An attacker can sync their exploit to this interval —\n" ..
+                "act on frames 1-%d, be clean on frame %d.",
+                math.round(n), math.round(n)-1, math.round(n)),
+            "Randomize your scan interval:\n  local interval = math.random(15, 45)  -- varies each cycle\nOr distribute checks across every frame at lower cost each frame.")
+    end
+else
+    finding("✓", "No regular scan interval detected — pattern appears randomized or continuous")
+end
+
+if fifo == false then
+    finding("✗", "TASK SCHEDULER RESUME ORDER IS NON-FIFO",
+        "task.defer() does not resume in the order callbacks were registered.\nThe scheduler has been modified by the executor.\nAny AC logic that depends on deferred execution order may misbehave.",
+        "Don't rely on task.defer ordering for sequenced detection logic.\nUse explicit flags or queues to coordinate multi-step checks.")
+elseif fifo == true then
+    finding("✓", "Task scheduler FIFO order is intact")
+end
+
+if clock_drift and tonumber(clock_drift) and tonumber(clock_drift) > 0.05 then
+    finding("⚠", string.format("CLOCK SOURCES DIVERGING (%.4fs delta)", tonumber(clock_drift)),
+        "tick() and os.clock() are drifting apart.\nThis can indicate process suspension, GC pauses, or a modified\nclock implementation on this executor.",
+        "Use a single clock source consistently.\nAvoid comparing tick()-based and os.clock()-based timestamps\nin the same timing check.")
+end
+
+-- Input listener priority
+local ib_count = lookup("timing", "inputbegan_listener_count")
+if ib_count and tonumber(ib_count) and tonumber(ib_count) > 0 then
+    subheader("Input Event Priority")
+    stat("InputBegan listeners total", tostring(ib_count))
+    -- Check if AC listener is not first
+    local slot1 = lookup("timing", "inputbegan_slot_1")
+    if slot1 == "c_or_wrapped" or slot1 == "unknown" then
+        finding("⚠", "FIRST INPUTBEGAN LISTENER MAY NOT BE YOURS",
+            "The first slot on InputBegan is a C closure or wrapped function.\nThis could be an attacker's hook receiving input events before your AC.",
+            "Connect your InputBegan listener as early as possible in your\nAC's initialization chain to claim the first fire-order slot.")
+    end
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 7 — INSTANCE TREE EXPOSURE
+-- ══════════════════════════════════════════════════════════════════════════════
+header("7 · INSTANCE TREE EXPOSURE")
+print("  Can an attacker find your AC scripts, remotes, and sensor parts?")
+
+local script_entries   = find_all("instances", "script_")
+local sensor_count     = lookup("instances", "sensor_parts") or 0
+local remote_count     = lookup("instances", "remote_count") or 0
+local coregui_scripts  = lookup("instances", "coregui_scripts") or 0
+local ac_modules       = find_all("instances", "ac_module_")
+
+-- AC candidate scripts
+local ac_scripts = {}
+for _, e in ipairs(script_entries) do
+    if e.value == "AC_CANDIDATE" then
+        table.insert(ac_scripts, e.key:gsub("script_", ""))
+    end
+end
+
+if #ac_scripts > 0 then
+    finding("⚠", string.format("%d SCRIPT(S) IDENTIFIED AS LIKELY AC COMPONENTS", #ac_scripts),
+        "These scripts are named or pathed in a way that reveals their purpose:\n" ..
+        table.concat(ac_scripts, "\n"):sub(1, 300),
+        "Rename AC scripts to generic names (e.g. 'SystemService', 'ClientManager').\nNest them inside unrelated containers in the instance tree.\nDon't use keywords like 'AntiCheat', 'Detection', or 'Monitor' in names.")
+end
+
+if #ac_modules > 0 then
+    finding("⚠", string.format("%d MODULE(S) IDENTIFIED AS LIKELY AC FRAMEWORK", #ac_modules),
+        "These loaded ModuleScripts reveal AC framework structure.",
+        "Obfuscate module names. Bundle detection logic into\nnon-descriptively named shared modules.")
+end
+
+if tonumber(sensor_count) and sensor_count > 0 then
+    finding("⚠", string.format("%d SENSOR PART(S) DETECTED IN WORKSPACE", sensor_count),
+        "Transparent, massless, or tiny Parts with Touched listeners were found.\nAttackers can enumerate these and avoid them.",
+        "Use server-side spatial checks via Magnitude comparisons instead.\nClient-side sensor parts are easily identified and avoided.")
+end
+
+if tonumber(coregui_scripts) and coregui_scripts > 0 then
+    finding("⚠", string.format("%d SCRIPT(S) FOUND IN COREGUI", coregui_scripts),
+        "Scripts parented to CoreGui are unusual and may be AC overlay components.\nThey are visible to executor enumeration.",
+        "Audit CoreGui scripts. If they're yours, this is expected.\nIf unexpected, this may indicate another script has injected into CoreGui.")
+end
+
+stat("Total remotes enumerated", tostring(remote_count))
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 8 — COVERAGE GAPS
+-- ══════════════════════════════════════════════════════════════════════════════
+header("8 · COVERAGE GAPS (Probes Not Run)")
+print("  These probes were excluded from the default run because they")
+print("  could cause unintended session interference. Run them manually")
+print("  with opt-in flags if you need the data.")
+
+if #report.gaps == 0 then
+    print("  ✓  All default probes executed — no gaps in this run")
+else
+    for _, gap in ipairs(report.gaps) do
+        print("  ○  " .. gap)
+    end
+    print("\n  To enable opt-in probes, set these flags before running ac_recon_v1.lua:")
+    print("    getgenv().__ac_recon_opts = {")
+    print("        debug_hook_removal    = true,  -- 5.7: confirms hook reinstalls after removal")
+    print("        kick_latency          = true,  -- 7.5: measures server punishment dispatch speed")
+    print("        malformed_remote_fire = true,  -- CRITICAL: sends malformed args (may increment violations)")
+    print("    }")
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  SECTION 9 — PRIORITY ACTION LIST
+-- ══════════════════════════════════════════════════════════════════════════════
+header("9 · PRIORITY ACTION LIST")
+print("  Address these in order. Fix high-priority items first —")
+print("  they represent the most exploitable weaknesses.\n")
+
+local actions = {}
+
+-- Collect all significant findings as actions
+if hook_present == true then
+    table.insert(actions, { pri=1, label="Move all trust decisions server-side — debug hook means client is fully observable" })
+end
+if islc_rep == true then
+    table.insert(actions, { pri=1, label="Replace islclosure trust checks with getrenv() identity comparison" })
+end
+if gc_replaced == true then
+    table.insert(actions, { pri=1, label="Don't use getconnections() as an integrity signal — it's been replaced" })
+end
+for _, fn in ipairs(hooked) do
+    table.insert(actions, { pri=1, label="Validate server-side: " .. fn .. " is hooked on client" })
+end
+if tonumber(player_tables) and player_tables > 0 then
+    table.insert(actions, { pri=1, label="Move strike counter and kick threshold to server — client values are readable" })
+end
+if #ac_env_entries > 0 then
+    table.insert(actions, { pri=1, label="Convert AC script globals to module-local variables — getsenv() exposes them" })
+end
+if interval and interval ~= "none" and tonumber(interval) then
+    table.insert(actions, { pri=2, label=string.format("Randomize scan interval (currently predictable at ~%d frames)", math.round(tonumber(interval))) })
+end
+if #ac_scripts > 0 then
+    table.insert(actions, { pri=2, label="Rename AC scripts to non-descriptive names to slow enumeration" })
+end
+if type(ac_strings) == "table" and #ac_strings > 0 then
+    table.insert(actions, { pri=2, label="Obfuscate detection category string constants in bytecode" })
+end
+if tonumber(sensor_count) and sensor_count > 0 then
+    table.insert(actions, { pri=2, label="Replace workspace sensor Parts with server-side Magnitude checks" })
+end
+if #bindables > 0 then
+    table.insert(actions, { pri=3, label="Replace internal BindableEvent signals with direct function calls or upvalues" })
+end
+if tonumber(movement_tables) and movement_tables > 0 then
+    table.insert(actions, { pri=3, label="Move movement history buffers server-side" })
+end
+
+if #actions == 0 then
+    print("  ✓  No high-priority actions identified on this run.")
+    print("     Consider running opt-in probes for a deeper assessment.")
+else
+    local pri_labels = { [1]="CRITICAL", [2]="HIGH", [3]="MEDIUM" }
+    local current_pri = nil
+    table.sort(actions, function(a, b) return a.pri < b.pri end)
+    local idx = 1
+    for _, a in ipairs(actions) do
+        if a.pri ~= current_pri then
+            current_pri = a.pri
+            print(string.format("\n  ── %s ─────────────────────────────────", pri_labels[a.pri] or "LOW"))
+        end
+        print(string.format("  %2d. %s", idx, a.label))
+        idx = idx + 1
+    end
+end
+
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  EXPORT FOR WEB DASHBOARD
+-- ══════════════════════════════════════════════════════════════════════════════
+header("10 · EXPORT FOR WEB DASHBOARD")
+print("  Copy the JSON below and paste it into the AC Recon web dashboard")
+print("  for a visual breakdown of all findings.\n")
+
+-- Minimal JSON serializer
+local function to_json(val, depth)
+    depth = depth or 0
+    local t = type(val)
+    if t == "nil"     then return "null"
+    elseif t == "boolean" then return tostring(val)
+    elseif t == "number"  then
+        if val ~= val then return "null" end -- NaN
+        return tostring(val)
+    elseif t == "string" then
+        return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r') .. '"'
+    elseif t == "table" then
+        if depth > 4 then return '"[truncated]"' end
+        -- Check if array
+        local is_array = true
+        local n = 0
+        for k in pairs(val) do
+            n = n + 1
+            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
+                is_array = false; break
+            end
+        end
+        if is_array and n == #val then
+            local parts = {}
+            for _, v in ipairs(val) do
+                table.insert(parts, to_json(v, depth+1))
+            end
+            return "[" .. table.concat(parts, ",") .. "]"
+        else
+            local parts = {}
+            for k, v in pairs(val) do
+                if type(k) == "string" or type(k) == "number" then
+                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1))
+                end
+            end
+            return "{" .. table.concat(parts, ",") .. "}"
+        end
+    else
+        return '"[' .. t .. ']"'
+    end
+end
+
+-- Build a slimmed export object
+local export = {
+    meta    = report.meta,
+    summary = report.summary,
+    gaps    = report.gaps,
+    actions = actions,
+    entries = {}
+}
+-- Only include notable/significant entries to keep JSON manageable
+for _, e in ipairs(report.entries) do
+    if e.severity == "significant" or e.severity == "notable" then
+        table.insert(export.entries, {
+            section  = e.section,
+            key      = e.key,
+            value    = type(e.value) == "table" and "[table]" or tostring(e.value),
+            severity = e.severity,
+            phase    = e.phase,
+        })
+    end
+end
+
+local json = to_json(export)
+-- Print in chunks (Roblox console line length limit)
+local chunk = 200
+print("-- BEGIN AC_RECON_EXPORT --")
+for i = 1, #json, chunk do
+    print(json:sub(i, i + chunk - 1))
+end
+print("-- END AC_RECON_EXPORT --")
+
+print("\n" .. SEP_MAJOR)
+print("  Report complete. Copy the JSON above into the web dashboard.")
+print(SEP_MAJOR .. "\n")
