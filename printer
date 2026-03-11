@@ -630,40 +630,50 @@ print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
+-- DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A -- Replace this placeholder
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    -- Detect executor HTTP request function
-    local http_request = (request or http and http.request or http_request or syn and syn.request)
+    -- More robust detection for executor-specific request functions
+    local executor_request = nil
     
-    if http_request then
-        -- Define a unique boundary string for the multipart form data
+    -- Check common global and table-based request aliases
+    if type(request) == "function" then 
+        executor_request = request 
+    elseif type(http_request) == "function" then 
+        executor_request = http_request
+    elseif syn and type(syn.request) == "function" then 
+        executor_request = syn.request
+    elseif http and type(http.request) == "function" then 
+        executor_request = http.request
+    elseif fluxus and type(fluxus.request) == "function" then
+        executor_request = fluxus.request
+    end
+
+    -- Only proceed if we actually found a valid function to call
+    if executor_request then
         local boundary = "----WebKitFormBoundaryACReconReport"
-        
-        -- The basic text message that accompanies the file
         local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
         
-        -- Construct the raw multipart/form-data body
+        -- Construct the raw multipart/form-data body [cite: 58, 62]
         local body = "--" .. boundary .. "\r\n"
         body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
         body = body .. message_payload .. "\r\n"
         
         body = body .. "--" .. boundary .. "\r\n"
-        -- We name the file "ac_recon_report.txt" so Discord renders it as a downloadable text file
         body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
         body = body .. 'Content-Type: text/plain\r\n\r\n'
-        body = body .. json .. "\r\n"
+        body = body .. (json or "{}") .. "\r\n" -- Fallback to empty JSON if nil [cite: 63]
         body = body .. "--" .. boundary .. "--"
         
+        -- Wrap the call in a pcall to catch any remaining runtime hiccups [cite: 18, 20]
         local success, err = pcall(function()
-            http_request({
+            executor_request({
                 Url = WEBHOOK_URL,
                 Method = "POST",
                 Headers = {
-                    -- We must tell Discord the exact boundary string we used
                     ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
                 },
                 Body = body
@@ -671,11 +681,11 @@ if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
         end)
 
         if success then
-            print("  [+] Successfully sent the report to Discord as a .txt attachment.")
+            print("  [+] Successfully sent the report to Discord as a .txt attachment.") [cite: 65]
         else
-            warn("  [-] Failed to send the webhook: " .. tostring(err))
+            warn("  [-] Failed to send the webhook: " .. tostring(err)) [cite: 3]
         end
     else
-        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
+        warn("  [-] No valid HTTP request function found for this executor. Webhook skipped.") [cite: 3, 11]
     end
 end
