@@ -1,4 +1,3 @@
-
 -- ============================================================
 --  AC Recon — Human-Readable Report Printer
 --  Run this AFTER ac_recon_v1.lua has completed.
@@ -627,18 +626,4 @@ print("-- END AC_RECON_EXPORT --")
 
 print("\n" .. SEP_MAJOR)
 print("  Report complete. Copy the JSON above into the web dashboard.")
-print(SEP_MAJOR .. "\n")
-
-local json = to_json(export)
-
--- Print in chunks (Roblox console line length limit)
-local chunk = 200
-print("-- BEGIN AC_RECON_EXPORT --")
-for i = 1, #json, chunk do
-    print(json:sub(i, i + chunk - 1))
-end
-print("-- END AC_RECON_EXPORT --")
-
-print("\n" .. SEP_MAJOR)
-print("  Report complete. Copy the JSON above into the web dashboard.") [cite: 65]
 print(SEP_MAJOR .. "\n")
