@@ -630,48 +630,52 @@ print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  SECTION 10 — SYNCHRONOUS WEBHOOK TEST
+--  DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local final_report = getgenv().__ac_recon
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A"
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
 
-print("[1] Entering Section 10...")
-
-if final_report and WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    -- Detect executor function
-    local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
+if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
+    -- Detect executor HTTP request function
+    local http_request = (request or http and http.request or http_request or syn and syn.request)
     
-    if type(http_req) == "function" then
-        print("[2] HTTP function found. Starting request...")
-
-        -- Simple JSON string builder (prevents calling potentially nil functions)
-        local simple_json = string.format(
-            '{"content": "AC Recon Report\\nExecutor: %s\\nFindings: %s"}',
-            tostring(final_report.meta.executor_fingerprint or "Unknown"),
-            tostring(final_report.summary.finding_count or 0)
-        )
-
-        -- Execute synchronously (No task.spawn)
-        local success, result = pcall(function()
-            return http_req({
+    if http_request then
+        -- Define a unique boundary string for the multipart form data
+        local boundary = "----WebKitFormBoundaryACReconReport"
+        
+        -- The basic text message that accompanies the file
+        local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
+        
+        -- Construct the raw multipart/form-data body
+        local body = "--" .. boundary .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
+        body = body .. message_payload .. "\r\n"
+        
+        body = body .. "--" .. boundary .. "\r\n"
+        -- We name the file "ac_recon_report.txt" so Discord renders it as a downloadable text file
+        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
+        body = body .. 'Content-Type: text/plain\r\n\r\n'
+        body = body .. json .. "\r\n"
+        body = body .. "--" .. boundary .. "--"
+        
+        local success, err = pcall(function()
+            http_request({
                 Url = WEBHOOK_URL,
                 Method = "POST",
-                Headers = {["Content-Type"] = "application/json"},
-                Body = simple_json
+                Headers = {
+                    -- We must tell Discord the exact boundary string we used
+                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
+                },
+                Body = body
             })
         end)
 
         if success then
-            print("[3] Webhook attempt finished. Status: " .. tostring(result and result.StatusCode or "Unknown Success"))
+            print("  [+] Successfully sent the report to Discord as a .txt attachment.")
         else
-            print("[3] Webhook CRASHED: " .. tostring(result))
+            warn("  [-] Failed to send the webhook: " .. tostring(err))
         end
     else
-        print("[2] Error: No HTTP function found.")
+        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
     end
-else
-    print("[2] Error: Report or URL missing.")
 end
-
-print("[4] SECTION 10 FINISHED")
