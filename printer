@@ -630,52 +630,53 @@ print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
+--  SECTION 10 — FINAL EXPORT & DISCORD LOGGING
 -- ══════════════════════════════════════════════════════════════════════════════
+header("10 · DISCORD EXPORT")
 
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A" -- Replace this placeholder
+local final_report = getgenv().__ac_recon
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A"
 
-if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    -- Detect executor HTTP request function
-    local http_request = (request or http and http.request or http_request or syn and syn.request)
+if final_report and WEBHOOK_URL ~= "" then
+    local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
     
-    if http_request then
-        -- Define a unique boundary string for the multipart form data
-        local boundary = "----WebKitFormBoundaryACReconReport"
+    if type(http_req) == "function" then
+        print("  [+] Preparing full report for Discord...")
+
+        -- 1. Generate the JSON string using the existing to_json function
+        local json_data = to_json(export) -- Uses the 'export' table built in Section 10 
+
+        -- 2. Build Multipart Body for File Attachment
+        local boundary = "----ACReconBoundary"
+        local message = '{"content": "**AC Recon Report Generated**\\nExecutor: '.. tostring(final_report.meta.executor_fingerprint) ..'", "username": "AC Recon Bot"}'
         
-        -- The basic text message that accompanies the file
-        local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
-        
-        -- Construct the raw multipart/form-data body
         local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
-        body = body .. message_payload .. "\r\n"
-        
+        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n' .. message .. "\r\n"
         body = body .. "--" .. boundary .. "\r\n"
-        -- We name the file "ac_recon_report.txt" so Discord renders it as a downloadable text file
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
-        body = body .. 'Content-Type: text/plain\r\n\r\n'
-        body = body .. json .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_report.json"\r\n'
+        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_data .. "\r\n"
         body = body .. "--" .. boundary .. "--"
         
-        local success, err = pcall(function()
-            http_request({
+        -- 3. Send Synchronously
+        local success, result = pcall(function()
+            return http_req({
                 Url = WEBHOOK_URL,
                 Method = "POST",
-                Headers = {
-                    -- We must tell Discord the exact boundary string we used
-                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
-                },
+                Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
                 Body = body
             })
         end)
 
         if success then
-            print("  [+] Successfully sent the report to Discord as a .txt attachment.")
+            print("  [+] Report sent successfully as 'ac_report.json'.")
         else
-            warn("  [-] Failed to send the webhook: " .. tostring(err))
+            warn("  [-] Webhook failed: " .. tostring(result))
         end
     else
-        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
+        warn("  [-] Executor does not support HTTP requests.")
     end
 end
+
+print("\n" .. SEP_MAJOR)
+print("  Report complete.")
+print(SEP_MAJOR .. "\n")
