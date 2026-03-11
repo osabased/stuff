@@ -634,7 +634,7 @@ print(SEP_MAJOR .. "\n")
 -- ══════════════════════════════════════════════════════════════════════════════
 
 local final_report = getgenv().__ac_recon
-local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A"
 
 print("[1] Entering Section 10...")
 
