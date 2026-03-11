@@ -634,7 +634,7 @@ print(SEP_MAJOR .. "\n")
 --  DISCORD WEBHOOK INTEGRATION
 -- ══════════════════════════════════════════════════════════════════════════════
 
-local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
+local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A -- Replace this placeholder
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
     -- Detect executor HTTP request function
