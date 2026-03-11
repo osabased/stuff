@@ -655,29 +655,29 @@ local function to_json(val, depth)
     if t == "nil" then return "null"
     elseif t == "boolean" then return tostring(val)
     elseif t == "number" then
-        if val ~= val then return "null" end 
+        if val ~= val then return "null" end -- NaN [cite: 58]
         return tostring(val)
     elseif t == "string" then
         return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r') .. '"'
     elseif t == "table" then
         if depth > 4 then return '"[truncated]"' end
-        local is_array = true
+        local is_array = true -- [cite: 59]
         local n = 0
         for k in pairs(val) do
             n = n + 1
             if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
-                is_array = false; break
+                is_array = false; break -- [cite: 60]
             end
         end
         if is_array and n == #val then
             local parts = {}
             for _, v in ipairs(val) do table.insert(parts, to_json(v, depth+1)) end
-            return "[" .. table.concat(parts, ",") .. "]"
+            return "[" .. table.concat(parts, ",") .. "]" -- [cite: 61]
         else
             local parts = {}
             for k, v in pairs(val) do
                 if type(k) == "string" or type(k) == "number" then
-                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1))
+                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1)) -- [cite: 62]
                 end
             end
             return "{" .. table.concat(parts, ",") .. "}"
@@ -687,15 +687,16 @@ local function to_json(val, depth)
     end
 end
 
--- 2. Build the export object [cite: 63]
+-- 2. Build the export object using report data [cite: 63]
 local export = {
     meta    = report.meta,
     summary = report.summary,
     gaps    = report.gaps,
-    actions = actions,
+    actions = actions, -- Defined in Section 9 [cite: 53]
     entries = {}
 }
 
+-- Filter notable entries for export [cite: 64]
 for _, e in ipairs(report.entries) do
     if e.severity == "significant" or e.severity == "notable" then
         table.insert(export.entries, {
@@ -708,38 +709,38 @@ for _, e in ipairs(report.entries) do
     end
 end
 
--- 3. Generate the JSON string [cite: 64]
-local json_data = to_json(export)
+-- 3. Generate the actual JSON string
+local json_output = to_json(export)
 
--- 4. Print to console for manual backup
+-- 4. Print to console (Manual Backup) [cite: 64]
 print("-- BEGIN AC_RECON_EXPORT --")
-local chunk = 200
-for i = 1, #json_data, chunk do
-    print(json_data:sub(i, i + chunk - 1))
+local chunk_size = 200
+for i = 1, #json_output, chunk_size do
+    print(json_output:sub(i, i + chunk_size - 1))
 end
 print("-- END AC_RECON_EXPORT --")
 
--- 5. DISCORD WEBHOOK LOGGING
+-- 5. DISCORD WEBHOOK LOGGING (FILE ATTACHMENT)
 local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- <--- REPLACE THIS
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    -- Safely detect the executor's HTTP function
-    local http_request = (request or (http and http.request) or http_request or (syn and syn.request))
+    -- Detect executor's HTTP request function safely
+    local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
     
-    if http_request then
+    if type(http_req) == "function" then
         local boundary = "----WebKitFormBoundaryACRecon"
-        local message = '{"content": "**AC Recon Report Generated**\\nFull JSON attached below.", "username": "AC Recon Bot"}'
+        local message = '{"content": "**AC Recon Report**\\nExecutor: '.. tostring(report.meta.executor_fingerprint) ..'\\nFindings: '.. tostring(report.summary.finding_count) ..'", "username": "AC Recon Logger"}'
         
-        -- Build Multipart Body
+        -- Build the multipart/form-data body
         local body = "--" .. boundary .. "\r\n"
         body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n' .. message .. "\r\n"
         body = body .. "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="report.json"\r\n'
-        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_data .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_report.json"\r\n'
+        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_output .. "\r\n"
         body = body .. "--" .. boundary .. "--"
         
         local success, err = pcall(function()
-            return http_request({
+            return http_req({
                 Url = WEBHOOK_URL,
                 Method = "POST",
                 Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
@@ -748,15 +749,15 @@ if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
         end)
 
         if success then
-            print("  [+] Report sent to Discord successfully.")
+            print("  [+] Webhook sent: Report successfully attached as a file.")
         else
             warn("  [-] Webhook failed: " .. tostring(err))
         end
     else
-        warn("  [-] Webhook skipped: Your executor does not support HTTP requests.")
+        warn("  [-] Webhook skipped: No valid request function found for this executor.")
     end
 end
 
 print("\n" .. SEP_MAJOR)
-print("  Report complete.")
+print("  Report complete. [cite: 65]")
 print(SEP_MAJOR .. "\n")
