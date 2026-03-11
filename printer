@@ -629,63 +629,67 @@ print("\n" .. SEP_MAJOR)
 print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
+local json = to_json(export)
+
+-- Print in chunks (Roblox console line length limit)
+local chunk = 200
+print("-- BEGIN AC_RECON_EXPORT --")
+for i = 1, #json, chunk do
+    print(json:sub(i, i + chunk - 1))
+end
+print("-- END AC_RECON_EXPORT --")
+
+print("\n" .. SEP_MAJOR)
+print("  Report complete. Copy the JSON above into the web dashboard.") [cite: 65]
+print(SEP_MAJOR .. "\n")
+
 -- ══════════════════════════════════════════════════════════════════════════════
--- DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
+--  DISCORD WEBHOOK INTEGRATION
 -- ══════════════════════════════════════════════════════════════════════════════
 
 local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A -- Replace this placeholder
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    -- More robust detection for executor-specific request functions
-    local executor_request = nil
+    -- Detect executor HTTP request function
+    local http_request = (request or http and http.request or http_request or syn and syn.request)
     
-    -- Check common global and table-based request aliases
-    if type(request) == "function" then 
-        executor_request = request 
-    elseif type(http_request) == "function" then 
-        executor_request = http_request
-    elseif syn and type(syn.request) == "function" then 
-        executor_request = syn.request
-    elseif http and type(http.request) == "function" then 
-        executor_request = http.request
-    elseif fluxus and type(fluxus.request) == "function" then
-        executor_request = fluxus.request
-    end
+    if http_request then
+        local HttpService = game:GetService("HttpService")
+        
+        -- Discord embed description limit is 4096 characters. 
+        -- If your JSON exceeds this, it truncates safely.
+        local truncated_json = string.sub(json, 1, 4000)
+        if #json > 4000 then
+            truncated_json = truncated_json .. "\n... [JSON truncated due to Discord length limits]"
+        end
 
-    -- Only proceed if we actually found a valid function to call
-    if executor_request then
-        local boundary = "----WebKitFormBoundaryACReconReport"
-        local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
-        
-        -- Construct the raw multipart/form-data body [cite: 58, 62]
-        local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
-        body = body .. message_payload .. "\r\n"
-        
-        body = body .. "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
-        body = body .. 'Content-Type: text/plain\r\n\r\n'
-        body = body .. (json or "{}") .. "\r\n" -- Fallback to empty JSON if nil [cite: 63]
-        body = body .. "--" .. boundary .. "--"
-        
-        -- Wrap the call in a pcall to catch any remaining runtime hiccups [cite: 18, 20]
-        local success, err = pcall(function()
-            executor_request({
-                Url = WEBHOOK_URL,
-                Method = "POST",
-                Headers = {
-                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
-                },
-                Body = body
-            })
+        local payload = {
+            content = "New AC Recon Report Available!",
+            embeds = {{
+                title = "AC Recon JSON Export",
+                description = "```json\n" .. truncated_json .. "\n```",
+                color = 3447003 -- Blue color
+            }}
+        }
+
+        local success, req_json = pcall(function()
+            return HttpService:JSONEncode(payload)
         end)
 
         if success then
-            print("  [+] Successfully sent the report to Discord as a .txt attachment.") [cite: 65]
+            http_request({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = req_json
+            })
+            print("  [+] Successfully logged JSON report to Discord Webhook.")
         else
-            warn("  [-] Failed to send the webhook: " .. tostring(err)) [cite: 3]
+            warn("  [-] Failed to encode webhook payload.")
         end
     else
-        warn("  [-] No valid HTTP request function found for this executor. Webhook skipped.") [cite: 3, 11]
+        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
     end
 end
