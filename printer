@@ -628,3 +628,54 @@ print("-- END AC_RECON_EXPORT --")
 print("\n" .. SEP_MAJOR)
 print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
+
+if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
+    -- Detect executor HTTP request function
+    local http_request = (request or http and http.request or http_request or syn and syn.request)
+    
+    if http_request then
+        -- Define a unique boundary string for the multipart form data
+        local boundary = "----WebKitFormBoundaryACReconReport"
+        
+        -- The basic text message that accompanies the file
+        local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
+        
+        -- Construct the raw multipart/form-data body
+        local body = "--" .. boundary .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
+        body = body .. message_payload .. "\r\n"
+        
+        body = body .. "--" .. boundary .. "\r\n"
+        -- We name the file "ac_recon_report.txt" so Discord renders it as a downloadable text file
+        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
+        body = body .. 'Content-Type: text/plain\r\n\r\n'
+        body = body .. json .. "\r\n"
+        body = body .. "--" .. boundary .. "--"
+        
+        local success, err = pcall(function()
+            http_request({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = {
+                    -- We must tell Discord the exact boundary string we used
+                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
+                },
+                Body = body
+            })
+        end)
+
+        if success then
+            print("  [+] Successfully sent the report to Discord as a .txt attachment.")
+        else
+            warn("  [-] Failed to send the webhook: " .. tostring(err))
+        end
+    else
+        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
+    end
+end
