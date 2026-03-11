@@ -627,7 +627,7 @@ end
 print("-- END AC_RECON_EXPORT --")
 
 print("\n" .. SEP_MAJOR)
-print("  Report complete. Copy the JSON above into the web dashboard.") [cite: 65]
+print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
