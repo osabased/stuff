@@ -630,68 +630,48 @@ print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  SECTION 10 — SELF-CONTAINED WEBHOOK
+--  SECTION 10 — SYNCHRONOUS WEBHOOK TEST
 -- ══════════════════════════════════════════════════════════════════════════════
 
--- 1. Grab the report again to ensure it isn't nil
 local final_report = getgenv().__ac_recon
-if not final_report then
-    print("!! DEBUG: Webhook failed because report was nil")
-    return
-end
+local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A
 
--- 2. Self-contained JSON function (prevents "call nil" if printer version failed)
-local function safe_json(val)
-    local t = type(val)
-    if t == "string" then return '"'..val..'"'
-    elseif t == "number" or t == "boolean" then return tostring(val)
-    elseif t == "table" then
-        local parts = {}
-        for k, v in pairs(val) do
-            table.insert(parts, '"'..tostring(k)..'":'..safe_json(v))
-        end
-        return "{"..table.concat(parts, ",").."}"
-    end
-    return '"['..t..']"'
-end
+print("[1] Entering Section 10...")
 
--- 3. The Webhook Logic
-local WEBHOOK_URL = https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A -- <--- REPLACE THIS
-
-if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
+if final_report and WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
     -- Detect executor function
     local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
     
-    if http_req and type(http_req) == "function" then
-        local json_payload = safe_json({
-            executor = final_report.meta.executor_fingerprint or "Unknown",
-            findings = final_report.summary.finding_count or 0
-        })
+    if type(http_req) == "function" then
+        print("[2] HTTP function found. Starting request...")
 
-        local boundary = "----ACRECON"
-        local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
-        body = body .. '{"content": "AC Recon Report Attached"}\r\n'
-        body = body .. "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="report.json"\r\n'
-        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_payload .. "\r\n"
-        body = body .. "--" .. boundary .. "--"
+        -- Simple JSON string builder (prevents calling potentially nil functions)
+        local simple_json = string.format(
+            '{"content": "AC Recon Report\\nExecutor: %s\\nFindings: %s"}',
+            tostring(final_report.meta.executor_fingerprint or "Unknown"),
+            tostring(final_report.summary.finding_count or 0)
+        )
 
-        -- Using a task.spawn to prevent a hang from crashing the main script
-        task.spawn(function()
-            local success, err = pcall(function()
-                http_req({
-                    Url = WEBHOOK_URL,
-                    Method = "POST",
-                    Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
-                    Body = body
-                })
-            end)
-            if success then print("WEBHOOK SENT") else print("WEBHOOK ERROR: " .. tostring(err)) end
+        -- Execute synchronously (No task.spawn)
+        local success, result = pcall(function()
+            return http_req({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = {["Content-Type"] = "application/json"},
+                Body = simple_json
+            })
         end)
+
+        if success then
+            print("[3] Webhook attempt finished. Status: " .. tostring(result and result.StatusCode or "Unknown Success"))
+        else
+            print("[3] Webhook CRASHED: " .. tostring(result))
+        end
     else
-        print("!! DEBUG: No executor HTTP function found")
+        print("[2] Error: No HTTP function found.")
     end
+else
+    print("[2] Error: Report or URL missing.")
 end
 
-print("SECTION 10 FINISHED")
+print("[4] SECTION 10 FINISHED")
