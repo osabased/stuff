@@ -617,7 +617,6 @@ for _, e in ipairs(report.entries) do
 end
 
 local json = to_json(export)
-
 -- Print in chunks (Roblox console line length limit)
 local chunk = 200
 print("-- BEGIN AC_RECON_EXPORT --")
@@ -631,127 +630,68 @@ print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  SECTION 10 — EXPORT & DEBUG LOGGING
+--  SECTION 10 — SELF-CONTAINED WEBHOOK
 -- ══════════════════════════════════════════════════════════════════════════════
-header("10 · EXPORT & DEBUG LOGGING")
 
-print("[DEBUG] Starting Section 10...")
+-- 1. Grab the report again to ensure it isn't nil
+local final_report = getgenv().__ac_recon
+if not final_report then
+    print("!! DEBUG: Webhook failed because report was nil")
+    return
+end
 
--- 1. Minimal JSON serializer
-local function to_json(val, depth)
-    depth = depth or 0
+-- 2. Self-contained JSON function (prevents "call nil" if printer version failed)
+local function safe_json(val)
     local t = type(val)
-    if t == "nil" then return "null"
-    elseif t == "boolean" then return tostring(val)
-    elseif t == "number" then
-        if val ~= val then return "null" end 
-        return tostring(val)
-    elseif t == "string" then
-        return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r') .. '"'
+    if t == "string" then return '"'..val..'"'
+    elseif t == "number" or t == "boolean" then return tostring(val)
     elseif t == "table" then
-        if depth > 4 then return '"[truncated]"' end
-        local is_array = true
-        local n = 0
-        for k in pairs(val) do
-            n = n + 1
-            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
-                is_array = false; break
-            end
+        local parts = {}
+        for k, v in pairs(val) do
+            table.insert(parts, '"'..tostring(k)..'":'..safe_json(v))
         end
-        if is_array and n == #val then
-            local parts = {}
-            for _, v in ipairs(val) do table.insert(parts, to_json(v, depth+1)) end
-            return "[" .. table.concat(parts, ",") .. "]"
-        else
-            local parts = {}
-            for k, v in pairs(val) do
-                if type(k) == "string" or type(k) == "number" then
-                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1))
-                end
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-    else
-        return '"[' .. t .. ']"'
+        return "{"..table.concat(parts, ",").."}"
     end
+    return '"['..t..']"'
 end
 
-print("[DEBUG] JSON function defined.")
-
--- 2. Build the export object
-local export = {
-    meta    = report.meta,
-    summary = report.summary,
-    gaps    = report.gaps,
-    actions = actions or {},
-    entries = {}
-}
-
-for _, e in ipairs(report.entries) do
-    if e.severity == "significant" or e.severity == "notable" then
-        table.insert(export.entries, {
-            section  = e.section,
-            key      = e.key,
-            value    = type(e.value) == "table" and "[table]" or tostring(e.value),
-            severity = e.severity,
-            phase    = e.phase,
-        })
-    end
-end
-
-print("[DEBUG] Export object built. Entries: " .. tostring(#export.entries))
-
--- 3. Generate JSON
-local json_data = to_json(export)
-print("[DEBUG] JSON string generated. Length: " .. tostring(#json_data))
-
--- 4. DISCORD WEBHOOK LOGGING
+-- 3. The Webhook Logic
 local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- <--- REPLACE THIS
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    print("[DEBUG] Webhook URL is set. Detecting HTTP function...")
-    
-    -- Safety check for the executor's request function
+    -- Detect executor function
     local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
     
-    print("[DEBUG] http_req type: " .. type(http_req))
-
     if http_req and type(http_req) == "function" then
-        print("[DEBUG] Building multipart body...")
-        
-        local boundary = "----WebKitFormBoundaryACRecon"
-        local message = '{"content": "**AC Recon Report Generated**", "username": "AC Recon Bot"}'
-        
+        local json_payload = safe_json({
+            executor = final_report.meta.executor_fingerprint or "Unknown",
+            findings = final_report.summary.finding_count or 0
+        })
+
+        local boundary = "----ACRECON"
         local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n' .. message .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
+        body = body .. '{"content": "AC Recon Report Attached"}\r\n'
         body = body .. "--" .. boundary .. "\r\n"
         body = body .. 'Content-Disposition: form-data; name="file"; filename="report.json"\r\n'
-        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_data .. "\r\n"
+        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_payload .. "\r\n"
         body = body .. "--" .. boundary .. "--"
-        
-        print("[DEBUG] Body built. Preparing for pcall request...")
 
-        local success, err = pcall(function()
-            return http_req({
-                Url = WEBHOOK_URL,
-                Method = "POST",
-                Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
-                Body = body
-            })
+        -- Using a task.spawn to prevent a hang from crashing the main script
+        task.spawn(function()
+            local success, err = pcall(function()
+                http_req({
+                    Url = WEBHOOK_URL,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
+                    Body = body
+                })
+            end)
+            if success then print("WEBHOOK SENT") else print("WEBHOOK ERROR: " .. tostring(err)) end
         end)
-
-        if success then
-            print("[DEBUG] pcall success. Webhook sent.")
-        else
-            print("[DEBUG] pcall failed. Error: " .. tostring(err))
-        end
     else
-        print("[DEBUG] Error: No valid HTTP function found. http_req is nil or not a function.")
+        print("!! DEBUG: No executor HTTP function found")
     end
-else
-    print("[DEBUG] Webhook skipped: URL still set to placeholder.")
 end
 
-print("\n" .. SEP_MAJOR)
-print("  Report complete.")
-print(SEP_MAJOR .. "\n")
+print("SECTION 10 FINISHED")
