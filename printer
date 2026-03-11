@@ -1,4 +1,3 @@
-
 -- ============================================================
 --  AC Recon — Human-Readable Report Printer
 --  Run this AFTER ac_recon_v1.lua has completed.
@@ -615,61 +614,119 @@ local json_data = to_json(export)
 print("Final JSON Size: " .. #json_data .. " bytes")
 -- Print in chunks (Roblox console line length limit)
 local chunk = 200
-print("-- BEGIN AC_RECON_EXPORT --")
-for i = 1, #json, chunk do
-    print(json:sub(i, i + chunk - 1))
+print("~~BEGIN~~")
+for i = 1, #json_data, chunk do
+    print(json_data:sub(i, i + chunk - 1))
 end
-print("-- END AC_RECON_EXPORT --")
+print("~~END~~")
 
 print("\n" .. SEP_MAJOR)
 print("  Report complete. Copy the JSON above into the web dashboard.")
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  SECTION 10 — FINAL EXPORT & DISCORD LOGGING
+--  SECTION 11 — DISCORD WEBHOOK (CHUNKED JSON RELAY)
+--  Splits the export JSON into numbered 1800-char chunks and sends each as a
+--  plain Discord message. Copy ALL messages from Discord into the dashboard
+--  paste box — it reassembles them automatically using the ~~BEGIN~~/~~END~~
+--  markers.
+--
+--  Chunk size : 1800 chars  (safely under Discord's 2000-char message limit)
+--  Rate limit : 0.7s delay between posts (Discord cap: ~5 posts per 2s)
 -- ══════════════════════════════════════════════════════════════════════════════
-header("10 · DISCORD EXPORT")
+header("11 · DISCORD WEBHOOK (JSON RELAY)")
 
-local final_report = getgenv().__ac_recon
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1481128380622704670/I14nsEuDtdJ2xBg8oqKyQi7y86Nbbkp_a3y-nO6yc0-0SQ9V5eaWhVozBEruS025Zv8A"  -- PASTE YOUR WEBHOOK URL HERE
 
-if final_report and WEBHOOK_URL ~= "" then
-    local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
-    
-    if type(http_req) == "function" then
-        print("  [+] Preparing full report for Discord...")
+if WEBHOOK_URL == "" then
+    print("  ○  Webhook skipped — set WEBHOOK_URL to enable")
+else
+    local http_req = request or (http and http.request) or http_request
+                  or (syn and syn.request)
 
-        -- 1. Generate the JSON string using the existing to_json function
-        local json_data = to_json(export) -- Uses the 'export' table built in Section 10 
-
-        -- 2. Build Multipart Body for File Attachment
-        local boundary = "----ACReconBoundary"
-        local message = '{"content": "**AC Recon Report Generated**\\nExecutor: '.. tostring(final_report.meta.executor_fingerprint) ..'", "username": "AC Recon Bot"}'
-        
-        local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n' .. message .. "\r\n"
-        body = body .. "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_report.json"\r\n'
-        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_data .. "\r\n"
-        body = body .. "--" .. boundary .. "--"
-        
-        -- 3. Send Synchronously
-        local success, result = pcall(function()
-            return http_req({
-                Url = WEBHOOK_URL,
-                Method = "POST",
-                Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
-                Body = body
-            })
-        end)
-
-        if success then
-            print("  [+] Report sent successfully as 'ac_report.json'.")
-        else
-            warn("  [-] Webhook failed: " .. tostring(result))
-        end
-    else
+    if type(http_req) ~= "function" then
         warn("  [-] Executor does not support HTTP requests.")
+    else
+
+        -- ── Simple POST helper ────────────────────────────────────────────────
+        local function post_message(content)
+            -- Escape content for JSON string value
+            local escaped = content
+                :gsub('\\', '\\\\')
+                :gsub('"',  '\\"')
+                :gsub('\r', '')
+                :gsub('\n', '\\n')
+
+            local body = '{"username":"AC Recon","content":"' .. escaped .. '"}'
+
+            local ok, res = pcall(http_req, {
+                Url     = WEBHOOK_URL,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = body,
+            })
+            return ok, res
+        end
+
+        -- ── Split json_data into 1800-char chunks ─────────────────────────────
+        local CHUNK_SIZE  = 1800
+        local total_chars = #json_data
+        local total_chunks = math.ceil(total_chars / CHUNK_SIZE)
+
+        print(string.format("  [+] JSON size: %d chars → %d chunk(s) to send",
+            total_chars, total_chunks))
+
+        -- Send a header message first so the chunks are easy to find in Discord
+        local header_msg = string.format(
+            "[AC Recon Export — %d chunk(s) — paste ALL into dashboard]",
+            total_chunks
+        )
+        local ok0, r0 = post_message(header_msg)
+        if not ok0 then
+            warn("  [-] Header message failed: " .. tostring(r0))
+        end
+        task.wait(0.7)
+
+        -- Send ~~BEGIN~~ marker as its own message
+        post_message("~~BEGIN~~")
+        task.wait(0.7)
+
+        -- Send each chunk
+        local sent, failed = 0, 0
+        for i = 1, total_chunks do
+            local chunk_start = (i - 1) * CHUNK_SIZE + 1
+            local chunk_end   = math.min(i * CHUNK_SIZE, total_chars)
+            local chunk_text  = json_data:sub(chunk_start, chunk_end)
+
+            local ok, res = post_message(chunk_text)
+
+            if ok then
+                sent = sent + 1
+                print(string.format("  [+] Chunk %d/%d sent (%d chars)",
+                    i, total_chunks, #chunk_text))
+            else
+                failed = failed + 1
+                warn(string.format("  [-] Chunk %d/%d failed: %s",
+                    i, total_chunks, tostring(res)))
+            end
+
+            -- Rate-limit delay between chunks
+            if i < total_chunks then
+                task.wait(0.7)
+            end
+        end
+
+        -- Send ~~END~~ marker as its own message
+        task.wait(0.7)
+        post_message("~~END~~")
+
+        print(string.format("\n  [✓] Done — %d sent, %d failed", sent, failed))
+        if failed == 0 then
+            print("  Copy all messages between ~~BEGIN~~ and ~~END~~ from Discord")
+            print("  and paste them into the dashboard. Timestamps are stripped automatically.")
+        else
+            warn("  Some chunks failed — retry or reduce CHUNK_SIZE if hitting rate limits.")
+        end
     end
 end
 
