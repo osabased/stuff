@@ -617,6 +617,7 @@ for _, e in ipairs(report.entries) do
 end
 
 local json = to_json(export)
+
 -- Print in chunks (Roblox console line length limit)
 local chunk = 200
 print("-- BEGIN AC_RECON_EXPORT --")
@@ -626,5 +627,56 @@ end
 print("-- END AC_RECON_EXPORT --")
 
 print("\n" .. SEP_MAJOR)
-print("  Report complete. Copy the JSON above into the web dashboard.")
+print("  Report complete. Copy the JSON above into the web dashboard.") [cite: 65]
 print(SEP_MAJOR .. "\n")
+
+-- ══════════════════════════════════════════════════════════════════════════════
+--  DISCORD WEBHOOK INTEGRATION
+-- ══════════════════════════════════════════════════════════════════════════════
+
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
+
+if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
+    -- Detect executor HTTP request function
+    local http_request = (request or http and http.request or http_request or syn and syn.request)
+    
+    if http_request then
+        local HttpService = game:GetService("HttpService")
+        
+        -- Discord embed description limit is 4096 characters. 
+        -- If your JSON exceeds this, it truncates safely.
+        local truncated_json = string.sub(json, 1, 4000)
+        if #json > 4000 then
+            truncated_json = truncated_json .. "\n... [JSON truncated due to Discord length limits]"
+        end
+
+        local payload = {
+            content = "New AC Recon Report Available!",
+            embeds = {{
+                title = "AC Recon JSON Export",
+                description = "```json\n" .. truncated_json .. "\n```",
+                color = 3447003 -- Blue color
+            }}
+        }
+
+        local success, req_json = pcall(function()
+            return HttpService:JSONEncode(payload)
+        end)
+
+        if success then
+            http_request({
+                Url = WEBHOOK_URL,
+                Method = "POST",
+                Headers = {
+                    ["Content-Type"] = "application/json"
+                },
+                Body = req_json
+            })
+            print("  [+] Successfully logged JSON report to Discord Webhook.")
+        else
+            warn("  [-] Failed to encode webhook payload.")
+        end
+    else
+        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
+    end
+end
