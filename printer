@@ -668,37 +668,38 @@ else
             return ok, res
         end
 
-        -- ── Split json_data into 1800-char chunks ─────────────────────────────
-        local CHUNK_SIZE  = 1800
-        local total_chars = #json_data
+        -- ── Split json_data into chunks and wrap in code blocks ──────────────
+        -- Each message is:  ```\n<chunk>\n```
+        -- The ``` fences prevent Discord markdown from mangling JSON characters
+        -- like *, _, ~, >, which would corrupt the data.
+        -- 1800 chars of JSON + 8 chars of fencing = well under 2000-char limit.
+        local CHUNK_SIZE   = 1800
+        local total_chars  = #json_data
         local total_chunks = math.ceil(total_chars / CHUNK_SIZE)
 
         print(string.format("  [+] JSON size: %d chars → %d chunk(s) to send",
             total_chars, total_chunks))
 
-        -- Send a header message first so the chunks are easy to find in Discord
-        local header_msg = string.format(
-            "[AC Recon Export — %d chunk(s) — paste ALL into dashboard]",
+        -- Header message
+        post_message(string.format(
+            "**AC Recon Export** — %d chunk(s) — copy everything below into the dashboard",
             total_chunks
-        )
-        local ok0, r0 = post_message(header_msg)
-        if not ok0 then
-            warn("  [-] Header message failed: " .. tostring(r0))
-        end
+        ))
         task.wait(0.7)
 
-        -- Send ~~BEGIN~~ marker as its own message
+        -- BEGIN marker (plain, not in a code block — dashboard looks for this)
         post_message("~~BEGIN~~")
         task.wait(0.7)
 
-        -- Send each chunk
+        -- Send each chunk wrapped in a code block
         local sent, failed = 0, 0
         for i = 1, total_chunks do
             local chunk_start = (i - 1) * CHUNK_SIZE + 1
             local chunk_end   = math.min(i * CHUNK_SIZE, total_chars)
             local chunk_text  = json_data:sub(chunk_start, chunk_end)
 
-            local ok, res = post_message(chunk_text)
+            -- Wrap in code block so Discord renders it verbatim
+            local ok, res = post_message("```\n" .. chunk_text .. "\n```")
 
             if ok then
                 sent = sent + 1
@@ -710,22 +711,20 @@ else
                     i, total_chunks, tostring(res)))
             end
 
-            -- Rate-limit delay between chunks
             if i < total_chunks then
                 task.wait(0.7)
             end
         end
 
-        -- Send ~~END~~ marker as its own message
+        -- END marker
         task.wait(0.7)
         post_message("~~END~~")
 
         print(string.format("\n  [✓] Done — %d sent, %d failed", sent, failed))
         if failed == 0 then
-            print("  Copy all messages between ~~BEGIN~~ and ~~END~~ from Discord")
-            print("  and paste them into the dashboard. Timestamps are stripped automatically.")
+            print("  In Discord: copy from ~~BEGIN~~ down to ~~END~~ and paste into dashboard.")
         else
-            warn("  Some chunks failed — retry or reduce CHUNK_SIZE if hitting rate limits.")
+            warn("  Some chunks failed — reduce CHUNK_SIZE if hitting rate limits.")
         end
     end
 end
