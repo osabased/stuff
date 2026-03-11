@@ -644,127 +644,52 @@ print("  Report complete. Copy the JSON above into the web dashboard.") [cite: 6
 print(SEP_MAJOR .. "\n")
 
 -- ══════════════════════════════════════════════════════════════════════════════
---  SECTION 10 — EXPORT & DEBUG LOGGING
+--  DISCORD WEBHOOK INTEGRATION (FILE ATTACHMENT)
 -- ══════════════════════════════════════════════════════════════════════════════
-header("10 · EXPORT & DEBUG LOGGING")
 
-print("[DEBUG] Starting Section 10...")
-
--- 1. Minimal JSON serializer
-local function to_json(val, depth)
-    depth = depth or 0
-    local t = type(val)
-    if t == "nil" then return "null"
-    elseif t == "boolean" then return tostring(val)
-    elseif t == "number" then
-        if val ~= val then return "null" end 
-        return tostring(val)
-    elseif t == "string" then
-        return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r') .. '"'
-    elseif t == "table" then
-        if depth > 4 then return '"[truncated]"' end
-        local is_array = true
-        local n = 0
-        for k in pairs(val) do
-            n = n + 1
-            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
-                is_array = false; break
-            end
-        end
-        if is_array and n == #val then
-            local parts = {}
-            for _, v in ipairs(val) do table.insert(parts, to_json(v, depth+1)) end
-            return "[" .. table.concat(parts, ",") .. "]"
-        else
-            local parts = {}
-            for k, v in pairs(val) do
-                if type(k) == "string" or type(k) == "number" then
-                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1))
-                end
-            end
-            return "{" .. table.concat(parts, ",") .. "}"
-        end
-    else
-        return '"[' .. t .. ']"'
-    end
-end
-
-print("[DEBUG] JSON function defined.")
-
--- 2. Build the export object
-local export = {
-    meta    = report.meta,
-    summary = report.summary,
-    gaps    = report.gaps,
-    actions = actions or {},
-    entries = {}
-}
-
-for _, e in ipairs(report.entries) do
-    if e.severity == "significant" or e.severity == "notable" then
-        table.insert(export.entries, {
-            section  = e.section,
-            key      = e.key,
-            value    = type(e.value) == "table" and "[table]" or tostring(e.value),
-            severity = e.severity,
-            phase    = e.phase,
-        })
-    end
-end
-
-print("[DEBUG] Export object built. Entries: " .. tostring(#export.entries))
-
--- 3. Generate JSON
-local json_data = to_json(export)
-print("[DEBUG] JSON string generated. Length: " .. tostring(#json_data))
-
--- 4. DISCORD WEBHOOK LOGGING
-local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- <--- REPLACE THIS
+local WEBHOOK_URL = "YOUR_DISCORD_WEBHOOK_URL_HERE" -- Replace this placeholder
 
 if WEBHOOK_URL ~= "YOUR_DISCORD_WEBHOOK_URL_HERE" then
-    print("[DEBUG] Webhook URL is set. Detecting HTTP function...")
+    -- Detect executor HTTP request function
+    local http_request = (request or http and http.request or http_request or syn and syn.request)
     
-    -- Safety check for the executor's request function
-    local http_req = (request or (http and http.request) or http_request or (syn and syn.request))
-    
-    print("[DEBUG] http_req type: " .. type(http_req))
-
-    if http_req and type(http_req) == "function" then
-        print("[DEBUG] Building multipart body...")
+    if http_request then
+        -- Define a unique boundary string for the multipart form data
+        local boundary = "----WebKitFormBoundaryACReconReport"
         
-        local boundary = "----WebKitFormBoundaryACRecon"
-        local message = '{"content": "**AC Recon Report Generated**", "username": "AC Recon Bot"}'
+        -- The basic text message that accompanies the file
+        local message_payload = '{"content": "**New AC Recon Report Available!**\\nSee the attached text file for the complete, untruncated JSON export.", "username": "AC Recon Logger"}'
         
+        -- Construct the raw multipart/form-data body
         local body = "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n' .. message .. "\r\n"
+        body = body .. 'Content-Disposition: form-data; name="payload_json"\r\n\r\n'
+        body = body .. message_payload .. "\r\n"
+        
         body = body .. "--" .. boundary .. "\r\n"
-        body = body .. 'Content-Disposition: form-data; name="file"; filename="report.json"\r\n'
-        body = body .. 'Content-Type: application/json\r\n\r\n' .. json_data .. "\r\n"
+        -- We name the file "ac_recon_report.txt" so Discord renders it as a downloadable text file
+        body = body .. 'Content-Disposition: form-data; name="file"; filename="ac_recon_report.txt"\r\n'
+        body = body .. 'Content-Type: text/plain\r\n\r\n'
+        body = body .. json .. "\r\n"
         body = body .. "--" .. boundary .. "--"
         
-        print("[DEBUG] Body built. Preparing for pcall request...")
-
         local success, err = pcall(function()
-            return http_req({
+            http_request({
                 Url = WEBHOOK_URL,
                 Method = "POST",
-                Headers = { ["Content-Type"] = "multipart/form-data; boundary=" .. boundary },
+                Headers = {
+                    -- We must tell Discord the exact boundary string we used
+                    ["Content-Type"] = "multipart/form-data; boundary=" .. boundary
+                },
                 Body = body
             })
         end)
 
         if success then
-            print("[DEBUG] pcall success. Webhook sent.")
+            print("  [+] Successfully sent the report to Discord as a .txt attachment.")
         else
-            print("[DEBUG] pcall failed. Error: " .. tostring(err))
+            warn("  [-] Failed to send the webhook: " .. tostring(err))
         end
     else
-        print("[DEBUG] Error: No valid HTTP function found. http_req is nil or not a function.")
+        warn("  [-] No executor HTTP request function found. Cannot send webhook.")
     end
-else
-    print("[DEBUG] Webhook skipped: URL still set to placeholder.")
 end
-
-print("\n" .. SEP_MAJOR)
-print("  Report complete.")
-print(SEP_MAJOR .. "\n")
