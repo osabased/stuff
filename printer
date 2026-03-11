@@ -554,69 +554,65 @@ print("  Copy the JSON below and paste it into the AC Recon web dashboard")
 print("  for a visual breakdown of all findings.\n")
 
 -- Minimal JSON serializer
+-- 1. Slimmed JSON Serializer with String Truncation
 local function to_json(val, depth)
     depth = depth or 0
     local t = type(val)
-    if t == "nil"     then return "null"
-    elseif t == "boolean" then return tostring(val)
-    elseif t == "number"  then
-        if val ~= val then return "null" end -- NaN
+    if t == "string" then
+        -- TRUNCATE individual strings to 100 chars to prevent massive bloat
+        local clean = val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n',' '):gsub('\r',' ')
+        if #clean > 100 then
+            clean = clean:sub(1, 100) .. "..."
+        end
+        return '"' .. clean .. '"'
+    elseif t == "boolean" or t == "number" then
         return tostring(val)
-    elseif t == "string" then
-        return '"' .. val:gsub('\\','\\\\'):gsub('"','\\"'):gsub('\n','\\n'):gsub('\r','\\r') .. '"'
     elseif t == "table" then
-        if depth > 4 then return '"[truncated]"' end
-        -- Check if array
+        if depth > 6 then return '"[Depth Limit]"' end
         local is_array = true
         local n = 0
         for k in pairs(val) do
             n = n + 1
-            if type(k) ~= "number" or k ~= math.floor(k) or k < 1 then
-                is_array = false; break
-            end
+            if type(k) ~= "number" then is_array = false break end
         end
-        if is_array and n == #val then
+        if is_array then
             local parts = {}
-            for _, v in ipairs(val) do
-                table.insert(parts, to_json(v, depth+1))
-            end
+            for _, v in ipairs(val) do table.insert(parts, to_json(v, depth+1)) end
             return "[" .. table.concat(parts, ",") .. "]"
         else
             local parts = {}
             for k, v in pairs(val) do
-                if type(k) == "string" or type(k) == "number" then
-                    table.insert(parts, to_json(tostring(k), depth+1) .. ":" .. to_json(v, depth+1))
-                end
+                table.insert(parts, '"' .. tostring(k) .. '":' .. to_json(v, depth+1))
             end
             return "{" .. table.concat(parts, ",") .. "}"
         end
-    else
-        return '"[' .. t .. ']"'
     end
+    return "null"
 end
 
--- Build a slimmed export object
+-- 2. Build a Highly Filtered Export
 local export = {
-    meta    = report.meta,
-    summary = report.summary,
-    gaps    = report.gaps,
-    actions = actions,
-    entries = {}
+    meta = {
+        executor = report.meta.executor_fingerprint,
+        date = os.date("%Y-%m-%d")
+    },
+    findings_count = report.summary.finding_count,
+    significant_entries = {}
 }
--- Only include notable/significant entries to keep JSON manageable
+
+-- ONLY include "significant" severity. Skip "notable" to save space.
 for _, e in ipairs(report.entries) do
-    if e.severity == "significant" or e.severity == "notable" then
-        table.insert(export.entries, {
-            section  = e.section,
-            key      = e.key,
-            value    = type(e.value) == "table" and "[table]" or tostring(e.value),
-            severity = e.severity,
-            phase    = e.phase,
+    if e.severity == "significant" then
+        table.insert(export.significant_entries, {
+            s = tostring(e.section),
+            k = tostring(e.key),
+            v = type(e.value) == "string" and e.value:sub(1, 50) or "[data]"
         })
     end
 end
 
-local json = to_json(export)
+local json_data = to_json(export)
+print("Final JSON Size: " .. #json_data .. " bytes")
 -- Print in chunks (Roblox console line length limit)
 local chunk = 200
 print("-- BEGIN AC_RECON_EXPORT --")
