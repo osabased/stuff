@@ -1,8 +1,18 @@
 -- ============================================================
---  Roblox Anti-Cheat Reconnaissance & Analysis Tool  v1.0
+--  Roblox Anti-Cheat Reconnaissance & Analysis Tool  v1.1
 --  Architecture Schematic implementation
 --  Run in your own place only (Roblox creator policy applies)
 -- ============================================================
+
+-- ── Pre-bootstrap: capture executor API references synchronously before any yields
+-- If the AC loaded before tool injection, getrenv() will already contain hooked
+-- references. Storing these early refs lets Phase 4.5/4.6 detect API replacement
+-- by comparing current refs against what was present at load time.
+local EARLY_REFS = {
+    islclosure     = rawget(_G, "islclosure")     or (getgenv and getgenv().islclosure)     or nil,
+    getconnections = rawget(_G, "getconnections") or (getgenv and getgenv().getconnections) or nil,
+    getrenv        = rawget(_G, "getrenv")        or (getgenv and getgenv().getrenv)        or nil,
+}
 
 -- ── Shared State ────────────────────────────────────────────
 local API      = {}   -- Phase 1: executor API presence map
@@ -15,7 +25,7 @@ local INSTANCES = {}  -- Phase 6: instance/script scan results
 local TIMING   = {}   -- Phase 7: behavioral timing results
 
 local REPORT = {
-    meta    = { version = "1.0", timestamp = os.clock(), executor_fingerprint = "unknown", run_duration_sec = 0 },
+    meta    = { version = "1.2", timestamp = os.clock(), executor_fingerprint = "unknown", run_duration_sec = 0 },
     entries = {},
     summary = { finding_count = 0, significant_count = 0, closure_behavior = {}, hooked_fns = {} },
     gaps    = {},
@@ -142,17 +152,51 @@ local function phase1()
                 "pcall","xpcall","error","assert",
                 "task","math","string","table",
                 "FireServer","InvokeServer",
+                "rawget","rawset","rawequal","rawlen",
+                "tostring","tonumber","select","ipairs","pairs","next",
+                "coroutine","io","os",
             }
             for _, k in ipairs(targets) do
                 BASELINE[k] = renv[k]
+            end
+            -- Snapshot all standard library subtables in full via pairs()
+            local subtable_keys = {"math","string","table","coroutine","os","io","utf8"}
+            local subtable_count = 0
+            for _, lib in ipairs(subtable_keys) do
+                if type(renv[lib]) == "table" then
+                    BASELINE[lib] = {}
+                    for k, v in pairs(renv[lib]) do
+                        BASELINE[lib][k] = v
+                        subtable_count = subtable_count + 1
+                    end
+                end
             end
             -- Snapshot task subtable
             if type(renv.task) == "table" then
                 BASELINE.task = {}
                 for k,v in pairs(renv.task) do BASELINE.task[k] = v end
             end
-            emit("info", "Baseline captured (" .. #targets .. " root keys snapshotted)")
-            log_entry("bootstrap", "baseline_captured", true, "info", 1)
+            -- Snapshot RemoteEvent methods via getrenv metatable chain
+            local ok_re, re_proto = safe_call(function()
+                local re = Instance.new("RemoteEvent")
+                local mt = API["getrawmetatable"] and API["getrawmetatable"](re) or nil
+                re:Destroy()
+                return mt
+            end)
+            if ok_re and ok_re and re_proto then
+                BASELINE.__RemoteEvent_mt = re_proto
+                -- Capture FireServer/InvokeServer from a live instance at baseline time
+                local ok_fs, re2 = safe_call(function() return Instance.new("RemoteEvent") end)
+                if ok_fs then
+                    BASELINE.FireServer   = re2.FireServer
+                    BASELINE.InvokeServer = re2.InvokeServer
+                    re2:Destroy()
+                end
+            end
+            REPORT.meta.baseline_t = os.clock()
+            emit("info", string.format("Baseline captured (%d root keys, %d subtable entries snapshotted)", #targets, subtable_count))
+            log_entry("bootstrap", "baseline_captured",       true,           "info", 1)
+            log_entry("bootstrap", "baseline_subtable_count", subtable_count, "info", 1)
         else
             emit("notable", "getrenv() failed or returned non-table")
             log_entry("bootstrap", "baseline_captured", false, "notable", 1)
@@ -160,6 +204,39 @@ local function phase1()
     else
         emit("notable", "getrenv not available — baseline skipped")
         log_entry("bootstrap", "baseline_captured", false, "notable", 1)
+    end
+
+    -- 1.3-B Baseline Freshness Check
+    probe_header("1.3-B", "Baseline Freshness Check")
+    -- If AC scripts were already running before this tool started, their hooks
+    -- are baked into getrenv() and the baseline cannot be considered clean.
+    if API["getrunningscripts"] then
+        local ok_rs, scripts = safe_call(API["getrunningscripts"])
+        if ok_rs and type(scripts) == "table" then
+            local ac_vocab_lc = {"anticheat","anti_cheat","ac_","_ac","detection","monitor","security"}
+            local early_ac = {}
+            for _, s in ipairs(scripts) do
+                local name = tostring(s.Name or ""):lower()
+                local path = tostring(s:GetFullName()):lower()
+                for _, kw in ipairs(ac_vocab_lc) do
+                    if name:find(kw,1,true) or path:find(kw,1,true) then
+                        table.insert(early_ac, s:GetFullName())
+                        break
+                    end
+                end
+            end
+            if #early_ac > 0 then
+                emit("notable", "AC-candidate scripts were running before tool start — baseline may include their hooks:")
+                for _, n in ipairs(early_ac) do emit("detail", "  " .. n) end
+                log_entry("bootstrap", "baseline_freshness", "stale_ac_scripts_present", "notable", 1)
+            else
+                emit("info", "No AC-candidate scripts detected before tool start — baseline is likely clean")
+                log_entry("bootstrap", "baseline_freshness", "clean", "info", 1)
+            end
+        end
+    else
+        emit("detail", "getrunningscripts unavailable — baseline freshness cannot be verified")
+        log_entry("bootstrap", "baseline_freshness", "unverified", "info", 1)
     end
 
     -- 1.4 Executor Fingerprint
@@ -194,20 +271,34 @@ end
 local function phase2()
     section_header(2, "Closure Identity Characterization")
 
-    -- Three test subjects
+    -- Three test subjects (original) + hookfunction subject (new)
     local lua_closure = function() return true end
     local c_closure   = math.abs
     local nc_closure  = nil
+    local hf_closure  = nil   -- hookfunction-wrapped subject
 
     if API["newcclosure"] then
         local ok, nc = safe_call(API["newcclosure"], lua_closure)
         if ok then nc_closure = nc end
     end
 
+    -- Create a hookfunction subject: hook a throwaway function and capture the result
+    if API["hookfunction"] then
+        local dummy_target = function() return 42 end
+        local dummy_hook   = function() return 42 end
+        local ok_hf, original = safe_call(API["hookfunction"], dummy_target, dummy_hook)
+        if ok_hf then
+            -- The hooked dummy_target is now the hookfunction-wrapped version
+            hf_closure = dummy_target
+            PROBE["hookfunction_original"] = original
+        end
+    end
+
     local subjects = {
         { name = "lua_closure",  fn = lua_closure },
         { name = "c_closure",    fn = c_closure   },
         { name = "nc_closure",   fn = nc_closure  },
+        { name = "hf_closure",   fn = hf_closure  },  -- hookfunction-wrapped
     }
 
     -- 2.1 islclosure matrix
@@ -277,6 +368,35 @@ local function phase2()
         log_entry("closure", "nc_satisfies_both", both, sev, 2)
     else
         emit("detail", "Quirk detection — newcclosure unavailable")
+    end
+
+    -- 2.5 hookfunction-wrapped closure classification
+    probe_header("2.5", "hookfunction-Wrapped Closure Classification")
+    if hf_closure then
+        local lc_fn = API["islclosure"]
+        local cc_fn = API["iscclosure"] or API["checkclosure"]
+        local hf_is_lc, hf_is_cc = nil, nil
+        if lc_fn then local o,v = safe_call(lc_fn, hf_closure); if o then hf_is_lc = v end end
+        if cc_fn then local o,v = safe_call(cc_fn, hf_closure); if o then hf_is_cc = v end end
+        PROBE["hf_is_lc"] = hf_is_lc
+        PROBE["hf_is_cc"] = hf_is_cc
+        -- Determine hook method signature: hookfunction replacements appear as C closures
+        -- (the replacement is stored at the C layer), distinguishing them from assignment replacements
+        local method_hint
+        if hf_is_cc == true  then method_hint = "c_closure — consistent with hookfunction replacement"
+        elseif hf_is_lc == true then method_hint = "lua_closure — assignment-style replacement"
+        else method_hint = "unclassified" end
+        PROBE["hookfunction_replacement_type"] = method_hint
+        local sev = "notable"
+        emit(sev, "hookfunction-wrapped function: islclosure=" .. tostring(hf_is_lc) ..
+            "  iscclosure=" .. tostring(hf_is_cc))
+        emit("detail", "Hook method signature: " .. method_hint)
+        log_entry("closure", "hf_is_lc",                   hf_is_lc,    sev, 2)
+        log_entry("closure", "hf_is_cc",                   hf_is_cc,    sev, 2)
+        log_entry("closure", "hookfunction_replacement_type", method_hint, sev, 2)
+    else
+        emit("detail", "hookfunction unavailable — hook method classification skipped")
+        log_entry("closure", "hookfunction_available", false, "info", 2)
     end
 end
 
@@ -382,41 +502,58 @@ local function phase3()
 
     -- 3.3 Diagnostic Callback Visibility Test
     probe_header("3.3", "Diagnostic Callback Visibility Test")
-    local diag_lua_fired, diag_nc_fired = false, false
+    local diag_lua_fired = false
+    local diag_nc_fired  = false
     local test_conn_lua, test_conn_nc
 
-    test_conn_lua = RunService.Heartbeat:Connect(function() diag_lua_fired = true end)
+    -- Register known callbacks and capture their function references
+    local diag_lua_fn = function() diag_lua_fired = true end
+    local diag_nc_fn  = nil
+
+    test_conn_lua = RunService.Heartbeat:Connect(diag_lua_fn)
+
     if API["newcclosure"] then
-        local ok, nc = safe_call(API["newcclosure"], function() diag_nc_fired = true end)
-        if ok then test_conn_nc = RunService.Heartbeat:Connect(nc) end
+        local ok_nc, nc_fn = safe_call(API["newcclosure"], function() diag_nc_fired = true end)
+        if ok_nc and nc_fn then
+            diag_nc_fn    = nc_fn
+            test_conn_nc  = RunService.Heartbeat:Connect(nc_fn)
+        end
     end
 
-    task.wait(0.1) -- wait 1 frame
+    task.wait(0.1) -- allow at least one frame to fire
 
+    -- Now enumerate connections and check whether our specific callbacks appear
     local ok_check, conns_check = safe_call(API["getconnections"], RunService.Heartbeat)
     local lua_visible, nc_visible = false, false
+
     if ok_check and type(conns_check) == "table" then
         for _, conn in ipairs(conns_check) do
             local cb_ok, cb = safe_call(function() return conn.Function end)
             if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
             if cb_ok and cb then
-                if cb == test_conn_lua then lua_visible = true end
-            end
-            if lc_fn then
-                local o,v = safe_call(lc_fn, cb or function()end)
-                if o and v then lua_visible = true end -- approximate
+                -- Exact reference comparison — the ONLY reliable visibility test
+                if cb == diag_lua_fn then lua_visible = true end
+                if diag_nc_fn and cb == diag_nc_fn then nc_visible = true end
             end
         end
-        nc_visible = (API["newcclosure"] ~= nil) -- visibility inferred
     end
 
     if test_conn_lua then test_conn_lua:Disconnect() end
     if test_conn_nc  then test_conn_nc:Disconnect()  end
 
-    emit("info", "Lua callback visible in getconnections: " .. tostring(lua_visible or diag_lua_fired))
-    emit("info", "NC callback visible in getconnections: "  .. tostring(nc_visible))
-    log_entry("signals", "diag_lua_visible", lua_visible, "info", 3)
-    log_entry("signals", "diag_nc_visible",  nc_visible,  "info", 3)
+    local lua_sev = lua_visible and "info" or "notable"
+    local nc_sev  = (API["newcclosure"] and not nc_visible) and "notable" or "info"
+    emit(lua_sev, "Lua callback visible in getconnections (exact ref match): " .. tostring(lua_visible))
+    emit(nc_sev,  "NC callback visible in getconnections (exact ref match): "  .. tostring(nc_visible))
+    -- If the tool's own lua callback is invisible, the signal walk in Phase 3.2 is unreliable
+    if not lua_visible then
+        emit("significant", "getconnections does not return the tool's own callback — Phase 3 signal topology data may be filtered or incomplete")
+        log_entry("signals", "getconnections_reliable", false, "significant", 3)
+    else
+        log_entry("signals", "getconnections_reliable", true, "info", 3)
+    end
+    log_entry("signals", "diag_lua_visible", lua_visible, lua_sev, 3)
+    log_entry("signals", "diag_nc_visible",  nc_visible,  nc_sev,  3)
 
     -- 3.4 Signal Coverage Map
     probe_header("3.4", "Signal Coverage Map")
@@ -462,7 +599,7 @@ end
 local function phase4()
     section_header(4, "Function Hook Detection")
 
-    -- Helper: compare identity
+    -- Helper: compare identity and determine hook method
     local function identity_check(label, global_fn, baseline_fn, section_key)
         if global_fn == nil then
             emit("detail", label .. " — not found in global env")
@@ -477,39 +614,68 @@ local function phase4()
         local replaced = (global_fn ~= baseline_fn)
         local sev = replaced and "significant" or "info"
         HOOKS[section_key] = replaced
-        if replaced then table.insert(REPORT.summary.hooked_fns, label) end
-        emit(sev, string.format("%-35s  replaced=%s", label, tostring(replaced)))
+        if replaced then
+            table.insert(REPORT.summary.hooked_fns, label)
+            -- Determine hook method: hookfunction replacements appear as C closures;
+            -- assignment replacements appear as Lua closures
+            local cc_fn = API["iscclosure"] or API["checkclosure"]
+            local hook_method = "unknown"
+            if cc_fn then
+                local ok_m, is_cc = safe_call(cc_fn, global_fn)
+                if ok_m then
+                    if is_cc == true then
+                        hook_method = "hookfunction"   -- C-layer replacement
+                    else
+                        hook_method = "assignment"     -- plain Lua table write
+                    end
+                end
+            end
+            HOOKS[section_key .. "_method"] = hook_method
+            emit(sev, string.format("%-35s  replaced=true  method=%s", label, hook_method))
+            log_entry("hooks", section_key .. "_method", hook_method, sev, 4)
+        else
+            emit(sev, string.format("%-35s  replaced=false", label))
+        end
         log_entry("hooks", section_key, replaced, sev, 4)
     end
 
     -- 4.1 RemoteEvent Functions
     probe_header("4.1", "RemoteEvent Function Identity")
-    local Players = game:GetService("Players")
-    local lp = Players.LocalPlayer
-    if lp then
-        local remote_test = Instance.new("RemoteEvent")
-        -- Compare via getrenv
-        local genv_fs = API["getrenv"] and (function()
-            local ok, renv = safe_call(API["getrenv"])
-            return ok and renv
-        end)() or nil
+    -- Capture live FireServer/InvokeServer from a fresh instance and compare against
+    -- the baseline captured in Phase 1 (getrenv-clean references)
+    local ok_re, remote_test = safe_call(function() return Instance.new("RemoteEvent") end)
+    if ok_re and remote_test then
+        local ok_rf, remote_fn_test = safe_call(function() return Instance.new("RemoteFunction") end)
 
-        local ok_mt, mt = safe_call(API["getrawmetatable"] or function() end, remote_test)
-        if ok_mt and mt then
-            emit("detail", "RemoteEvent metatable accessible")
-            log_entry("hooks", "remote_mt_accessible", true, "info", 4)
+        -- Capture global-env versions of the methods
+        local global_fs   = remote_test.FireServer
+        local global_is   = remote_fn_test and remote_fn_test.InvokeServer or nil
+
+        -- Compare against Phase 1 baseline
+        identity_check("RemoteEvent.FireServer",       global_fs, BASELINE.FireServer,   "hook_FireServer")
+        identity_check("RemoteFunction.InvokeServer",  global_is, BASELINE.InvokeServer, "hook_InvokeServer")
+
+        -- Also check __namecall metatable intercept
+        local gmt_fn2 = API["getrawmetatable"] or (debug and debug.getmetatable)
+        if gmt_fn2 then
+            local ok_mt, mt = safe_call(gmt_fn2, remote_test)
+            if ok_mt and mt then
+                emit("detail", "RemoteEvent metatable accessible")
+                log_entry("hooks", "remote_mt_accessible", true, "info", 4)
+                if mt.__namecall then
+                    HOOKS["remote_namecall"] = true
+                    emit("significant", "RemoteEvent.__namecall is present (possible intercept point)")
+                    log_entry("hooks", "remote_namecall_present", true, "significant", 4)
+                end
+            end
         end
 
-        -- Check __namecall for remote functions
-        if mt and mt.__namecall then
-            local sev = "significant"
-            HOOKS["remote_namecall"] = true
-            emit(sev, "RemoteEvent.__namecall is present (possible intercept point)")
-            log_entry("hooks", "remote_namecall_present", true, sev, 4)
-        end
         remote_test:Destroy()
+        if remote_fn_test then remote_fn_test:Destroy() end
     else
-        emit("detail", "LocalPlayer not available — remote identity check skipped")
+        emit("detail", "Could not create RemoteEvent — remote identity check skipped")
+        log_entry("hooks", "hook_FireServer",   "skipped", "info", 4)
+        log_entry("hooks", "hook_InvokeServer", "skipped", "info", 4)
     end
 
     -- 4.2 Core Runtime Functions
@@ -518,8 +684,21 @@ local function phase4()
         local ok, renv = safe_call(API["getrenv"])
         if ok and renv then
             local checks = {
-                { "pcall",        renv.pcall,          BASELINE.pcall         },
-                { "math.random",  renv.math and renv.math.random, BASELINE.math and BASELINE.math.random },
+                { "pcall",       renv.pcall,       BASELINE.pcall        },
+                { "xpcall",      renv.xpcall,      BASELINE.xpcall       },
+                { "rawget",      renv.rawget,       BASELINE.rawget       },
+                { "rawset",      renv.rawset,       BASELINE.rawset       },
+                { "tostring",    renv.tostring,     BASELINE.tostring     },
+                { "math.random", renv.math and renv.math.random,
+                                 BASELINE.math and BASELINE.math.random   },
+                { "string.byte", renv.string and renv.string.byte,
+                                 BASELINE.string and BASELINE.string.byte },
+                { "string.sub",  renv.string and renv.string.sub,
+                                 BASELINE.string and BASELINE.string.sub  },
+                { "table.insert",renv.table and renv.table.insert,
+                                 BASELINE.table and BASELINE.table.insert },
+                { "table.remove",renv.table and renv.table.remove,
+                                 BASELINE.table and BASELINE.table.remove },
             }
             -- task subtable
             if renv.task then
@@ -560,64 +739,85 @@ local function phase4()
     end
 
     -- 4.4 __namecall Overhead Measurement
+    -- FIX: Compare two Instance:IsA() latencies — one via normal namecall dispatch
+    -- and one bypassed via rawget(mt,"__namecall")(part,"IsA","Part") — to isolate
+    -- the overhead attributable to __namecall interception specifically.
+    -- Prior version compared math.abs (no dispatch) vs IsA (dispatch + class lookup),
+    -- which always produced a large delta unrelated to hooking.
     probe_header("4.4", "__namecall Overhead Measurement")
     local part = Instance.new("Part")
     local SAMPLES = 200
 
-    -- Baseline: math.abs calls (no namecall)
-    local t0 = os.clock()
-    for i = 1, SAMPLES do math.abs(i) end
-    local base_time = (os.clock() - t0) / SAMPLES
-
-    -- Measured: Instance method call
+    -- Direct namecall path (goes through __namecall, which may be hooked)
     local t1 = os.clock()
     for i = 1, SAMPLES do part:IsA("Part") end
-    local meas_time = (os.clock() - t1) / SAMPLES
-    part:Destroy()
+    local namecall_time = (os.clock() - t1) / SAMPLES
 
-    local delta_us = (meas_time - base_time) * 1e6
+    -- Bypassed path: call the method reference directly from the metatable
+    local gmt_bypass = API["getrawmetatable"] or (debug and debug.getmetatable)
+    local bypass_time = namecall_time  -- fallback: no delta
+    if gmt_bypass then
+        local ok_mt, mt = safe_call(gmt_bypass, part)
+        if ok_mt and mt and mt.__namecall then
+            local direct_nc = mt.__namecall
+            local t2 = os.clock()
+            for i = 1, SAMPLES do direct_nc(part, "IsA", "Part") end
+            bypass_time = (os.clock() - t2) / SAMPLES
+        end
+    end
+
+    part:Destroy()
+    local delta_us = (namecall_time - bypass_time) * 1e6
     HOOKS["namecall_delta_us"] = delta_us
     local sev = (delta_us > 1.5) and "significant" or "info"
-    emit(sev, string.format("__namecall overhead delta: %.2f μs (>1μs suggests active hook)", delta_us))
+    emit(sev, string.format("__namecall overhead delta (namecall vs direct): %.2f μs (>1.5μs suggests active hook)", delta_us))
     log_entry("hooks", "namecall_overhead_us", delta_us, sev, 4)
 
     -- 4.5 islclosure Self-Consistency
+    -- Compare against the reference captured at load time (EARLY_REFS) rather than
+    -- getrenv() — islclosure is an executor API and does not exist in the real Lua
+    -- environment, so getrenv().islclosure is always nil (dead code in prior versions).
     probe_header("4.5", "islclosure Self-Consistency Check")
-    if API["islclosure"] and API["getrenv"] then
-        local ok, renv = safe_call(API["getrenv"])
-        if ok and renv then
-            local global_islc   = (getgenv and getgenv().islclosure) or rawget(_G, "islclosure")
-            local baseline_islc = renv.islclosure
-            if global_islc and baseline_islc then
-                local replaced = (global_islc ~= baseline_islc)
-                local sev = replaced and "significant" or "info"
-                HOOKS["islclosure_replaced"] = replaced
-                emit(sev, "islclosure replaced: " .. tostring(replaced))
-                log_entry("hooks", "islclosure_replaced", replaced, sev, 4)
-            else
-                emit("detail", "islclosure baseline comparison not possible")
-            end
+    if API["islclosure"] then
+        local current_islc = (getgenv and getgenv().islclosure) or rawget(_G, "islclosure")
+        local early_islc   = EARLY_REFS.islclosure
+        if current_islc and early_islc then
+            local replaced = (current_islc ~= early_islc)
+            local sev = replaced and "significant" or "info"
+            HOOKS["islclosure_replaced"] = replaced
+            emit(sev, "islclosure replaced (vs load-time ref): " .. tostring(replaced))
+            log_entry("hooks", "islclosure_replaced", replaced, sev, 4)
+        elseif early_islc == nil then
+            emit("detail", "islclosure was nil at load time — comparison not possible")
+            log_entry("hooks", "islclosure_replaced", "no_early_ref", "info", 4)
+        else
+            emit("detail", "islclosure current ref unavailable")
         end
     else
-        emit("detail", "islclosure self-consistency — insufficient APIs")
+        emit("detail", "islclosure self-consistency — islclosure not available")
     end
 
     -- 4.6 getconnections Self-Consistency
+    -- Same fix as 4.5: getconnections is an executor API absent from getrenv().
+    -- Compare against the load-time reference stored in EARLY_REFS.
     probe_header("4.6", "getconnections Self-Consistency Check")
-    if API["getconnections"] and API["getrenv"] then
-        local ok, renv = safe_call(API["getrenv"])
-        if ok and renv then
-            local global_gc   = (getgenv and getgenv().getconnections) or rawget(_G, "getconnections")
-            local baseline_gc = renv.getconnections
-            if global_gc and baseline_gc then
-                local replaced = (global_gc ~= baseline_gc)
-                local sev = replaced and "significant" or "info"
-                HOOKS["getconnections_replaced"] = replaced
-                emit(sev, "getconnections replaced: " .. tostring(replaced))
-                log_entry("hooks", "getconnections_replaced", replaced, sev, 4)
-            else
-                emit("detail", "getconnections baseline comparison not possible")
+    if API["getconnections"] then
+        local current_gc = (getgenv and getgenv().getconnections) or rawget(_G, "getconnections")
+        local early_gc   = EARLY_REFS.getconnections
+        if current_gc and early_gc then
+            local replaced = (current_gc ~= early_gc)
+            local sev = replaced and "significant" or "info"
+            HOOKS["getconnections_replaced"] = replaced
+            emit(sev, "getconnections replaced (vs load-time ref): " .. tostring(replaced))
+            if replaced then
+                emit("significant", "Phase 3 signal topology data may be filtered or fabricated")
             end
+            log_entry("hooks", "getconnections_replaced", replaced, sev, 4)
+        elseif early_gc == nil then
+            emit("detail", "getconnections was nil at load time — comparison not possible")
+            log_entry("hooks", "getconnections_replaced", "no_early_ref", "info", 4)
+        else
+            emit("detail", "getconnections current ref unavailable")
         end
     end
 
@@ -688,6 +888,9 @@ local function phase5()
     section_header(5, "Environment & Memory Analysis")
 
     -- 5.1 Registry Value Classification
+    -- FIX: Pre-bind lc_fn/cc_fn and use direct safe_call in the loop to avoid
+    -- allocating anonymous closures per entry (which caused GC pressure corrupting
+    -- Phase 7 timing measurements in prior versions).
     probe_header("5.1", "Registry Value Classification")
     if API["getreg"] then
         local ok, reg = safe_call(API["getreg"])
@@ -698,8 +901,9 @@ local function phase5()
             for _, v in ipairs(reg) do
                 local t = type(v)
                 if t == "function" then
-                    local is_lc = lc_fn and (function() local o,r = safe_call(lc_fn, v); return o and r end)()
-                    local is_cc = cc_fn and (function() local o,r = safe_call(cc_fn, v); return o and r end)()
+                    local is_lc, is_cc = false, false
+                    if lc_fn then local o, r = safe_call(lc_fn, v); is_lc = o and r end
+                    if cc_fn then local o, r = safe_call(cc_fn, v); is_cc = o and r end
                     if is_lc then counts.lua_closure = counts.lua_closure + 1
                     elseif is_cc then counts.c_closure = counts.c_closure + 1
                     else counts.other = counts.other + 1 end
@@ -795,7 +999,7 @@ local function phase5()
                     for _, mk in ipairs(movement_keys) do
                         if v[mk] ~= nil then match_count = match_count + 1 end
                     end
-                    if match_count >= 2 then
+                    if match_count >= 3 then  -- require 3+ keys to reduce false positives from physics/asset tables
                         movement_tables = movement_tables + 1
                         local found_keys = {}
                         for _, mk in ipairs(movement_keys) do
@@ -881,8 +1085,38 @@ local function phase5()
                 emit("detail", "  mask=" .. tostring(mask) .. " count=" .. tostring(count))
                 log_entry("environment", "debug_hook_present", true, sev, 5)
                 log_entry("environment", "debug_hook_mask",    mask,  "info", 5)
-                -- NOTE: removal test is opt-in (Session Interference Register)
-                log_gap("5.7 — debug.sethook removal test (opt-in)")
+                -- Removal + reinstall test (executor-safe: operates on game VM from outside)
+                -- The executor removes the hook, waits 3 frames, then checks if it was reinstalled.
+                -- This reveals whether the AC has an integrity restoration mechanism.
+                -- Removal + reinstall test is a Session Interference Register action.
+                -- Guard behind OPT_IN_REMOVE_DEBUG_HOOK to prevent it running by default.
+                local OPT_IN_REMOVE_DEBUG_HOOK = false  -- set true for explicit opt-in
+                if OPT_IN_REMOVE_DEBUG_HOOK and debug.sethook then
+                    local ok_rm = safe_call(debug.sethook)  -- clear hook
+                    if ok_rm then
+                        local reinstalled = false
+                        local frames_waited = 0
+                        local check_conn
+                        check_conn = game:GetService("RunService").Heartbeat:Connect(function()
+                            frames_waited = frames_waited + 1
+                            if frames_waited >= 3 then
+                                check_conn:Disconnect()
+                                local ok2, h2 = safe_call(debug.gethook)
+                                reinstalled = (ok2 and h2 ~= nil)
+                                ENV["debug_hook_reinstalled"] = reinstalled
+                                local sev2 = reinstalled and "significant" or "notable"
+                                emit(sev2, string.format(
+                                    "Debug hook reinstalled within 3 frames: %s — %s",
+                                    tostring(reinstalled),
+                                    reinstalled and "AC has integrity restoration (very strong protection)"
+                                             or "AC does NOT restore its debug hook within 3 frames"))
+                                log_entry("environment", "debug_hook_reinstalled", reinstalled, sev2, 5)
+                            end
+                        end)
+                    end
+                else
+                    log_gap("5.7 — debug.sethook removal test (debug.sethook unavailable)")
+                end
             else
                 log_entry("environment", "debug_hook_present", false, "info", 5)
             end
@@ -895,33 +1129,65 @@ local function phase5()
     -- 5.8 Upvalue Tree Walk
     probe_header("5.8", "Upvalue Tree Walk")
     if API["getupvalues"] and API["getconnections"] then
+        -- Walk ALL signals in the topology, not just Heartbeat
         local RunService = game:GetService("RunService")
-        local ok, conns = safe_call(API["getconnections"], RunService.Heartbeat)
-        if ok and type(conns) == "table" then
-            for i, conn in ipairs(conns) do
-                local cb_ok, cb = safe_call(function() return conn.Function end)
-                if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
-                if cb_ok and type(cb) == "function" then
-                    local ok2, uvs = safe_call(API["getupvalues"], cb)
-                    if ok2 and type(uvs) == "table" then
-                        emit("notable", string.format("Heartbeat conn[%d] upvalues (%d):", i, #uvs))
-                        for ui, uv in ipairs(uvs) do
-                            local t = type(uv)
-                            emit("detail", string.format("  [%d] %s", ui, t == "table" and "table{" .. tostring(#uv) .. "}" or tostring(uv):sub(1,60)))
+        local UserInputService = game:GetService("UserInputService")
+        local signals_to_walk = {
+            { "Heartbeat",   RunService.Heartbeat   },
+            { "Stepped",     RunService.Stepped     },
+            { "InputBegan",  UserInputService.InputBegan },
+        }
+        local total_upvalue_entries = 0
+        for _, sig_entry in ipairs(signals_to_walk) do
+            local sig_label, sig_obj = sig_entry[1], sig_entry[2]
+            local ok, conns = safe_call(API["getconnections"], sig_obj)
+            if ok and type(conns) == "table" then
+                for i, conn in ipairs(conns) do
+                    local cb_ok, cb = safe_call(function() return conn.Function end)
+                    if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
+                    if cb_ok and type(cb) == "function" then
+                        local ok2, uvs = safe_call(API["getupvalues"], cb)
+                        if ok2 and type(uvs) == "table" and #uvs > 0 then
+                            total_upvalue_entries = total_upvalue_entries + #uvs
+                            emit("notable", string.format("%s conn[%d] upvalues (%d):", sig_label, i, #uvs))
+                            for ui, uv in ipairs(uvs) do
+                                local t = type(uv)
+                                emit("detail", string.format("  [%d] %s", ui,
+                                    t == "table" and "table{" .. tostring(#uv) .. "}"
+                                    or tostring(uv):sub(1,60)))
+                            end
+                            log_entry("environment", sig_label .. "_upvalues_conn" .. i, #uvs, "notable", 5)
                         end
-                        log_entry("environment", "heartbeat_upvalues_" .. i, #uvs, "notable", 5)
-                    end
-                    -- Recurse via getprotos
-                    if API["getprotos"] then
-                        local ok3, protos = safe_call(API["getprotos"], cb)
-                        if ok3 and type(protos) == "table" then
-                            emit("detail", string.format("  getprotos → %d nested prototypes", #protos))
-                            log_entry("environment", "heartbeat_protos_" .. i, #protos, "info", 5)
+                        -- Recurse via getprotos
+                        if API["getprotos"] then
+                            local ok3, protos = safe_call(API["getprotos"], cb)
+                            if ok3 and type(protos) == "table" and #protos > 0 then
+                                emit("detail", string.format("  getprotos → %d nested prototypes", #protos))
+                                -- Walk one level of nested prototypes for constants
+                                for pi, proto in ipairs(protos) do
+                                    if type(proto) == "function" then
+                                        local ok4, puvs = safe_call(API["getupvalues"], proto)
+                                        if ok4 and type(puvs) == "table" and #puvs > 0 then
+                                            total_upvalue_entries = total_upvalue_entries + #puvs
+                                            emit("detail", string.format("    proto[%d] upvalues: %d", pi, #puvs))
+                                        end
+                                    end
+                                end
+                                log_entry("environment", sig_label .. "_protos_conn" .. i, #protos, "info", 5)
+                            end
                         end
                     end
                 end
             end
         end
+        -- getsenv() upvalue walk over AC-candidate scripts runs in phase5b(),
+        -- which is called after Phase 6 populates INSTANCES["ac_candidates"].
+        -- (Running it here was a dependency-ordering bug: ac_candidates is nil at this point.)
+        emit("detail", "getsenv() AC-script upvalue walk deferred to Phase 5-B (runs after Phase 6)")
+        log_entry("environment", "senv_upvalue_walk_deferred", true, "info", 5)
+        ENV["total_upvalue_entries"] = total_upvalue_entries
+        emit("info", "Total upvalue entries collected across all walks: " .. total_upvalue_entries)
+        log_entry("environment", "total_upvalue_entries", total_upvalue_entries, "info", 5)
     else
         emit("detail", "getupvalues or getconnections unavailable — upvalue walk skipped")
         log_gap("5.8 — Upvalue Tree Walk")
@@ -930,32 +1196,61 @@ local function phase5()
     -- 5.9 Bytecode Constant Extraction
     probe_header("5.9", "Bytecode Constant Extraction")
     if API["getconstants"] and API["getconnections"] then
-        local RunService = game:GetService("RunService")
-        local ok, conns = safe_call(API["getconnections"], RunService.Heartbeat)
-        if ok and type(conns) == "table" then
-            for i, conn in ipairs(conns) do
-                local cb_ok, cb = safe_call(function() return conn.Function end)
-                if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
-                if cb_ok and type(cb) == "function" then
-                    local ok2, consts = safe_call(API["getconstants"], cb)
-                    if ok2 and type(consts) == "table" then
-                        local str_consts = {}
-                        for _, c in ipairs(consts) do
-                            if type(c) == "string" and #c > 2 then
-                                table.insert(str_consts, c)
-                            end
-                        end
-                        if #str_consts > 0 then
-                            emit("notable", string.format("Heartbeat conn[%d] string constants (%d):", i, #str_consts))
-                            for _, s in ipairs(str_consts) do
-                                emit("detail", "  \"" .. s:sub(1,80) .. "\"")
-                            end
-                            log_entry("environment", "bytecode_constants_" .. i, str_consts, "notable", 5)
+        local RunService       = game:GetService("RunService")
+        local UserInputService = game:GetService("UserInputService")
+        local signals_to_scan  = {
+            { "Heartbeat",  RunService.Heartbeat   },
+            { "Stepped",    RunService.Stepped     },
+            { "InputBegan", UserInputService.InputBegan },
+        }
+        local all_str_consts = {}
+
+        local function extract_constants(fn, label)
+            local ok2, consts = safe_call(API["getconstants"], fn)
+            if ok2 and type(consts) == "table" then
+                local str_consts = {}
+                for _, c in ipairs(consts) do
+                    if type(c) == "string" and #c > 2 then
+                        table.insert(str_consts, c)
+                        table.insert(all_str_consts, c)
+                    end
+                end
+                if #str_consts > 0 then
+                    emit("notable", string.format("%s string constants (%d):", label, #str_consts))
+                    for _, s in ipairs(str_consts) do
+                        emit("detail", "  \"" .. s:sub(1,80) .. "\"")
+                    end
+                    log_entry("environment", "bytecode_constants_" .. label, str_consts, "notable", 5)
+                end
+            end
+            -- Recurse into nested prototypes
+            if API["getprotos"] then
+                local ok3, protos = safe_call(API["getprotos"], fn)
+                if ok3 and type(protos) == "table" then
+                    for pi, proto in ipairs(protos) do
+                        if type(proto) == "function" then
+                            extract_constants(proto, label .. "_proto" .. pi)
                         end
                     end
                 end
             end
         end
+
+        for _, sig_entry in ipairs(signals_to_scan) do
+            local sig_label, sig_obj = sig_entry[1], sig_entry[2]
+            local ok, conns = safe_call(API["getconnections"], sig_obj)
+            if ok and type(conns) == "table" then
+                for i, conn in ipairs(conns) do
+                    local cb_ok, cb = safe_call(function() return conn.Function end)
+                    if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
+                    if cb_ok and type(cb) == "function" then
+                        extract_constants(cb, sig_label .. "_conn" .. i)
+                    end
+                end
+            end
+        end
+        emit("info", "Total string constants extracted: " .. #all_str_consts)
+        log_entry("environment", "total_string_constants", #all_str_consts, "info", 5)
     else
         emit("detail", "getconstants or getconnections unavailable — bytecode extraction skipped")
         log_gap("5.9 — Bytecode Constant Extraction")
@@ -974,28 +1269,88 @@ local function phase6()
         local ok, scripts = safe_call(API["getrunningscripts"])
         if ok and type(scripts) == "table" then
             local ac_candidates = {}
-            local ac_vocab_lower = {"anticheat","anti_cheat","ac_","_ac","detection","monitor","security","cheat"}
+            -- Detection-variable vocabulary for getsenv() scoring
+            local ac_env_vocab = {
+                "flagged","detected","kickqueue","threshold","strikes",
+                "violations","banned","anticheat","monitoring","ban",
+                "speed_check","teleport_check","fly_check","exploit",
+                "cheat","hack","punish","sanction","report_player",
+            }
+            -- Bytecode string vocabulary for getscriptbytecode() scoring
+            local ac_bytecode_vocab = {
+                "anticheat","anti_cheat","detection","threshold","flag",
+                "ban","strike","detected","kick","speed","teleport",
+                "fly","noclip","aimbot","exploit","cheat","hack",
+                "violation","punishment","monitor","detect","sanction",
+            }
+            -- Name-based keyword fallback (lowest weight)
+            local ac_name_vocab = {"anticheat","anti_cheat","ac_","_ac","detection","monitor","security","cheat"}
+
             for _, s in ipairs(scripts) do
+                local score  = 0
+                local reasons = {}
+
+                -- Score 1: name/path keyword match (weak signal)
                 local name = tostring(s.Name or ""):lower()
-                local role = "unknown"
-                for _, kw in ipairs(ac_vocab_lower) do
-                    if name:find(kw, 1, true) then role = "AC_CANDIDATE"; break end
-                end
-                if role == "unknown" then
-                    local path = tostring(s:GetFullName()):lower()
-                    for _, kw in ipairs(ac_vocab_lower) do
-                        if path:find(kw, 1, true) then role = "AC_CANDIDATE"; break end
+                local path = tostring(s:GetFullName()):lower()
+                for _, kw in ipairs(ac_name_vocab) do
+                    if name:find(kw,1,true) or path:find(kw,1,true) then
+                        score = score + 1
+                        table.insert(reasons, "name:" .. kw)
+                        break
                     end
                 end
-                local sev = (role == "AC_CANDIDATE") and "notable" or "info"
-                emit(sev, string.format("[%s] %s  (%s)", role, s:GetFullName(), s.ClassName))
-                log_entry("instances", "script_" .. s:GetFullName(), role, sev, 6)
+
+                -- Score 2: getsenv() detection-variable density (strong signal, executor-only)
+                if API["getsenv"] then
+                    local ok_e, env = safe_call(API["getsenv"], s)
+                    if ok_e and type(env) == "table" then
+                        local env_hits = 0
+                        for k, _ in pairs(env) do
+                            local kl = tostring(k):lower()
+                            for _, kw in ipairs(ac_env_vocab) do
+                                if kl:find(kw,1,true) then
+                                    env_hits = env_hits + 1
+                                    table.insert(reasons, "env:" .. kw)
+                                    break
+                                end
+                            end
+                        end
+                        score = score + env_hits * 3  -- env hits weighted 3×
+                    end
+                end
+
+                -- Score 3: getscriptbytecode() string constant scan (strong signal, executor-only)
+                if API["getscriptbytecode"] then
+                    local ok_b, bc = safe_call(API["getscriptbytecode"], s)
+                    if ok_b and type(bc) == "string" then
+                        local bc_lower = bc:lower()
+                        for _, kw in ipairs(ac_bytecode_vocab) do
+                            if bc_lower:find(kw,1,true) then
+                                score = score + 2   -- bytecode hits weighted 2×
+                                table.insert(reasons, "bytecode:" .. kw)
+                            end
+                        end
+                    end
+                end
+
+                local role = (score >= 3) and "AC_CANDIDATE" or (score >= 1) and "AC_POSSIBLE" or "unknown"
+                local sev  = (role == "AC_CANDIDATE") and "significant"
+                          or (role == "AC_POSSIBLE")  and "notable"
+                          or "info"
+                emit(sev, string.format("[%s score=%d] %s  (%s)", role, score, s:GetFullName(), s.ClassName))
+                if #reasons > 0 then
+                    emit("detail", "  reasons: " .. table.concat(reasons, ", "))
+                end
+                log_entry("instances", "script_" .. s:GetFullName(),
+                    { role=role, score=score, reasons=reasons }, sev, 6)
                 if role == "AC_CANDIDATE" then table.insert(ac_candidates, s) end
             end
             INSTANCES["running_scripts"] = #scripts
             INSTANCES["ac_candidates"]   = ac_candidates
             emit("info", "Total running scripts: " .. #scripts .. "  AC candidates: " .. #ac_candidates)
-            log_entry("instances", "running_script_count", #scripts, "info", 6)
+            log_entry("instances", "running_script_count", #scripts,       "info", 6)
+            log_entry("instances", "ac_candidate_count",   #ac_candidates, "info", 6)
         end
     else
         emit("notable", "getrunningscripts not available")
@@ -1190,6 +1545,55 @@ local function phase6()
 end
 
 -- ═══════════════════════════════════════════════════════════
+--  PHASE 5-B — getsenv() Upvalue Walk (runs after Phase 6)
+-- ═══════════════════════════════════════════════════════════
+-- Phase 5.8 needed INSTANCES["ac_candidates"] which is only populated after
+-- Phase 6 runs. This phase performs the deferred getsenv() walk.
+local function phase5b()
+    section_header("5-B", "AC-Script Upvalue Walk (post Phase 6)")
+
+    if not (API["getupvalues"] and API["getsenv"]) then
+        emit("detail", "getupvalues or getsenv unavailable — Phase 5-B skipped")
+        log_gap("5-B — getsenv() AC-script upvalue walk (APIs missing)")
+        return
+    end
+
+    local candidates = INSTANCES["ac_candidates"] or {}
+    if #candidates == 0 then
+        emit("info", "No AC candidates identified in Phase 6 — upvalue walk has no targets")
+        log_entry("environment", "senv_upvalue_candidates", 0, "info", 0)
+        return
+    end
+
+    local total = 0
+    for _, script in ipairs(candidates) do
+        local ok_e, env = safe_call(API["getsenv"], script)
+        if ok_e and type(env) == "table" then
+            for k, v in pairs(env) do
+                if type(v) == "function" then
+                    local ok_u, uvs = safe_call(API["getupvalues"], v)
+                    if ok_u and type(uvs) == "table" and #uvs > 0 then
+                        total = total + #uvs
+                        emit("notable", string.format("getsenv(%s).%s upvalues (%d):",
+                            script.Name, tostring(k), #uvs))
+                        for ui, uv in ipairs(uvs) do
+                            local t = type(uv)
+                            emit("detail", string.format("  [%d] %s", ui,
+                                t == "table" and "table{" .. tostring(#uv) .. "}"
+                                or tostring(uv):sub(1,60)))
+                        end
+                        log_entry("environment", "senv_upvalues_" .. script.Name .. "_" .. tostring(k),
+                            #uvs, "notable", 0)
+                    end
+                end
+            end
+        end
+    end
+    emit("info", "Phase 5-B total upvalue entries from AC script environments: " .. total)
+    log_entry("environment", "senv_total_upvalue_entries", total, "info", 0)
+end
+
+-- ═══════════════════════════════════════════════════════════
 --  PHASE 7 — Behavioral Timing Analysis
 -- ═══════════════════════════════════════════════════════════
 local function phase7()
@@ -1338,9 +1742,10 @@ local function phase7()
     task.defer(function() table.insert(order, "A") end)
     task.defer(function() table.insert(order, "B") end)
     task.defer(function() table.insert(order, "C") end)
-    task.wait()
-    task.wait()
-    task.wait()
+    -- Use task.wait(0.1) rather than three sequential task.wait() calls —
+    -- some executors resume deferred tasks across multiple resume cycles and
+    -- three individual waits may not be sufficient for all deferred tasks to flush.
+    task.wait(0.1)
     local expected = {"A","B","C"}
     local is_fifo = (#order >= 3 and order[1]==expected[1] and order[2]==expected[2] and order[3]==expected[3])
     local sev4 = (not is_fifo) and "significant" or "info"
@@ -1460,6 +1865,34 @@ local function phase8()
         local prev = API["getgenv"]()["__ac_recon"]
         API["getgenv"]()["__ac_recon"] = REPORT
 
+        -- Recursive value serializer — avoids false-change noise from tostring() on tables
+        local function serialize_val(v, depth)
+            depth = depth or 0
+            local t = type(v)
+            if t == "boolean" or t == "number" then return tostring(v)
+            elseif t == "string" then return v
+            elseif t == "table" and depth < 3 then
+                local parts = {}
+                -- Try array form first
+                if #v > 0 then
+                    for _, item in ipairs(v) do
+                        table.insert(parts, serialize_val(item, depth+1))
+                    end
+                    return "{" .. table.concat(parts, ",") .. "}"
+                else
+                    for k, val in pairs(v) do
+                        table.insert(parts, tostring(k) .. "=" .. serialize_val(val, depth+1))
+                    end
+                    -- Sort keys for deterministic output (prevents spurious diff entries
+                    -- caused by non-deterministic table iteration order between runs)
+                    table.sort(parts)
+                    return "{" .. table.concat(parts, ",") .. "}"
+                end
+            else
+                return tostring(v)
+            end
+        end
+
         -- Cross-run diff
         if prev and type(prev) == "table" and prev.entries then
             print("\n  ── Cross-Run Diff ──────────────────────────────────")
@@ -1472,14 +1905,16 @@ local function phase8()
                 local k = e.section .. "." .. e.key
                 local old = prev_map[k]
                 if old then
-                    if tostring(old.value) ~= tostring(e.value) or old.severity ~= e.severity then
+                    local old_str = serialize_val(old.value)
+                    local new_str = serialize_val(e.value)
+                    if old_str ~= new_str or old.severity ~= e.severity then
                         changes = changes + 1
                         print(string.format("  CHANGED  %s: %s → %s",
-                            k, tostring(old.value):sub(1,30), tostring(e.value):sub(1,30)))
+                            k, old_str:sub(1,40), new_str:sub(1,40)))
                     end
                 else
                     changes = changes + 1
-                    print("  NEW      " .. k .. " = " .. tostring(e.value):sub(1,40))
+                    print("  NEW      " .. k .. " = " .. serialize_val(e.value):sub(1,40))
                 end
             end
             if changes == 0 then print("  (no changes from previous run)") end
@@ -1490,10 +1925,446 @@ local function phase8()
 end
 
 -- ═══════════════════════════════════════════════════════════
---  MAIN ENTRY POINT
+--  PHASE 9 — RemoteEvent Argument Interception
 -- ═══════════════════════════════════════════════════════════
+local function phase9()
+    section_header(9, "RemoteEvent Argument Interception")
+
+    if not API["hookfunction"] then
+        emit("notable", "hookfunction not available — Phase 9 skipped")
+        log_gap("9 — RemoteEvent Argument Interception (hookfunction missing)")
+        return
+    end
+
+    probe_header("9.1", "FireServer/InvokeServer Hook Setup")
+    -- FIX: Hook the FireServer and InvokeServer method references directly rather
+    -- than __namecall. The prior version called getnamecallmethod() inside a
+    -- hookfunction hook on __namecall — that context does NOT have an active
+    -- namecall, so getnamecallmethod() always returned nil/empty and the
+    -- FireServer/InvokeServer filter never passed (Phase 9 was a complete NOP).
+    local OBSERVE_SECONDS = 30
+    local remote_calls    = {}
+    local schema_map      = {}
+    local hooked_fs       = false
+    local hooked_is       = false
+    local original_fs_ref = nil
+    local original_is_ref = nil
+
+    -- Capture raw method references from fresh instances
+    local ok_re, re_tmp = safe_call(function() return Instance.new("RemoteEvent") end)
+    local ok_rf, rf_tmp = safe_call(function() return Instance.new("RemoteFunction") end)
+    if ok_re and re_tmp then original_fs_ref = re_tmp.FireServer; re_tmp:Destroy() end
+    if ok_rf and rf_tmp then original_is_ref = rf_tmp.InvokeServer; rf_tmp:Destroy() end
+
+    local function record_call(self, method_name, args)
+        local arg_types, arg_ranges = {}, {}
+        for i, a in ipairs(args) do
+            local t = type(a)
+            arg_types[i] = t
+            if t == "number" then
+                arg_ranges[i] = { min = a, max = a }
+            elseif t == "string" then
+                arg_ranges[i] = { len = #a }
+            end
+        end
+        table.insert(remote_calls, {
+            remote    = tostring(self.Name or "?"),
+            method    = method_name,
+            arg_count = #args,
+            arg_types = arg_types,
+            arg_ranges= arg_ranges,
+        })
+    end
+
+    if original_fs_ref then
+        local ok_hk, _ = safe_call(API["hookfunction"], original_fs_ref, function(self, ...)
+            record_call(self, "FireServer", {...})
+            return original_fs_ref(self, ...)
+        end)
+        if ok_hk then
+            hooked_fs = true
+            emit("info", "FireServer hooked directly — observing calls for " .. OBSERVE_SECONDS .. "s")
+            log_entry("remote_intercept", "fs_hooked", true, "info", 9)
+        end
+    end
+
+    if original_is_ref then
+        local ok_hk2, _ = safe_call(API["hookfunction"], original_is_ref, function(self, ...)
+            record_call(self, "InvokeServer", {...})
+            return original_is_ref(self, ...)
+        end)
+        if ok_hk2 then
+            hooked_is = true
+            emit("info", "InvokeServer hooked directly")
+            log_entry("remote_intercept", "is_hooked", true, "info", 9)
+        end
+    end
+
+    if not hooked_fs and not hooked_is then
+        emit("notable", "Could not hook FireServer or InvokeServer — Phase 9 passive only")
+        log_gap("9.1 — Direct method hook failed")
+        return
+    end
+
+    -- Analyse after OBSERVE_SECONDS
+    task.delay(OBSERVE_SECONDS, function()
+        -- Hooks restore automatically when hookfunction replaces functions;
+        -- no explicit cleanup needed (the original refs still dispatch correctly).
+
+        probe_header("9.2", "Schema Map Construction")
+        for _, call in ipairs(remote_calls) do
+            local rn = call.remote
+            if not schema_map[rn] then schema_map[rn] = {} end
+            for i, t in ipairs(call.arg_types) do
+                if not schema_map[rn][i] then
+                    schema_map[rn][i] = { types = {}, min = math.huge, max = -math.huge, max_len = 0 }
+                end
+                schema_map[rn][i].types[t] = (schema_map[rn][i].types[t] or 0) + 1
+                if t == "number" and call.arg_ranges[i] then
+                    local r = schema_map[rn][i]
+                    r.min = math.min(r.min, call.arg_ranges[i].min)
+                    r.max = math.max(r.max, call.arg_ranges[i].max)
+                elseif t == "string" and call.arg_ranges[i] then
+                    schema_map[rn][i].max_len = math.max(schema_map[rn][i].max_len, call.arg_ranges[i].len)
+                end
+            end
+        end
+
+        local remote_count = (function() local n=0 for _ in pairs(schema_map) do n=n+1 end return n end)()
+        emit("info", "Observed " .. #remote_calls .. " remote calls across " .. remote_count .. " remotes")
+
+        for rn, args in pairs(schema_map) do
+            emit("notable", "Remote: " .. rn)
+            for i, info in pairs(args) do
+                local type_list = {}
+                for t, _ in pairs(info.types) do table.insert(type_list, t) end
+                local range_str = ""
+                if info.min ~= math.huge then
+                    range_str = string.format("  range=[%.1f, %.1f]", info.min, info.max)
+                    if info.min >= 0 and info.max <= 5000 then
+                        range_str = range_str .. "  ⚠ position-range candidate"
+                    end
+                elseif info.max_len > 0 then
+                    range_str = "  maxlen=" .. info.max_len
+                end
+                emit("detail", string.format("  arg[%d] types=[%s]%s",
+                    i, table.concat(type_list, ","), range_str))
+            end
+            log_entry("remote_intercept", "schema_" .. rn, schema_map[rn], "notable", 9)
+        end
+        log_entry("remote_intercept", "total_observed_calls", #remote_calls, "info", 9)
+    end)
+
+    emit("info", "Phase 9 observation window open — results will appear after " .. OBSERVE_SECONDS .. "s")
+end
+
+-- ═══════════════════════════════════════════════════════════
+--  PHASE 10 — AC Hook Restoration Speed Test
+-- ═══════════════════════════════════════════════════════════
+local function phase10()
+    section_header(10, "AC Hook Restoration Speed Test")
+
+    if not API["hookfunction"] or not API["getrenv"] then
+        emit("notable", "hookfunction or getrenv not available — Phase 10 skipped")
+        log_gap("10 — AC Hook Restoration Speed Test (missing APIs)")
+        return
+    end
+
+    probe_header("10.1", "Hook Restoration Measurement")
+    -- For each function Phase 4 identified as replaced, temporarily restore the
+    -- getrenv() original and measure the frame count until the replacement reappears.
+    local ok_rv, renv = safe_call(API["getrenv"])
+    if not ok_rv or type(renv) ~= "table" then
+        emit("notable", "getrenv() failed — Phase 10 skipped")
+        return
+    end
+
+    local functions_to_test = {}
+    -- Only test functions that Phase 4 found replaced
+    for key, replaced in pairs(HOOKS) do
+        if replaced == true and key:find("^hook_") then
+            local fn_name = key:sub(6)  -- strip "hook_"
+            -- Resolve baseline ref
+            local baseline_ref = nil
+            if fn_name:find("%.") then
+                local parts = {}
+                for p in fn_name:gmatch("[^.]+") do table.insert(parts, p) end
+                local t = renv
+                for _, p in ipairs(parts) do
+                    if type(t) == "table" then t = t[p] else t = nil; break end
+                end
+                baseline_ref = t
+            else
+                baseline_ref = renv[fn_name]
+            end
+            if type(baseline_ref) == "function" then
+                table.insert(functions_to_test, { name = fn_name, baseline = baseline_ref })
+            end
+        end
+    end
+
+    if #functions_to_test == 0 then
+        emit("info", "No replaced functions found in Phase 4 — restoration test has nothing to test")
+        log_entry("hook_restoration", "functions_tested", 0, "info", 10)
+        return
+    end
+
+    emit("info", "Testing restoration speed for " .. #functions_to_test .. " replaced function(s)")
+    local RESTORE_TIMEOUT_FRAMES = 600  -- ~10s at 60fps; give up after this
+
+    -- Helper: resolve a possibly-dotted name to the containing table and final key
+    local function resolve_dotted(genv, fn_name)
+        local parts = {}
+        for p in fn_name:gmatch("[^.]+") do table.insert(parts, p) end
+        if #parts == 1 then
+            return genv, fn_name
+        elseif #parts == 2 then
+            local tbl = genv[parts[1]]
+            if type(tbl) == "table" then
+                return tbl, parts[2]
+            end
+        end
+        return nil, nil
+    end
+
+    -- Helper: read the actual current value at a possibly-dotted path
+    local function read_dotted(genv, fn_name)
+        local tbl, key = resolve_dotted(genv, fn_name)
+        if tbl and key then return tbl[key] end
+        return nil
+    end
+
+    for _, fn_entry in ipairs(functions_to_test) do
+        local fn_name    = fn_entry.name
+        local baseline   = fn_entry.baseline
+
+        local genv = API["getgenv"]()
+        local current_replacement = read_dotted(genv, fn_name)
+        if current_replacement == nil then goto continue end
+
+        -- Restore: write baseline to the ACTUAL subtable path, not a top-level synthetic key
+        local restore_tbl, restore_key = resolve_dotted(genv, fn_name)
+        if not restore_tbl then
+            emit("detail", fn_name .. " — could not resolve path for restore, skipping")
+            goto continue
+        end
+
+        restore_tbl[restore_key] = baseline
+
+        -- Validate the restoration succeeded before starting the monitor loop
+        if read_dotted(genv, fn_name) ~= baseline then
+            emit("notable", fn_name .. " — restoration write did not take effect (possible __newindex); skipping monitor")
+            restore_tbl[restore_key] = current_replacement
+            goto continue
+        end
+
+        local restore_frame = nil
+        local frames_checked = 0
+        local check_conn
+        check_conn = game:GetService("RunService").Heartbeat:Connect(function()
+            frames_checked = frames_checked + 1
+            -- Monitor the ACTUAL path, not genv[fn_name] (which would be a phantom key for dotted names)
+            if read_dotted(genv, fn_name) ~= baseline then
+                restore_frame = frames_checked
+                check_conn:Disconnect()
+            elseif frames_checked >= RESTORE_TIMEOUT_FRAMES then
+                check_conn:Disconnect()
+            end
+        end)
+
+        -- Wait for check to complete (max RESTORE_TIMEOUT_FRAMES / ~60fps ≈ 10s)
+        local wait_count = 0
+        while check_conn.Connected and wait_count < 15 do
+            task.wait(0.7)
+            wait_count = wait_count + 1
+        end
+        if check_conn.Connected then check_conn:Disconnect() end
+
+        -- Restore the replacement via the actual subtable path
+        restore_tbl[restore_key] = current_replacement
+
+        local sev, conclusion
+        if restore_frame == nil then
+            sev = "notable"
+            conclusion = "NOT restored within " .. RESTORE_TIMEOUT_FRAMES .. " frames — AC does not verify hook integrity (one-shot hooks)"
+        elseif restore_frame <= 1 then
+            sev = "significant"
+            conclusion = "restored within 1 frame — AC uses debug hook or Heartbeat for continuous integrity verification (very strong)"
+        elseif restore_frame <= 5 then
+            sev = "significant"
+            conclusion = "restored in " .. restore_frame .. " frames — AC uses fast polling loop (strong)"
+        else
+            sev = "notable"
+            conclusion = "restored in " .. restore_frame .. " frames (~" ..
+                string.format("%.1f", restore_frame / 60) .. "s) — AC uses slow polling (exploitable window)"
+        end
+
+        emit(sev, string.format("%-30s  restore_frame=%s  %s",
+            fn_name, tostring(restore_frame), conclusion))
+        log_entry("hook_restoration", "restore_" .. fn_name,
+            { frame = restore_frame, conclusion = conclusion }, sev, 10)
+
+        ::continue::
+    end
+end
+
+-- ═══════════════════════════════════════════════════════════
+--  PHASE 12 — Environment Poisoning Resistance Test
+-- ═══════════════════════════════════════════════════════════
+local function phase12()
+    section_header(12, "Environment Poisoning Resistance Test")
+
+    if not API["setupvalue"] and not API["hookfunction"] then
+        emit("notable", "setupvalue and hookfunction unavailable — Phase 12 skipped")
+        log_gap("12 — Environment Poisoning Resistance Test (missing APIs)")
+        return
+    end
+
+    -- 12.1 AC state variable write test
+    probe_header("12.1", "AC State Variable Write Test")
+    -- Attempt to write a known-false value to detection state variables found via
+    -- Phase 5/6 (e.g., Flagged = false, Strikes = 0) in AC scripts' getsenv() tables.
+    local poisoned_count = 0
+    if API["getsenv"] and INSTANCES["ac_candidates"] then
+        local ac_state_keys = {"Flagged","Detected","Strikes","Violations","Banned","KickQueued"}
+        for _, script in ipairs(INSTANCES["ac_candidates"] or {}) do
+            local ok_e, env = safe_call(API["getsenv"], script)
+            if ok_e and type(env) == "table" then
+                for _, key in ipairs(ac_state_keys) do
+                    if env[key] ~= nil then
+                        local original_val = env[key]
+                        local canary_val   = (type(original_val) == "number") and 0
+                                          or (type(original_val) == "boolean") and false
+                                          or nil
+                        if canary_val ~= nil then
+                            env[key] = canary_val
+                            -- Wait 3 frames: 1 frame may be too short for ACs that sync state
+                            -- on a periodic timer rather than per-frame
+                            for _ = 1, 3 do task.wait() end
+                            local current = env[key]
+                            local corrected = (current ~= canary_val)
+                            local sev = corrected and "significant" or "notable"
+                            emit(sev, string.format("senv(%s).%s: wrote %s → AC corrected=%s (read back: %s)",
+                                script.Name, key, tostring(canary_val), tostring(corrected), tostring(current)))
+                            log_entry("poisoning", "state_" .. script.Name .. "_" .. key,
+                                { corrected = corrected, frames = 1 }, sev, 12)
+                            -- Restore original value
+                            env[key] = original_val
+                            poisoned_count = poisoned_count + 1
+                        end
+                    end
+                end
+            end
+        end
+    else
+        emit("detail", "getsenv unavailable or no AC candidates — state write test skipped")
+        log_gap("12.1 — AC State Variable Write (no candidates)")
+    end
+    if poisoned_count == 0 then
+        emit("info", "No writable AC state variables found in this run")
+    end
+
+    -- 12.2 getgenv() Canary Probe
+    -- FIX: Prior version placed a proxy table with __index at genv[canary_key].
+    -- An AC scanning getgenv() receives the proxy table and uses pairs() or type()
+    -- on it — neither fires __index. The canary never triggered (always false negative).
+    -- Correct design: write a plain string canary and monitor for deletion/modification.
+    probe_header("12.2", "getgenv() Canary Probe")
+    if API["getgenv"] then
+        local canary_key = "__ac_recon_canary_" .. math.random(1e8)
+        local canary_val = "RECON_CANARY_" .. math.random(1e6)
+        local genv = API["getgenv"]()
+
+        genv[canary_key] = canary_val
+
+        local canary_modified = false
+        local modified_frame  = nil
+        for frame = 1, 60 do
+            task.wait()
+            if genv[canary_key] ~= canary_val then
+                canary_modified = true
+                modified_frame  = frame
+                break
+            end
+        end
+
+        genv[canary_key] = nil  -- clean up
+
+        local sev = canary_modified and "significant" or "info"
+        if canary_modified then
+            emit(sev, string.format(
+                "AC modified/deleted getgenv() canary within %d frame(s) — AC actively scans executor environment",
+                modified_frame))
+        else
+            emit(sev, "getgenv() canary survived 60 frames unmodified — AC does not scan executor globals")
+        end
+        log_entry("poisoning", "genv_canary_modified", canary_modified, sev, 12)
+        if modified_frame then
+            log_entry("poisoning", "genv_canary_modified_frame", modified_frame, sev, 12)
+        end
+    end
+
+    -- 12.3 setupvalue-based internal state modification
+    -- 12.3 setupvalue Internal State Modification
+    -- FIX: Prior version called setupvalue(cb, ui, uv) passing the SAME table that
+    -- is already at that upvalue slot — a complete no-op. The canary key was then
+    -- written directly to uv, which is the same live table the AC reads, potentially
+    -- corrupting AC state. Correct approach: create a shallow copy of the upvalue table,
+    -- replace the upvalue with the copy, write a canary key, and check if the AC reverts
+    -- the upvalue to the original table (indicating integrity monitoring).
+    probe_header("12.3", "setupvalue Internal State Modification")
+    if API["setupvalue"] and API["getupvalues"] and API["getconnections"] then
+        local RunService = game:GetService("RunService")
+        local ok, conns = safe_call(API["getconnections"], RunService.Heartbeat)
+        if ok and type(conns) == "table" and #conns > 0 then
+            for i, conn in ipairs(conns) do
+                local cb_ok, cb = safe_call(function() return conn.Function end)
+                if not cb_ok then cb_ok, cb = safe_call(function() return conn.Callback end) end
+                if cb_ok and type(cb) == "function" then
+                    local ok_uv, uvs = safe_call(API["getupvalues"], cb)
+                    if ok_uv and type(uvs) == "table" then
+                        for ui, uv in ipairs(uvs) do
+                            if type(uv) == "table" then
+                                -- Make a shallow copy so we do not corrupt the AC's live state
+                                local uv_copy = {}
+                                for k, v in pairs(uv) do uv_copy[k] = v end
+                                -- Replace the upvalue with the copy
+                                local ok_su = safe_call(API["setupvalue"], cb, ui, uv_copy)
+                                if ok_su then
+                                    task.wait()
+                                    -- Check whether the AC restored the original table reference
+                                    local ok_uv2, uvs2 = safe_call(API["getupvalues"], cb)
+                                    local reverted = false
+                                    if ok_uv2 and type(uvs2) == "table" and uvs2[ui] then
+                                        reverted = (uvs2[ui] == uv)  -- original table ref restored
+                                    end
+                                    -- Restore original immediately regardless
+                                    safe_call(API["setupvalue"], cb, ui, uv)
+                                    local sev = reverted and "significant" or "info"
+                                    emit(sev, string.format(
+                                        "Heartbeat conn[%d] upvalue[%d]: AC reverted replacement=%s",
+                                        i, ui, tostring(reverted)))
+                                    if reverted then
+                                        emit("detail", "  AC detected upvalue replacement and restored original — strong integrity check")
+                                    end
+                                    log_entry("poisoning", "upvalue_revert_conn" .. i .. "_uv" .. ui,
+                                        reverted, sev, 12)
+                                    goto done_upvalue_test
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+            ::done_upvalue_test::
+        end
+    else
+        emit("detail", "setupvalue/getupvalues/getconnections unavailable — upvalue modification skipped")
+        log_gap("12.3 — setupvalue Internal State Modification")
+    end
+end
 print("╔══════════════════════════════════════════════════════╗")
-print("║   AC Recon & Analysis Tool  v1.0                    ║")
+print("║   AC Recon & Analysis Tool  v1.2                    ║")
 print("║   Run in your own place only                        ║")
 print("╚══════════════════════════════════════════════════════╝")
 print("Start time: " .. tostring(os.clock()))
@@ -1517,8 +2388,22 @@ if not ok5 then warn("[Phase 5 error] " .. tostring(err5)) end
 local ok6, err6 = pcall(phase6)
 if not ok6 then warn("[Phase 6 error] " .. tostring(err6)) end
 
+-- Phase 5-B: getsenv() upvalue walk deferred until after Phase 6 populates ac_candidates
+local ok5b, err5b = pcall(phase5b)
+if not ok5b then warn("[Phase 5-B error] " .. tostring(err5b)) end
+
 local ok7, err7 = pcall(phase7)
 if not ok7 then warn("[Phase 7 error] " .. tostring(err7)) end
 
 local ok8, err8 = pcall(phase8)
 if not ok8 then warn("[Phase 8 error] " .. tostring(err8)) end
+
+-- New phases added in v1.1 per executor-context revision
+local ok9, err9 = pcall(phase9)
+if not ok9 then warn("[Phase 9 error] " .. tostring(err9)) end
+
+local ok10, err10 = pcall(phase10)
+if not ok10 then warn("[Phase 10 error] " .. tostring(err10)) end
+
+local ok12, err12 = pcall(phase12)
+if not ok12 then warn("[Phase 12 error] " .. tostring(err12)) end
